@@ -17,7 +17,7 @@ env:
 jobs:
   # Build cross-platform binaries and create prerelease
   build-binaries:
-    # Fork safety: publishing is opt-in outside upstream (see plans/mission-control/RUNBOOK.md).
+    # Fork safety: publishing is opt-in outside upstream (see docs/mission-control/RUNBOOK.md).
     if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true')
     runs-on: ubuntu-latest
     strategy:
@@ -90,7 +90,7 @@ jobs:
 
   # Build and push Docker images tagged as beta
   docker-images:
-    # Fork safety: publishing is opt-in outside upstream (see plans/mission-control/RUNBOOK.md).
+    # Fork safety: publishing is opt-in outside upstream (see docs/mission-control/RUNBOOK.md).
     if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true')
     runs-on: ubuntu-latest
     strategy:

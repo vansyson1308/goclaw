@@ -16,7 +16,7 @@ env:
 jobs:
   # ── macOS builds (arm64 native + amd64 cross-compile on same runner) ──
   build-macos:
-    # Fork safety: publishing is opt-in outside upstream (see plans/mission-control/RUNBOOK.md).
+    # Fork safety: publishing is opt-in outside upstream (see docs/mission-control/RUNBOOK.md).
     if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true')
     strategy:
       matrix:
@@ -93,7 +93,7 @@ jobs:
 
   # ── Windows build ──
   build-windows:
-    # Fork safety: publishing is opt-in outside upstream (see plans/mission-control/RUNBOOK.md).
+    # Fork safety: publishing is opt-in outside upstream (see docs/mission-control/RUNBOOK.md).
     if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true')
     runs-on: windows-latest
     steps:
