@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -114,15 +115,14 @@ func (s *Service) Create(ctx context.Context, raw []byte, owner string) (*store.
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidContract, err)
 	}
-	if _, err := s.resolveSource(c.Workspace.SourceDir); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidContract, err)
-	}
-	if _, err := s.resolveOverlays(c); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidContract, err)
-	}
 	if owner == "" {
 		return nil, fmt.Errorf("mission owner required")
 	}
+	pins, err := s.pinInputs(c)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidContract, err)
+	}
+	pinsJSON, _ := json.Marshal(pins)
 	m := &store.Mission{
 		OwnerID:        owner,
 		AgentKey:       c.Agent,
@@ -130,6 +130,7 @@ func (s *Service) Create(ctx context.Context, raw []byte, owner string) (*store.
 		Contract:       c.Canonical(),
 		ContractDigest: c.Digest(),
 		Status:         StatusPlanned,
+		Pins:           pinsJSON,
 	}
 	if err := s.store.CreateMission(ctx, m, owner); err != nil {
 		return nil, err
@@ -235,14 +236,24 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 		return
 	}
 
+	var pins Pins
+	if err := json.Unmarshal(m.Pins, &pins); err != nil || pins.Source == "" {
+		s.finish(bctx, id, StatusPreparing, StatusBlocked, "mission inputs were not pinned at creation", store.MissionUpdate{})
+		return
+	}
 	src, err := s.resolveSource(c.Workspace.SourceDir)
 	missionDir := filepath.Join(s.cfg.DataRoot, m.TenantID.String(), id.String())
 	var pw *PreparedWorkspace
 	if err == nil {
-		pw, err = PrepareWorkspace(ctx, src, filepath.Join(missionDir, "workspace"))
+		pw, err = PrepareWorkspace(ctx, src, filepath.Join(missionDir, "workspace"), filepath.Join(missionDir, "base.git"))
 	}
 	if err != nil {
 		s.finish(bctx, id, StatusPreparing, StatusBlocked, "workspace preparation failed: "+err.Error(), store.MissionUpdate{})
+		return
+	}
+	if pw.SourceDigest != pins.Source {
+		s.finish(bctx, id, StatusPreparing, StatusBlocked,
+			fmt.Sprintf("source %q changed since the mission was created (%s, pinned %s)", c.Workspace.SourceDir, pw.SourceDigest, pins.Source), store.MissionUpdate{})
 		return
 	}
 	if len(pw.Skipped) > 0 {
@@ -253,7 +264,10 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 		s.finish(bctx, id, StatusPreparing, StatusBlocked, "acceptance overlay unavailable: "+err.Error(), store.MissionUpdate{})
 		return
 	}
-	env := VerifyEnv{Workspace: pw.Path, Scratch: filepath.Join(missionDir, "scratch"), Overlays: overlays, Exec: s.exec}
+	scratch := filepath.Join(missionDir, "scratch")
+	// The scratch dir (caches, throwaway check copies) is not evidence.
+	defer os.RemoveAll(scratch)
+	env := VerifyEnv{Workspace: pw.Path, Scratch: scratch, Overlays: overlays, OverlayPins: pins.Overlays, Exec: s.exec}
 	// Checks that must prove the change are run on the untouched baseline first.
 	baseline := Baseline(ctx, c, env)
 	if len(baseline) > 0 {
@@ -279,7 +293,8 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 	usage := store.MissionUpdate{}
 	var runReason string
 	if out != nil {
-		usage.Summary = &out.Content
+		summary := cleanText(out.Content)
+		usage.Summary = &summary
 		usage.InputTokens, usage.OutputTokens = &out.InputTokens, &out.OutputTokens
 		usage.CostUSD, usage.Iterations = out.CostUSD, &out.Iterations
 		if c.Limits.MaxCostUSD > 0 && out.CostUSD != nil && *out.CostUSD > c.Limits.MaxCostUSD {
@@ -294,24 +309,32 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 	}
 
 	// Evidence is collected even when the run failed, so users see real state.
-	diff, diffErr := Diff(bctx, pw.Path, pw.BaseRevision)
-	var changed []string
+	diff, diffErr := Diff(bctx, pw)
 	upd := store.MissionUpdate{}
 	if diffErr == nil {
-		changed = diff.ChangedFiles
+		env.Changed = diff.Present
 		upd.Diff, upd.DiffTruncated, upd.ChangedFiles = &diff.Patch, &diff.Truncated, orEmpty(diff.ChangedFiles)
 	}
-	env.Changed = changed
 	results := Verify(ctx, c, env, baseline)
 	if diffErr != nil {
 		results = append(results, CriterionResult{ID: "_diff", Kind: "internal", Status: ResultError,
-			Detail: "could not compute diff: " + diffErr.Error(), Executor: s.exec.Name(), ContractDigest: c.Digest()})
+			Detail: "could not compute diff: " + cleanText(diffErr.Error()), Executor: s.exec.Name(), ContractDigest: c.Digest()})
+	} else if findings := IntegrityFindings(diff, diff.Full); len(findings) > 0 {
+		// Verifier commands execute agent-written code; changes that can
+		// subvert them need a human to confirm the checks are meaningful.
+		results = append(results, CriterionResult{ID: "_integrity", Kind: "internal", Status: ResultError,
+			Detail: "needs human review: " + strings.Join(findings, "; "), Executor: s.exec.Name(), ContractDigest: c.Digest()})
 	}
 	verification, _ := json.Marshal(results)
 	upd.Verification = verification
 
 	final := Outcome(results)
 	reason := summarizeOutcome(results)
+	if c.Limits.MaxCostUSD > 0 && (out == nil || out.CostUSD == nil) && (final == StatusSucceeded || final == StatusPartial) {
+		// Unknown is not zero: the limit cannot be shown to hold.
+		final = StatusBlocked
+		reason = "cost limit is set but the run reported no cost, so the limit cannot be verified; " + reason
+	}
 	if runReason != "" {
 		// A failed or over-budget run cannot be reported as success even if
 		// the checks happen to pass.
@@ -333,11 +356,20 @@ func (s *Service) transition(ctx context.Context, id uuid.UUID, from, to, msg st
 
 func (s *Service) finish(ctx context.Context, id uuid.UUID, from, to, reason string, u store.MissionUpdate) {
 	now := time.Now().UTC()
+	reason = cleanText(reason)
 	u.FinishedAt, u.StatusReason = &now, &reason
 	// Persist the terminal state even if the run context expired.
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	_, _ = s.transition(fctx, id, from, to, reason, u)
+	_, err := s.transition(fctx, id, from, to, reason, u)
+	if err == nil || errors.Is(err, store.ErrMissionStateConflict) || errors.Is(err, store.ErrMissionNotFound) {
+		return
+	}
+	// The evidence itself could not be stored (e.g. rejected content): do
+	// not leave the mission active forever. Record that it could not be
+	// judged, without the payload.
+	msg := cleanText("could not persist verification evidence: " + err.Error())
+	_, _ = s.transition(fctx, id, from, StatusBlocked, msg, store.MissionUpdate{StatusReason: &msg, FinishedAt: &now})
 }
 
 func (s *Service) note(ctx context.Context, id uuid.UUID, msg string, detail any) {
@@ -350,6 +382,9 @@ func (s *Service) note(ctx context.Context, id uuid.UUID, msg string, detail any
 func (s *Service) resolveSource(rel string) (string, error) {
 	if err := validateRelPath(rel, "workspace.source_dir"); err != nil {
 		return "", err
+	}
+	if path.Clean(rel) == "." {
+		return "", fmt.Errorf("source %q must name a directory inside the mission source root, not the root itself", rel)
 	}
 	root, err := filepath.EvalSymlinks(s.cfg.SourceRoot)
 	if err != nil {
@@ -383,6 +418,35 @@ func (s *Service) resolveOverlays(c *Contract) (map[string]string, error) {
 		out[cr.ID] = p
 	}
 	return out, nil
+}
+
+// Pins are digests of the mission inputs taken at creation. The workspace
+// copy and each hidden overlay are checked against them before use, so a
+// change to the inputs (or tampering during the run) cannot go unnoticed.
+type Pins struct {
+	Source   string            `json:"source"`
+	Overlays map[string]string `json:"overlays,omitempty"`
+}
+
+func (s *Service) pinInputs(c *Contract) (*Pins, error) {
+	src, err := s.resolveSource(c.Workspace.SourceDir)
+	if err != nil {
+		return nil, err
+	}
+	overlays, err := s.resolveOverlays(c)
+	if err != nil {
+		return nil, err
+	}
+	p := &Pins{Overlays: map[string]string{}}
+	if p.Source, err = TreeDigest(src); err != nil {
+		return nil, fmt.Errorf("read source %q: %w", c.Workspace.SourceDir, err)
+	}
+	for id, dir := range overlays {
+		if p.Overlays[id], err = TreeDigest(dir); err != nil {
+			return nil, fmt.Errorf("read overlay for %q: %w", id, err)
+		}
+	}
+	return p, nil
 }
 
 func baselineSummary(b map[string]CriterionResult) map[string]string {

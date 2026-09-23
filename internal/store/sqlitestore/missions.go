@@ -26,7 +26,7 @@ const missionCols = `id, tenant_id, owner_id, agent_key, title, contract, contra
 	status_reason, executor, workspace_path, base_revision, verification, diff, diff_truncated,
 	changed_files, summary, input_tokens, output_tokens, cost_usd, iterations, state_version,
 	created_at, updated_at, started_at, finished_at,
-	usage_incomplete, attempt, max_attempts, lease_owner, lease_expires_at`
+	usage_incomplete, attempt, max_attempts, lease_owner, lease_expires_at, pins`
 
 func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	var m store.Mission
@@ -36,12 +36,12 @@ func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	var cost sql.NullFloat64
 	var created, updated sqliteTime
 	var started, finished, leaseUntil nullSqliteTime
-	var leaseOwner sql.NullString
+	var leaseOwner, pins sql.NullString
 	if err := row.Scan(&id, &tenant, &m.OwnerID, &m.AgentKey, &m.Title, &contract, &m.ContractDigest, &m.Status,
 		&reason, &executor, &wsPath, &baseRev, &verification, &diff, &m.DiffTruncated,
 		&changed, &summary, &m.InputTokens, &m.OutputTokens, &cost, &m.Iterations, &m.StateVersion,
 		&created, &updated, &started, &finished,
-		&m.UsageIncomplete, &m.Attempt, &m.MaxAttempts, &leaseOwner, &leaseUntil); err != nil {
+		&m.UsageIncomplete, &m.Attempt, &m.MaxAttempts, &leaseOwner, &leaseUntil, &pins); err != nil {
 		return nil, err
 	}
 	m.ID, _ = uuid.Parse(id)
@@ -62,6 +62,9 @@ func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	m.CreatedAt, m.UpdatedAt = created.Time, updated.Time
 	m.StartedAt, m.FinishedAt = started.ptr(), finished.ptr()
 	m.LeaseOwner, m.LeaseExpiresAt = leaseOwner.String, leaseUntil.ptr()
+	if pins.Valid && pins.String != "" {
+		m.Pins = json.RawMessage(pins.String)
+	}
 	return &m, nil
 }
 
@@ -89,9 +92,9 @@ func (s *SQLiteMissionStore) CreateMission(ctx context.Context, m *store.Mission
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO missions (id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status, max_attempts, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID.String(), tenantID.String(), m.OwnerID, m.AgentKey, m.Title, string(m.Contract), m.ContractDigest, m.Status, m.MaxAttempts,
+		`INSERT INTO missions (id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status, max_attempts, pins, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID.String(), tenantID.String(), m.OwnerID, m.AgentKey, m.Title, string(m.Contract), m.ContractDigest, m.Status, m.MaxAttempts, pinsText(m.Pins),
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
@@ -395,3 +398,10 @@ func (s *SQLiteMissionStore) ListMissionReceipts(ctx context.Context, missionID 
 }
 
 var _ store.MissionStore = (*SQLiteMissionStore)(nil)
+
+func pinsText(b json.RawMessage) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return string(b)
+}

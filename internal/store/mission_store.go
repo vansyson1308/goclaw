@@ -70,16 +70,18 @@ type Mission struct {
 	Iterations     int             `json:"iterations"`
 	// UsageIncomplete is set when an attempt ended without reporting usage
 	// (e.g. the process died); totals then undercount and cost is unknown.
-	UsageIncomplete bool       `json:"usage_incomplete,omitempty"`
-	Attempt         int        `json:"attempt"`
-	MaxAttempts     int        `json:"max_attempts"`
-	LeaseOwner      string     `json:"lease_owner,omitempty"`
-	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
-	StateVersion    int        `json:"state_version"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-	StartedAt       *time.Time `json:"started_at,omitempty"`
-	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+	UsageIncomplete bool `json:"usage_incomplete,omitempty"`
+	// Pins holds digests of the mission inputs taken at creation.
+	Pins           json.RawMessage `json:"pins,omitempty"`
+	Attempt        int             `json:"attempt"`
+	MaxAttempts    int             `json:"max_attempts"`
+	LeaseOwner     string          `json:"lease_owner,omitempty"`
+	LeaseExpiresAt *time.Time      `json:"lease_expires_at,omitempty"`
+	StateVersion   int             `json:"state_version"`
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+	StartedAt      *time.Time      `json:"started_at,omitempty"`
+	FinishedAt     *time.Time      `json:"finished_at,omitempty"`
 }
 
 // MissionUpdate carries optional field updates applied with a transition.

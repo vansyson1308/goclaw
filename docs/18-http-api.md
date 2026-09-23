@@ -1031,8 +1031,8 @@ Missions must be enabled on the gateway with `GOCLAW_MISSIONS=1`. The contract `
 | Method | Path | Role | Description |
 |--------|------|------|-------------|
 | `GET` | `/v1/missions?limit=` | viewer | `{"missions": [...], "enabled": bool}`, newest first. The diff is omitted in the list |
-| `POST` | `/v1/missions` | operator | Body: the contract JSON (≤ 64 KiB). Returns `202` with the mission, or `400` with the validation reason |
-| `GET` | `/v1/missions/{id}` | viewer | Full mission: `verification[]`, `diff`, `changed_files`, usage, `cost_usd` (`null` means unknown) |
+| `POST` | `/v1/missions` | operator + master scope | Body: the contract JSON (≤ 64 KiB). Returns `202` with the mission, `400` with the validation reason, or `403` for tenant-scoped callers (verifiers run on the gateway host) |
+| `GET` | `/v1/missions/{id}` | viewer | Full mission: `verification[]`, `diff`, `changed_files`, usage, `cost_usd` (`null` means unknown), `pins` (input digests). `workspace_path` is only returned to the master scope |
 | `GET` | `/v1/missions/{id}/events` | viewer | Append-only timeline (transitions and notes) |
 | `POST` | `/v1/missions/{id}/cancel` | operator | `409` if the mission already finished |
 
@@ -1041,8 +1041,11 @@ Each `verification[]` element contains:
 ```json
 {"id": "behavior", "kind": "command", "status": "pass", "baseline_status": "fail", "proves_change": true,
  "command": ["go", "test", "-run", "TestAcceptance", "./..."], "exit_code": 0, "duration_ms": 812,
+ "tests": {"TestAcceptanceSumIncludesNegatives": "pass"},
  "output_tail": "ok  example.com/sum 0.004s", "executor": "host", "contract_digest": "…"}
 ```
+
+`tests` is present for criteria with `expect_tests`. Internal criteria may be appended: `_diff` (the diff could not be computed) and `_integrity` (changes that can subvert verifiers were found; the mission is `blocked` for review).
 
 Statuses:
 - `planned`, `preparing`, `running`, `verifying` (in progress);

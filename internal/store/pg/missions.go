@@ -24,7 +24,7 @@ const missionCols = `id, tenant_id, owner_id, agent_key, title, contract, contra
 	status_reason, executor, workspace_path, base_revision, verification, diff, diff_truncated,
 	changed_files, summary, input_tokens, output_tokens, cost_usd, iterations, state_version,
 	created_at, updated_at, started_at, finished_at,
-	usage_incomplete, attempt, max_attempts, lease_owner, lease_expires_at`
+	usage_incomplete, attempt, max_attempts, lease_owner, lease_expires_at, pins`
 
 func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	var m store.Mission
@@ -32,14 +32,18 @@ func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	var verification, changed []byte
 	var cost sql.NullFloat64
 	var leaseOwner sql.NullString
+	var pins []byte
 	if err := row.Scan(&m.ID, &m.TenantID, &m.OwnerID, &m.AgentKey, &m.Title, &m.Contract, &m.ContractDigest, &m.Status,
 		&reason, &executor, &wsPath, &baseRev, &verification, &diff, &m.DiffTruncated,
 		&changed, &summary, &m.InputTokens, &m.OutputTokens, &cost, &m.Iterations, &m.StateVersion,
 		&m.CreatedAt, &m.UpdatedAt, &m.StartedAt, &m.FinishedAt,
-		&m.UsageIncomplete, &m.Attempt, &m.MaxAttempts, &leaseOwner, &m.LeaseExpiresAt); err != nil {
+		&m.UsageIncomplete, &m.Attempt, &m.MaxAttempts, &leaseOwner, &m.LeaseExpiresAt, &pins); err != nil {
 		return nil, err
 	}
 	m.LeaseOwner = leaseOwner.String
+	if len(pins) > 0 {
+		m.Pins = pins
+	}
 	m.StatusReason, m.Executor, m.WorkspacePath, m.BaseRevision = reason.String, executor.String, wsPath.String, baseRev.String
 	m.Diff, m.Summary = diff.String, summary.String
 	if len(verification) > 0 {
@@ -76,9 +80,9 @@ func (s *PGMissionStore) CreateMission(ctx context.Context, m *store.Mission, ac
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO missions (id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status, max_attempts)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING created_at, updated_at`,
-		m.ID, tenantID, m.OwnerID, m.AgentKey, m.Title, []byte(m.Contract), m.ContractDigest, m.Status, m.MaxAttempts,
+		`INSERT INTO missions (id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status, max_attempts, pins)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING created_at, updated_at`,
+		m.ID, tenantID, m.OwnerID, m.AgentKey, m.Title, []byte(m.Contract), m.ContractDigest, m.Status, m.MaxAttempts, nilJSON(m.Pins),
 	).Scan(&m.CreatedAt, &m.UpdatedAt); err != nil {
 		return err
 	}
@@ -384,3 +388,11 @@ func (s *PGMissionStore) ListMissionReceipts(ctx context.Context, missionID uuid
 }
 
 var _ store.MissionStore = (*PGMissionStore)(nil)
+
+// nilJSON stores an empty raw JSON value as SQL NULL.
+func nilJSON(b json.RawMessage) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return []byte(b)
+}

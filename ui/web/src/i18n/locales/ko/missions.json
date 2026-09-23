@@ -66,6 +66,7 @@
     "confirmCancelHint": "에이전트 실행이 중지되고 미션은 취소됨으로 표시됩니다.",
     "cancelled": "미션이 취소되었습니다",
     "provesChange": "변경 증명",
-    "baseline": "기준: {{status}}"
+    "baseline": "기준: {{status}}",
+    "expectedTest": "필수 테스트 {{name}}: {{status}}"
   }
 }

@@ -181,6 +181,13 @@ function CriterionRow({ c }: { c: CriterionResult }) {
           {c.detail && <p className="text-muted-foreground">{c.detail}</p>}
           {c.command && <p className="font-mono break-all">$ {c.command.join(" ")}{c.exit_code != null ? `  → exit ${c.exit_code}` : ""}</p>}
           {c.matched_files && c.matched_files.length > 0 && <p className="font-mono">{c.matched_files.join(", ")}</p>}
+          {c.tests && Object.keys(c.tests).length > 0 && (
+            <ul className="font-mono" data-testid={`criterion-tests-${c.id}`}>
+              {Object.entries(c.tests).map(([name, st]) => (
+                <li key={name}>{t("detail.expectedTest", { name, status: st })}</li>
+              ))}
+            </ul>
+          )}
           {c.output_tail && <pre className="max-h-48 overflow-auto rounded bg-muted/50 p-2 whitespace-pre-wrap break-all">{c.output_tail}</pre>}
         </div>
       )}

@@ -51,10 +51,19 @@ func (h *MissionsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	if list == nil {
 		list = []store.Mission{}
 	}
+	for i := range list {
+		list[i] = *redactMission(r.Context(), &list[i])
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"missions": list, "enabled": h.svc != nil})
 }
 
 func (h *MissionsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
+	// Verifier commands run on the gateway host until the container executor
+	// exists, so creating a mission is a server-wide side effect (like shell
+	// access): system owners / master tenant only.
+	if !requireMasterScope(w, r) {
+		return
+	}
 	if h.svc == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "missions are disabled on this gateway (set GOCLAW_MISSIONS=1 and restart)"})
 		return
@@ -71,7 +80,7 @@ func (h *MissionsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	default:
-		writeJSON(w, http.StatusAccepted, m)
+		writeJSON(w, http.StatusAccepted, redactMission(r.Context(), m))
 	}
 }
 
@@ -89,7 +98,7 @@ func (h *MissionsHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "mission not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, m)
+	writeJSON(w, http.StatusOK, redactMission(r.Context(), m))
 }
 
 func (h *MissionsHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -130,8 +139,18 @@ func (h *MissionsHandler) handleCancel(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	default:
-		writeJSON(w, http.StatusOK, m)
+		writeJSON(w, http.StatusOK, redactMission(r.Context(), m))
 	}
+}
+
+// redactMission hides gateway host paths from tenant-scoped callers.
+func redactMission(ctx context.Context, m *store.Mission) *store.Mission {
+	if m == nil || store.IsMasterScope(ctx) {
+		return m
+	}
+	cp := *m
+	cp.WorkspacePath, cp.LeaseOwner = "", ""
+	return &cp
 }
 
 func missionID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {

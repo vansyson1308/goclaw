@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -68,9 +69,14 @@ type Criterion struct {
 	// acceptance files copied over a throwaway copy of the workspace before
 	// the command runs. The agent never sees them.
 	OverlayDir string `json:"overlay_dir,omitempty"` // command
-	Glob       string `json:"glob,omitempty"`        // file_changed
-	Path       string `json:"path,omitempty"`        // file_contains
-	Text       string `json:"text,omitempty"`        // file_contains
+	// ExpectTests (go test only) names tests that must each report an
+	// explicit pass in `go test -json` output. Exit code 0 alone is not
+	// enough: the command runs code the agent wrote (e.g. a TestMain that
+	// exits 0 would otherwise pass every check).
+	ExpectTests []string `json:"expect_tests,omitempty"` // command
+	Glob        string   `json:"glob,omitempty"`         // file_changed
+	Path        string   `json:"path,omitempty"`         // file_contains
+	Text        string   `json:"text,omitempty"`         // file_contains
 }
 
 // Limits bound one mission run.
@@ -180,7 +186,23 @@ func (cr *Criterion) validate() error {
 				return err
 			}
 		}
+		if len(cr.ExpectTests) > 0 {
+			if len(cr.Command) < 2 || cr.Command[0] != "go" || cr.Command[1] != "test" {
+				return fmt.Errorf("expect_tests requires a `go test` command")
+			}
+			if slices.Contains(cr.Command, "-json") {
+				return fmt.Errorf("expect_tests adds -json itself; remove it from the command")
+			}
+			for _, name := range cr.ExpectTests {
+				if !validTestName(name) {
+					return fmt.Errorf("expect_tests: %q is not a Go test name", name)
+				}
+			}
+		}
 	case KindFileChanged:
+		if len(cr.ExpectTests) > 0 {
+			return fmt.Errorf("expect_tests applies to command criteria only")
+		}
 		if cr.MustChange || cr.OverlayDir != "" {
 			return fmt.Errorf("must_change/overlay_dir do not apply to file_changed (it proves change by definition)")
 		}
@@ -191,7 +213,7 @@ func (cr *Criterion) validate() error {
 			return fmt.Errorf("invalid glob: %w", err)
 		}
 	case KindFileContains:
-		if cr.OverlayDir != "" {
+		if cr.OverlayDir != "" || len(cr.ExpectTests) > 0 {
 			return fmt.Errorf("overlay_dir applies to command criteria only")
 		}
 		if err := validateRelPath(cr.Path, "path"); err != nil {
@@ -210,6 +232,19 @@ func (cr *Criterion) validate() error {
 // workspace was actually changed (as opposed to a guard that may already pass).
 func (cr Criterion) ProvesChange() bool {
 	return cr.Kind == KindFileChanged || cr.MustChange
+}
+
+// validTestName accepts Go test function names (optionally with /subtests).
+func validTestName(s string) bool {
+	if !strings.HasPrefix(s, "Test") || len(s) > 200 {
+		return false
+	}
+	for _, r := range s {
+		if !(r == '_' || r == '/' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // validateRelPath accepts only clean, relative paths that stay inside their root.

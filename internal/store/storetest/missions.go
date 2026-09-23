@@ -5,6 +5,7 @@ package storetest
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,9 +16,13 @@ import (
 // ctxA and ctxB must carry two different tenants.
 func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Context) {
 	t.Helper()
-	m := &store.Mission{OwnerID: "alice", AgentKey: "coder", Title: "lease", Contract: []byte(`{"version":1}`), ContractDigest: "d", MaxAttempts: 2}
+	m := &store.Mission{OwnerID: "alice", AgentKey: "coder", Title: "lease", Contract: []byte(`{"version":1}`), ContractDigest: "d", MaxAttempts: 2,
+		Pins: []byte(`{"source":"sha256:abc"}`)}
 	if err := ms.CreateMission(ctxA, m, "alice"); err != nil {
 		t.Fatal(err)
+	}
+	if g, err := ms.GetMission(ctxA, m.ID); err != nil || g == nil || !strings.Contains(string(g.Pins), "sha256:abc") {
+		t.Fatalf("pins not stored: %+v %v", g, err)
 	}
 	if m.MaxAttempts != 2 {
 		t.Fatalf("max attempts %d", m.MaxAttempts)

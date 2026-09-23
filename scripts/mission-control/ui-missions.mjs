@@ -74,7 +74,13 @@ try {
   await go("/missions");
   await page.getByTestId("mission-new").click();
   await page.getByTestId("mission-contract").waitFor();
-  await page.getByTestId("mission-submit").click();
+  // The submit button must be reachable even with a long contract.
+  const submit = page.getByTestId("mission-submit");
+  await submit.scrollIntoViewIfNeeded();
+  const box = await submit.boundingBox();
+  const vh = page.viewportSize().height;
+  if (!box || box.y < 0 || box.y + box.height > vh) fail(`submit button outside the viewport: ${JSON.stringify(box)} (viewport ${vh})`);
+  await submit.click();
   await page.waitForURL(/\/missions\/[0-9a-f-]{36}$/, { timeout: 20000 });
   await page.getByTestId("mission-detail-status")
     .filter({ hasText: /Succeeded|Failed|Blocked|Partial|Cancelled/ }).waitFor({ timeout: 180000 });

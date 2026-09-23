@@ -18,7 +18,7 @@ export const CONTRACT_TEMPLATE = JSON.stringify({
   workspace: { source_dir: "sumrepo" },
   acceptance: [
     { id: "existing-tests", description: "existing tests still pass", kind: "command", command: ["go", "test", "./..."] },
-    { id: "behavior", description: "hidden acceptance tests pass", kind: "command", command: ["go", "test", "-run", "TestAcceptance", "./..."], must_change: true, overlay_dir: "sumrepo-acceptance" },
+    { id: "behavior", description: "hidden acceptance tests pass", kind: "command", command: ["go", "test", "-run", "TestAcceptance", "./..."], must_change: true, overlay_dir: "sumrepo-acceptance", expect_tests: ["TestAcceptanceSumIncludesNegatives"] },
     { id: "regression-test", description: "a regression test was added", kind: "file_changed", glob: "*_test.go" },
   ],
   limits: { max_iterations: 12, timeout_seconds: 600 },
@@ -62,7 +62,7 @@ export function CreateMissionDialog({ open, onOpenChange, onCreate, onCreated }:
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl sm:max-h-[90vh] sm:overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{t("create.title")}</DialogTitle>
           <DialogDescription>{t("create.hint")}</DialogDescription>
@@ -70,7 +70,7 @@ export function CreateMissionDialog({ open, onOpenChange, onCreate, onCreated }:
         <Textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
-          className="font-mono text-base md:text-xs min-h-[320px]"
+          className="font-mono text-base md:text-xs min-h-[240px] max-h-[55vh] overflow-y-auto"
           spellCheck={false}
           aria-label={t("create.contractLabel")}
           data-testid="mission-contract"

@@ -66,6 +66,7 @@
     "confirmCancelHint": "Lượt chạy của agent sẽ dừng và nhiệm vụ được đánh dấu đã hủy.",
     "cancelled": "Đã hủy nhiệm vụ",
     "provesChange": "chứng minh thay đổi",
-    "baseline": "baseline: {{status}}"
+    "baseline": "baseline: {{status}}",
+    "expectedTest": "test yêu cầu {{name}}: {{status}}"
   }
 }

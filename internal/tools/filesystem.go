@@ -362,6 +362,9 @@ func allowedWriteWithTeamWorkspace(ctx context.Context, base []string) []string 
 // buildAllowedPrefixes merges base + tenant paths + team workspace and,
 // for read operations, the explicit Agent Team root.
 func buildAllowedPrefixes(ctx context.Context, base []string, includeTeamRoot bool) []string {
+	if WorkspaceConfinedFromCtx(ctx) {
+		return nil
+	}
 	tenantPaths := TenantAllowedPathsFromCtx(ctx)
 	teamWs := ToolTeamWorkspaceFromCtx(ctx)
 	var teamRoot string

@@ -5,7 +5,10 @@ ALTER TABLE missions
     ADD COLUMN IF NOT EXISTS max_attempts     INTEGER NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS lease_owner      TEXT,
     ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS usage_incomplete BOOLEAN NOT NULL DEFAULT false;
+    ADD COLUMN IF NOT EXISTS usage_incomplete BOOLEAN NOT NULL DEFAULT false,
+    -- Digests of the mission inputs taken at creation (source tree, hidden
+    -- acceptance overlays); checked again before they are used.
+    ADD COLUMN IF NOT EXISTS pins             JSONB;
 
 CREATE TABLE IF NOT EXISTS mission_receipts (
     tenant_id    UUID NOT NULL REFERENCES tenants(id),

@@ -66,6 +66,7 @@
     "confirmCancelHint": "智能体运行将停止，任务标记为已取消。",
     "cancelled": "任务已取消",
     "provesChange": "证明变更",
-    "baseline": "基线：{{status}}"
+    "baseline": "基线：{{status}}",
+    "expectedTest": "必需测试 {{name}}：{{status}}"
   }
 }

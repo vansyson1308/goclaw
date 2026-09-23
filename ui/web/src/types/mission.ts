@@ -18,6 +18,8 @@ export interface CriterionResult {
   output_tail?: string;
   matched_files?: string[];
   baseline_status?: string;
+  /** expect_tests: test name → pass | fail | skip | missing (from go test -json). */
+  tests?: Record<string, string>;
   proves_change: boolean;
   executor: string;
   contract_digest: string;

@@ -2451,7 +2451,8 @@ CREATE TABLE IF NOT EXISTS missions (
     max_attempts     INTEGER NOT NULL DEFAULT 1,
     lease_owner      TEXT,
     lease_expires_at TEXT,
-    usage_incomplete INTEGER NOT NULL DEFAULT 0
+    usage_incomplete INTEGER NOT NULL DEFAULT 0,
+    pins             TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_missions_tenant_created ON missions(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);

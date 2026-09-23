@@ -251,7 +251,7 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 
 	// Mission workspace: exclusive, fail-closed pin (no team/delegation mixing).
 	if req.MissionWorkspace != "" {
-		if isArtifactDelegation || req.TeamWorkspace != "" {
+		if isArtifactDelegation || req.TeamWorkspace != "" || req.TeamID != "" || req.LeaderAgentID != "" {
 			return contextSetupResult{}, fmt.Errorf("mission workspace cannot be combined with team or delegation workspaces")
 		}
 		info, err := os.Stat(req.MissionWorkspace)
@@ -259,6 +259,7 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			return contextSetupResult{}, fmt.Errorf("mission workspace unavailable: %q", req.MissionWorkspace)
 		}
 		ctx = tools.WithToolWorkspace(ctx, filepath.Clean(req.MissionWorkspace))
+		ctx = tools.WithWorkspaceConfined(ctx)
 	}
 
 	// Team workspace: dispatched task overrides default workspace.
@@ -304,7 +305,7 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			}
 		}
 	}
-	if !isArtifactDelegation && req.TeamWorkspace == "" && l.teamStore != nil && l.agentUUID != uuid.Nil {
+	if !isArtifactDelegation && req.TeamWorkspace == "" && req.MissionWorkspace == "" && l.teamStore != nil && l.agentUUID != uuid.Nil {
 		if team, _ := l.teamStore.GetTeamForAgent(ctx, l.agentUUID); team != nil {
 			resolvedTeamSettings = team.Settings
 			wsChat := req.ChatID

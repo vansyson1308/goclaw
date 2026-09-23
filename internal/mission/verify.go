@@ -3,6 +3,7 @@ package mission
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,7 +26,11 @@ const (
 	ResultError = "error"
 )
 
-const outputTailBytes = 4 << 10
+const (
+	outputTailBytes = 4 << 10
+	// maxCaptureBytes bounds the full output kept for parsing (go test -json).
+	maxCaptureBytes = 16 << 20
+)
 
 // CriterionResult is the evidence for one acceptance criterion.
 type CriterionResult struct {
@@ -39,9 +45,12 @@ type CriterionResult struct {
 	OutputTail     string   `json:"output_tail,omitempty"`
 	MatchedFiles   []string `json:"matched_files,omitempty"`
 	BaselineStatus string   `json:"baseline_status,omitempty"` // must_change: result on the unmodified baseline
-	ProvesChange   bool     `json:"proves_change"`             // counts as progress evidence
-	Executor       string   `json:"executor"`
-	ContractDigest string   `json:"contract_digest"`
+	// Tests maps each expect_tests name to what go test -json reported
+	// (pass, fail, skip, or missing).
+	Tests          map[string]string `json:"tests,omitempty"`
+	ProvesChange   bool              `json:"proves_change"` // counts as progress evidence
+	Executor       string            `json:"executor"`
+	ContractDigest string            `json:"contract_digest"`
 }
 
 // ExecRequest is one verifier command.
@@ -50,12 +59,16 @@ type ExecRequest struct {
 	Argv    []string
 	Timeout time.Duration
 	Scratch string // writable dir for HOME/TMP/caches, outside the workspace
+	// Capture keeps the full combined output (up to maxCaptureBytes) in
+	// ExecResult.Full, for criteria that parse it.
+	Capture bool
 }
 
 // ExecResult is what an executor observed.
 type ExecResult struct {
 	ExitCode int
 	Output   []byte // combined stdout+stderr (tail kept)
+	Full     []byte // full output when requested (nil if it exceeded the cap)
 	TimedOut bool
 	Err      error // spawn failure etc.; nil when the process ran to an exit code
 }
@@ -92,7 +105,7 @@ func (HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
 		"GOTOOLCHAIN=local",
 		"LANG=C.UTF-8",
 	}
-	var out tailBuffer
+	out := tailBuffer{capture: req.Capture}
 	cmd.Stdout, cmd.Stderr = &out, &out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
@@ -109,7 +122,7 @@ func (HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		waitErr = <-done
 	}
-	res := ExecResult{Output: out.Bytes(), TimedOut: timedOut}
+	res := ExecResult{Output: out.Bytes(), Full: out.Full(), TimedOut: timedOut}
 	var exitErr *exec.ExitError
 	switch {
 	case timedOut:
@@ -128,9 +141,12 @@ func (HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
 type VerifyEnv struct {
 	Workspace string
 	Scratch   string            // writable, outside the workspace
-	Changed   []string          // files changed vs the base snapshot
+	Changed   []string          // added or modified files vs the base snapshot (not deletions)
 	Overlays  map[string]string // criterion id → absolute hidden overlay dir
-	Exec      Executor
+	// OverlayPins maps criterion id → TreeDigest taken at mission creation.
+	// An overlay whose content no longer matches is an error, not a pass.
+	OverlayPins map[string]string
+	Exec        Executor
 }
 
 // Baseline runs every must_change criterion against the unmodified
@@ -251,15 +267,25 @@ func runCommand(ctx context.Context, cr Criterion, env VerifyEnv, digest string,
 			return r
 		}
 		if overlay != "" {
-			if _, err := copyTree(overlay, tmp); err != nil {
+			digest, _, err := copyTreeDigest(overlay, tmp)
+			if err != nil {
 				r.Status, r.Detail = ResultError, "apply hidden acceptance files: "+err.Error()
+				return r
+			}
+			if pin := env.OverlayPins[cr.ID]; pin == "" || pin != digest {
+				r.Status, r.Detail = ResultError, "hidden acceptance files changed since the mission was created (or were never pinned)"
 				return r
 			}
 		}
 		dir = tmp
 	}
-	res := env.Exec.Run(ctx, ExecRequest{Dir: dir, Argv: cr.Command, Timeout: time.Duration(cr.TimeoutSeconds) * time.Second, Scratch: env.Scratch})
-	r.OutputTail = tools.ScrubCredentials(string(res.Output))
+	argv := cr.Command
+	if len(cr.ExpectTests) > 0 {
+		// go test -json: per-test results instead of trusting the exit code.
+		argv = append([]string{argv[0], argv[1], "-json"}, argv[2:]...)
+	}
+	res := env.Exec.Run(ctx, ExecRequest{Dir: dir, Argv: argv, Timeout: time.Duration(cr.TimeoutSeconds) * time.Second, Scratch: env.Scratch, Capture: len(cr.ExpectTests) > 0})
+	r.OutputTail = cleanText(tools.ScrubCredentials(string(res.Output)))
 	switch {
 	case res.Err != nil:
 		r.Status, r.Detail = ResultError, "could not run: "+res.Err.Error()
@@ -273,7 +299,75 @@ func runCommand(ctx context.Context, cr Criterion, env VerifyEnv, digest string,
 			r.Status = ResultPass
 		}
 	}
+	if len(cr.ExpectTests) > 0 && res.Err == nil && !res.TimedOut {
+		applyExpectedTests(&r, cr.ExpectTests, res.Full)
+	}
 	return r
+}
+
+// applyExpectedTests requires every expected test to report an explicit
+// pass. A zero exit code with a missing or failed expected test is a fail.
+func applyExpectedTests(r *CriterionResult, expected []string, full []byte) {
+	if full == nil {
+		r.Status, r.Detail = ResultError, "test output exceeded the capture limit"
+		return
+	}
+	seen := parseGoTestJSON(full)
+	r.Tests = map[string]string{}
+	var tail tailBuffer
+	for _, line := range bytes.Split(full, []byte("\n")) {
+		var ev goTestEvent
+		if json.Unmarshal(line, &ev) == nil && ev.Action == "output" {
+			_, _ = tail.Write([]byte(ev.Output))
+		}
+	}
+	r.OutputTail = cleanText(tools.ScrubCredentials(string(tail.Bytes())))
+	var missing []string
+	for _, name := range expected {
+		st, ok := seen[name]
+		if !ok {
+			st = "missing"
+		}
+		r.Tests[name] = st
+		if st != "pass" {
+			missing = append(missing, name+"="+st)
+		}
+	}
+	if len(missing) > 0 && r.Status == ResultPass {
+		r.Status = ResultFail
+	}
+	if len(missing) > 0 {
+		r.Detail = "expected tests did not pass: " + strings.Join(missing, ", ")
+	}
+}
+
+type goTestEvent struct {
+	Action string `json:"Action"`
+	Test   string `json:"Test"`
+	Output string `json:"Output"`
+}
+
+// parseGoTestJSON returns the final status per test name. A test that
+// reported fail anywhere (any package) stays failed.
+func parseGoTestJSON(out []byte) map[string]string {
+	seen := map[string]string{}
+	for _, line := range bytes.Split(out, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] != '{' {
+			continue
+		}
+		var ev goTestEvent
+		if json.Unmarshal(line, &ev) != nil || ev.Test == "" {
+			continue
+		}
+		switch ev.Action {
+		case "pass", "fail", "skip":
+			if seen[ev.Test] != "fail" {
+				seen[ev.Test] = ev.Action
+			}
+		}
+	}
+	return seen
 }
 
 // readInside reads rel under root, refusing paths that resolve outside it
@@ -326,15 +420,42 @@ func Outcome(results []CriterionResult) string {
 	}
 }
 
-// tailBuffer keeps only the last outputTailBytes written.
-type tailBuffer struct{ buf []byte }
+// tailBuffer keeps the last outputTailBytes written and, with capture, the
+// full output up to maxCaptureBytes. Safe for concurrent stdout/stderr use.
+type tailBuffer struct {
+	mu       sync.Mutex
+	buf      []byte
+	capture  bool
+	full     []byte
+	overflow bool
+}
 
 func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.buf = append(t.buf, p...)
 	if len(t.buf) > outputTailBytes {
 		t.buf = t.buf[len(t.buf)-outputTailBytes:]
+	}
+	if t.capture && !t.overflow {
+		if len(t.full)+len(p) > maxCaptureBytes {
+			t.overflow, t.full = true, nil
+		} else {
+			t.full = append(t.full, p...)
+		}
 	}
 	return len(p), nil
 }
 
 func (t *tailBuffer) Bytes() []byte { return t.buf }
+
+// Full returns the captured output, or nil if capture was off or overflowed.
+func (t *tailBuffer) Full() []byte {
+	if !t.capture || t.overflow {
+		return nil
+	}
+	if t.full == nil {
+		return []byte{}
+	}
+	return t.full
+}

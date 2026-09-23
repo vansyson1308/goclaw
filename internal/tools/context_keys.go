@@ -904,6 +904,24 @@ func SandboxConfigFromCtx(ctx context.Context) *sandbox.Config {
 	return nil
 }
 
+// --- Workspace confinement (missions) ---
+
+const ctxWorkspaceConfined toolContextKey = "tool_workspace_confined"
+
+// WithWorkspaceConfined restricts filesystem tools to the tool workspace
+// only: tool-level, tenant and team allowed paths are ignored. Used for
+// mission runs, whose evidence (the workspace diff) would not show writes
+// made anywhere else.
+func WithWorkspaceConfined(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxWorkspaceConfined, true)
+}
+
+// WorkspaceConfinedFromCtx reports whether WithWorkspaceConfined is set.
+func WorkspaceConfinedFromCtx(ctx context.Context) bool {
+	v, _ := ctx.Value(ctxWorkspaceConfined).(bool)
+	return v
+}
+
 // --- Per-tenant allowed paths (filesystem tool access beyond workspace) ---
 
 const ctxTenantAllowedPaths toolContextKey = "tool_tenant_allowed_paths"

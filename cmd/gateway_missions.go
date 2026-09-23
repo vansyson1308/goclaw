@@ -77,6 +77,7 @@ func (d *gatewayDeps) buildMissionService(sched *scheduler.Scheduler) (*mission.
 	if err != nil {
 		return nil, err
 	}
+	hardenProcessForMissions()
 	slog.Warn("missions enabled (verifiers run on the host executor)", "source_root", sourceRoot, "data_root", dataRoot)
 	return svc, nil
 }

@@ -66,6 +66,7 @@
     "confirmCancelHint": "The agent run is stopped and the mission is marked cancelled.",
     "cancelled": "Mission cancelled",
     "provesChange": "proves change",
-    "baseline": "baseline: {{status}}"
+    "baseline": "baseline: {{status}}",
+    "expectedTest": "expected test {{name}}: {{status}}"
   }
 }

@@ -1966,6 +1966,7 @@ func sqliteMissionLeaseMigrationPatch(db *sql.DB) (string, error) {
 		{"lease_owner", "TEXT"},
 		{"lease_expires_at", "TEXT"},
 		{"usage_incomplete", "INTEGER NOT NULL DEFAULT 0"},
+		{"pins", "TEXT"},
 	}
 	patch := ""
 	for _, col := range columns {
