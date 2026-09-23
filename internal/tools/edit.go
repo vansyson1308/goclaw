@@ -118,7 +118,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) *Result {
 	}
 
 	// Virtual FS: context files
-	if !IsDelegationArtifactRun(ctx) && t.contextFileIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.contextFileIntc != nil {
 		if content, handled, err := t.contextFileIntc.ReadFile(ctx, path); handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to read context file: %v", err))
@@ -138,7 +138,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) *Result {
 	}
 
 	// Virtual FS: memory files
-	if !IsDelegationArtifactRun(ctx) && t.memIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.memIntc != nil {
 		if content, handled, err := t.memIntc.ReadFile(ctx, path); handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to read memory file: %v", err))

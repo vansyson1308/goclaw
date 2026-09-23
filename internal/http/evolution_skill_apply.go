@@ -89,6 +89,14 @@ func (h *EvolutionHandler) createSkillFromDraft(ctx context.Context, sg store.Ev
 	if slug == "" {
 		slug = skills.Slugify(name)
 	}
+	// The slug names a directory under the tenant's skills store: same rule
+	// as every other skill writer, so it cannot leave that directory.
+	if !skills.SlugRegexp.MatchString(slug) {
+		return uuid.Nil, "", 0, fmt.Errorf("invalid skill slug %q: lowercase letters, digits and hyphens only", slug)
+	}
+	if h.skillStore != nil && h.skillStore.IsSystemSkill(slug) {
+		return uuid.Nil, "", 0, fmt.Errorf("skill slug %q is reserved by a system skill", slug)
+	}
 
 	// Resolve tenant-scoped destination directory.
 	tenantID := store.TenantIDFromContext(ctx)

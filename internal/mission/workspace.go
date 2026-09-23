@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 const (
@@ -329,3 +331,10 @@ func copyFile(src, dst string, perm fs.FileMode, h io.Writer) error {
 	}
 	return out.Close()
 }
+
+// maxSummaryBytes bounds the agent's final message kept as the summary.
+const maxSummaryBytes = 16 << 10
+
+// scrubPatch removes credentials from the stored diff (shown to viewers).
+// The frozen evidence copy on disk keeps the exact content.
+func scrubPatch(p string) string { return tools.ScrubCredentials(p) }

@@ -282,6 +282,11 @@ func runCommand(ctx context.Context, cr Criterion, env VerifyEnv, digest string,
 	}
 	_ = os.Chmod(checksRoot, 0o700) // private on the host; mounts below are opened up
 	base := filepath.Join(checksRoot, tag+"-"+cr.ID)
+	if filepath.Dir(base) != checksRoot {
+		// Contracts validate ids; this guards anything that bypassed that.
+		r.Status, r.Detail = ResultError, "invalid criterion id"
+		return r
+	}
 	_ = os.RemoveAll(base)
 	defer os.RemoveAll(base)
 	dir, scratch := filepath.Join(base, "workspace"), filepath.Join(base, "scratch")

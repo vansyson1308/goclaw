@@ -444,3 +444,42 @@ The environment-only failures listed in §A (tiktoken egress, zombie reaping, th
 - [RELEASE-MANIFEST.md](RELEASE-MANIFEST.md)
 - [BAO-CAO-CUOI.md](BAO-CAO-CUOI.md) (final report, Vietnamese)
 - the missions section in `docs/18-http-api.md`
+
+## §I Security hardening pass (2026-09-23, after the merge of PR #1)
+
+**Method.** Two independent read-only audits of everything Mission Control and evolution added:
+- HTTP authorization, validation and error exposure;
+- store SQL, secrets, the tool guard and sandbox, and web UI XSS.
+
+Every finding below was re-verified in the code before any fix. Each fix has a regression test, and each test **failed on the unfixed code** before it passed.
+
+| # | Severity | Finding | Fix | Test |
+|---|---|---|---|---|
+| 1 | High | A criterion `id` is joined into the per-check directory path. `x/../../..` escaped it, so the verifier deleted, filled and `chmod 0777`'d an arbitrary host directory at baseline time, with the docker executor too | `id` must match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (this also reserves `_integrity`/`_diff`). As defense in depth, the verifier refuses any check dir outside `checks/` | `TestCriterionIDMustBeASafeName`, `TestVerifyCheckDirectoryCannotEscape` |
+| 2 | High (upstream code) | The evolution `skill_add` frontmatter `slug` went unchecked into `filepath.Join(skillsStore, slug, version)`. An approver could write `SKILL.md` into another tenant's skills | Same `SlugRegexp` and system-skill check as every other skill writer | `TestSkillDraftSlugCannotEscapeTenantSkillsStore` |
+| 3 | Medium | Mission runs read and wrote the agent's **virtual** `AGENTS.md`/`MEMORY.md`/`memory/*` (database-backed, injected into every later run), so an injected mission could persist instructions into the agent | `usesPhysicalFilesOnly(ctx)` (delegation or confined run) gates all 8 interceptor sites in read/write/edit/list | `TestWorkspaceConfinedRunBypassesVirtualFiles` |
+| 4 | Medium (High in host mode) | Host-executor mission `exec` inherited the gateway environment minus a denylist, including `GOCLAW_ENCRYPTION_KEY` and `GOCLAW_POSTGRES_DSN` | Confined runs get an allowlisted environment | `TestConfinedHostExecGetsAllowlistedEnvOnly` |
+| 5 | Medium | Host-executor missions could still use the tenant's stored CLI credentials (only "sandbox required" skipped them) | `credentialedBinaryFor` skips the lookup for every mission run | `TestConfinedExecNeverLooksUpStoredCredentials` |
+| 6 | Low | Host paths in status reasons, check details and events were visible to tenant viewers; the worker id appeared in event messages | The mission directory is redacted for non-master scopes, and the worker id is removed from events | `TestMissionHostPathsRedactedInReasonsDetailsAndEvents` |
+| 7 | Low | SQL and driver errors were returned verbatim (`500`) | Logged as `missions.internal_error`, with a generic response | `TestMissionInternalErrorsAreNotReturnedVerbatim` |
+| 8 | Low | The agent summary (unbounded) and the stored diff were not credential-scrubbed (command output was) | `ScrubCredentials`, and the summary is capped at 16 KiB. The frozen evidence on disk is unchanged | `TestSummaryIsScrubbedAndBounded`, `TestStoredDiffIsScrubbed` |
+| 9 | Low | The CLI printed agent-controlled text with terminal escape sequences | `termSafe` strips control characters except `\n`/`\t` | `TestTermSafeStripsControlSequences` |
+
+**Not changed here (need an owner decision, or deferred with a reason):**
+- **Authorization levels (the skill's "ask first" rule for auth changes):**
+  - evolution suggestion `PATCH` (apply/rollback) is operator-level, while the equivalent direct agent/skill writes need admin;
+  - mission create is operator + master scope;
+  - mission cancel is tenant-wide.
+  Proposal: tenant-admin for the evolution `PATCH`, admin (or owner) for mission create.
+- **Receipt digest:** an unsalted, truncated SHA-256 of the arguments, so low-entropy arguments can be confirmed offline by viewers. The fix (a per-mission HMAC key) changes the stored format.
+- **No cap on queued missions per gateway.** Create is master-scope only.
+- **Incomplete path redaction:** it covers the mission directory, not source-root paths that can appear in rare copy errors.
+- **`web_fetch`/`read_document` run on the host if a contract allows them.** Not in the default tool list.
+- **Web dependencies (upstream, unchanged by this work):** `pnpm audit --prod` reports 34 advisories (5 high, all in `react-router` 7.13.2). They target the framework-mode server runtime (turbo-stream, `__manifest`, RSC). This UI uses `BrowserRouter` as an SPA, so they are not reachable. Update at the next dependency bump.
+- **`govulncheck`:** could not run, because `vuln.go.dev` is blocked by this environment's egress policy (403).
+
+**Verification:**
+- `go build` (both editions) and `go vet ./...`: clean.
+- Unit tests of the changed packages: pass. The exception is the two zombie-reaping tests already listed in §A, which fail identically on unchanged `main` in this container.
+- `-race` integration (`Mission|Evolution|Skill`) and invariants on PG 18: pass.
+- Full E2E (docker executor + Playwright): `E2E PASS`, 7 missions + learning + UI.
