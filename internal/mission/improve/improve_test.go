@@ -119,3 +119,32 @@ func TestGateRules(t *testing.T) {
 	}
 	_ = os.Getenv
 }
+
+// Incident tasks go through the same validation as the benchmark's own tasks:
+// a task with a bad split or no contract would otherwise be silently counted.
+func TestAddTasksValidates(t *testing.T) {
+	for name, body := range map[string]string{
+		"bad-split":   `{"id":"x","split":"train","contract":{}}`,
+		"no-contract": `{"id":"x","split":"heldout"}`,
+		"null":        `{"id":"x","split":"heldout","contract":null}`,
+		"no-id":       `{"split":"dev","contract":{}}`,
+		"unknown":     `{"id":"x","split":"dev","contract":{},"extra":1}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "t.json"), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			b := &Benchmark{}
+			if err := b.AddTasks(dir); err == nil {
+				t.Fatalf("accepted %s", body)
+			}
+		})
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "ok.json"), []byte(`{"id":"x","split":"dev","contract":{}}`), 0o644)
+	b := &Benchmark{Tasks: []Task{{ID: "x"}}}
+	if err := b.AddTasks(dir); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate not refused: %v", err)
+	}
+}

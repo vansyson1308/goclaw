@@ -95,7 +95,7 @@ Precedence: `blocked` wins over `failed` when a criterion could not be evaluated
   - With the host executor, a process that leaves the workspace (`cd /`) before the run ends is not found by the sweep. It can still write to the host and, if it learns the random evidence path, to the evidence copy. The docker executor closes this: the attempt's container is destroyed when the run ends.
   - A claim whose commit succeeded but whose acknowledgement was lost burns that attempt: it is retried after the lease expires, or failed if it was the last one.
   - Do not run pre-Phase-D gateways against the same database. Their startup recovery fails every active mission.
-  - Model calls outside the agent loop are not counted against `max_tokens`: history compaction/summarization, memory flush, LLM-type hooks, `read_document`'s internal call, and post-run consolidation. One call can also overshoot the remaining budget.
+  - Model calls outside the agent loop are not counted against `max_tokens`: history compaction/summarization, memory flush, LLM-type hooks, `read_document`'s internal call, and post-run consolidation (which also summarizes the mission session into the agent's episodic/knowledge memory, using the agent's background provider). One call can also overshoot the remaining budget.
 
 ## Tools and receipts
 
@@ -161,8 +161,10 @@ Verifier commands **execute code the agent wrote** (a `go test` compiles the age
 **CLI**
 - `goclaw mission create -f contract.json [--wait]`
 - `goclaw mission list`
-- `goclaw mission show <id>`
+- `goclaw mission show <id>` (criteria, evidence, tool calls)
 - `goclaw mission cancel <id>`
+- `goclaw mission export-task <id>`: the mission's contract as a benchmark task (incident) for `goclaw improve`
+- `goclaw mission eval`: offline evaluation suite (EVALS.md)
 
 **Web**
 - Missions page: list; create from a contract; detail with criteria, evidence, diff, usage (with attempt and lower-bound marking), tool calls and events.

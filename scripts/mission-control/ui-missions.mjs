@@ -57,17 +57,18 @@ try {
   await go("/missions");
   await page.getByTestId("mission-row").first().waitFor({ timeout: 20000 });
   const statuses = await page.getByTestId("mission-status").allInnerTexts();
-  if (!statuses.some((s) => /succeeded/i.test(s))) fail("no succeeded mission in list: " + statuses);
-  if (!statuses.some((s) => /failed/i.test(s))) fail("false-claim mission not shown as failed: " + statuses);
+  if (!statuses.some((s) => /succeeded/i.test(s))) await fail("no succeeded mission in list: " + statuses);
+  if (!statuses.some((s) => /failed/i.test(s))) await fail("false-claim mission not shown as failed: " + statuses);
   await page.screenshot({ path: `${out}/ui-missions-list.png`, fullPage: true });
 
   // 2. Detail of a succeeded mission shows evidence.
-  await page.getByTestId("mission-row").filter({ hasText: /Succeeded/i }).first().click();
+  // The coding journey's mission (other succeeded missions have other evidence).
+  await page.getByTestId("mission-row").filter({ hasText: /Succeeded/i }).filter({ hasText: /Fix Sum/ }).first().click();
   await page.getByTestId("mission-criteria").waitFor();
   const passCount = await page.locator('[data-testid^="criterion-"][data-status="pass"]').count();
-  if (passCount !== 3) fail(`expected 3 passing criteria, got ${passCount}`);
+  if (passCount !== 3) await fail(`expected 3 passing criteria, got ${passCount}`);
   const diff = await page.getByTestId("mission-diff").innerText();
-  if (!diff.includes("if x > 0")) fail("diff does not show the removed condition");
+  if (!diff.includes("if x > 0")) await fail("diff does not show the removed condition");
   await page.screenshot({ path: `${out}/ui-mission-detail.png`, fullPage: true });
 
   // 3. Create a mission from the UI and watch it finish.
@@ -79,13 +80,13 @@ try {
   await submit.scrollIntoViewIfNeeded();
   const box = await submit.boundingBox();
   const vh = page.viewportSize().height;
-  if (!box || box.y < 0 || box.y + box.height > vh) fail(`submit button outside the viewport: ${JSON.stringify(box)} (viewport ${vh})`);
+  if (!box || box.y < 0 || box.y + box.height > vh) await fail(`submit button outside the viewport: ${JSON.stringify(box)} (viewport ${vh})`);
   await submit.click();
   await page.waitForURL(/\/missions\/[0-9a-f-]{36}$/, { timeout: 20000 });
   await page.getByTestId("mission-detail-status")
     .filter({ hasText: /Succeeded|Failed|Blocked|Partial|Cancelled/ }).waitFor({ timeout: 180000 });
   const finalStatus = await page.getByTestId("mission-detail-status").innerText();
-  if (!/succeeded/i.test(finalStatus)) fail("UI-created mission ended as " + finalStatus);
+  if (!/succeeded/i.test(finalStatus)) await fail("UI-created mission ended as " + finalStatus);
   await page.screenshot({ path: `${out}/ui-mission-created.png`, fullPage: true });
 
   // 4. Narrow viewport: no horizontal page overflow.
@@ -93,15 +94,15 @@ try {
   await go("/missions");
   await page.getByTestId("mission-row").first().waitFor();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-  if (overflow > 1) fail(`horizontal overflow on mobile: ${overflow}px`);
+  if (overflow > 1) await fail(`horizontal overflow on mobile: ${overflow}px`);
   await page.screenshot({ path: `${out}/ui-missions-mobile.png`, fullPage: true });
 
   // Resource-load failures are reported separately below; external fetches
   // (fonts/CDNs) are blocked in sandboxed CI and are not app errors.
   const relevant = consoleErrors.filter((e) => !/favicon|WebSocket|ws:\/\/|Failed to load resource/i.test(e));
-  if (relevant.length) fail("console errors: " + relevant.join(" | "));
+  if (relevant.length) await fail("console errors: " + relevant.join(" | "));
   const own = httpErrors.filter((e) => /\/v1\/missions/.test(e));
-  if (own.length) fail("mission API errors: " + own.join(" | "));
+  if (own.length) await fail("mission API errors: " + own.join(" | "));
   if (httpErrors.length) console.log("non-mission HTTP errors (informational): " + [...new Set(httpErrors)].join(" | "));
   await browser.close();
   console.log("UI PASS");

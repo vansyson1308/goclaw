@@ -12,6 +12,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 EX="$ROOT/examples/missions/fix-sum"
+RS="$ROOT/examples/missions/research-zephyr"
+SRC="$ROOT/evals/missions/testdata"   # mission sources + hidden overlays
 PG_CONTAINER="${PG_CONTAINER:-pgtest}"
 DB="${E2E_DB:-goclaw_e2e}"
 PORT="${E2E_PORT:-18992}"
@@ -40,7 +42,7 @@ start_gateway() {
   HOME="$WORK/home" GOCLAW_CONFIG="$WORK/config.json" GOCLAW_DATA_DIR="$WORK/data" \
   GOCLAW_GATEWAY_TOKEN="$TOKEN" GOCLAW_PORT="$PORT" \
   GOCLAW_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  GOCLAW_MISSIONS=1 GOCLAW_MISSIONS_SOURCE_ROOT="$EX/testdata" GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 \
+  GOCLAW_MISSIONS=1 GOCLAW_MISSIONS_SOURCE_ROOT="$SRC" GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 \
   GOCLAW_MISSIONS_LEASE_SECONDS=4 GOCLAW_OWNER_IDS=operator \
   GOCLAW_MISSIONS_EXECUTOR="$EXECUTOR" GOCLAW_MISSIONS_IMAGE="$IMAGE" \
     "$WORK/goclaw" >> "$WORK/gateway.log" 2>&1 &
@@ -58,6 +60,9 @@ for p in fix false-claim slow slow-fix injected; do
     '{name:$name, display_name:$name, provider_type:"scripted", enabled:true, settings:$s[0]}' |
     api -X POST "localhost:$PORT/v1/providers" -d @- >/dev/null || fail "create provider scripted-$p"
 done
+jq -n --slurpfile s "$RS/scripts/scripted-research.json" '{name:"scripted-research", display_name:"scripted-research", provider_type:"scripted", enabled:true, settings:$s[0]}' |
+  api -X POST "localhost:$PORT/v1/providers" -d @- >/dev/null || fail "create provider scripted-research"
+api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-researcher","display_name":"Mission Researcher","provider":"scripted-research","model":"scripted-research","summon":false}' >/dev/null || fail "create researcher agent"
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-coder","display_name":"Mission Coder","provider":"scripted-fix","model":"scripted-fix-sum","summon":false}' >/dev/null || fail "create agent"
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-liar","display_name":"Mission Liar","provider":"scripted-false-claim","model":"scripted-false-claim","summon":false}' >/dev/null || fail "create liar agent"
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-slow","display_name":"Mission Slow","provider":"scripted-slow","model":"scripted-slow","summon":false}' >/dev/null || fail "create slow agent"
@@ -91,7 +96,7 @@ jq -e 'length >= 3 and all(.[]; .status == "ok" and .attempt == 1) and ([.[].too
 jq -e '.changed_files | index("sum.go") != null and index("sum_negative_test.go") != null' "$WORK/m1.json" >/dev/null || fail "changed files"
 jq -e '.diff | contains("-\t\tif x > 0 {")' "$WORK/m1.json" >/dev/null || fail "diff lacks the fix"
 jq -e '(.changed_files | index("zz_acceptance_test.go")) == null' "$WORK/m1.json" >/dev/null || fail "hidden test leaked"
-grep -q 'if x > 0' "$EX/testdata/sumrepo/sum.go" || fail "source repository was modified"
+grep -q 'if x > 0' "$SRC/sumrepo/sum.go" || fail "source repository was modified"
 "$WORK/goclaw" mission show "$M1" > "$WORK/m1.txt"
 grep -q 'SUCCEEDED' "$WORK/m1.txt" || fail "CLI show"
 echo "   succeeded: $(jq -r .status_reason "$WORK/m1.json")"
@@ -183,6 +188,26 @@ if [ "$EXECUTOR" = docker ]; then
   echo "   refused: $(jq -r '[.[] | select(.status != "ok") | "\(.tool)=\(.status)"] | join(", ")' "$WORK/m6-receipts.json"); no secrets, no network, no host writes"
   [ -z "$(docker ps -aq --filter name=goclaw-verify-)" ] || fail "verifier containers left behind"
 fi
+
+step "mission 7: read-only research journey"
+M7=$(api -X POST "localhost:$PORT/v1/missions" -d @"$RS/contract.json" | mission_id)
+S7=$(wait_final "$M7")
+api "localhost:$PORT/v1/missions/$M7" > "$WORK/m7.json"
+api "localhost:$PORT/v1/missions/$M7/receipts" > "$WORK/m7-receipts.json"
+[ "$S7" = succeeded ] || { jq '{status,status_reason,verification}' "$WORK/m7.json"; fail "research mission status $S7"; }
+jq -e '[.verification[] | select(.status=="pass")] | length == 2' "$WORK/m7.json" >/dev/null || fail "research criteria"
+jq -e '.changed_files == ["ANSWER.md"]' "$WORK/m7.json" >/dev/null || fail "research changed more than ANSWER.md"
+jq -e 'all(.[]; .tool != "exec") and any(.[]; .tool == "read_file" and .status == "ok")' "$WORK/m7-receipts.json" >/dev/null || fail "research receipts"
+echo "   $(jq -r .status_reason "$WORK/m7.json")"
+
+step "learning: a failed mission becomes a benchmark incident"
+mkdir -p "$WORK/incidents"
+"$WORK/goclaw" mission export-task "$M2" --task-id incident-false-claim > "$WORK/incidents/incident-false-claim.json" || fail "export-task"
+jq -e '.id == "incident-false-claim" and .split == "heldout" and .contract.version == 1 and .contract.workspace.source_dir == "sumrepo"' \
+  "$WORK/incidents/incident-false-claim.json" >/dev/null || fail "exported task"
+(cd "$ROOT" && "$WORK/goclaw" improve evaluate v2 --bench evals/improve --incidents "$WORK/incidents") > "$WORK/improve-eval.txt" 2>&1 || fail "improve evaluate with the incident"
+grep -q 'incident-false-claim' "$WORK/improve-eval.txt" || fail "incident not part of the benchmark"
+echo "   exported mission $M2 as incident-false-claim; candidates are now judged on it"
 
 step "audit trail"
 api "localhost:$PORT/v1/missions/$M1/events" | jq -e '[.[] | .to_status] | index("succeeded") != null and index("verifying") != null' >/dev/null || fail "events"

@@ -27,6 +27,7 @@ type missionView struct {
 	Diff            string          `json:"diff"`
 	DiffTruncated   bool            `json:"diff_truncated"`
 	Verification    json.RawMessage `json:"verification"`
+	Contract        json.RawMessage `json:"contract"`
 	Summary         string          `json:"summary"`
 	InputTokens     int64           `json:"input_tokens"`
 	OutputTokens    int64           `json:"output_tokens"`
@@ -118,10 +119,50 @@ func missionCmd() *cobra.Command {
 				return err
 			}
 			printMission(m, showDiff)
+			if recs, err := gatewayHTTPGetTyped[[]store.MissionReceipt]("/v1/missions/" + args[0] + "/receipts"); err == nil && len(recs) > 0 {
+				fmt.Println("\nTool calls (recorded before each call ran):")
+				for _, r := range recs {
+					fmt.Printf("  %d.%-3d %-12s %-16s %s\n", r.Attempt, r.Seq, r.Tool, r.ActionClass, r.Status)
+				}
+			}
 			return nil
 		},
 	}
 	show.Flags().BoolVar(&showDiff, "diff", false, "print the full diff")
+
+	var exportSplit, exportID string
+	exportTask := &cobra.Command{
+		Use:   "export-task <id>",
+		Short: "Turn a mission into a benchmark task (e.g. an incident) for `goclaw improve`",
+		Long: "Prints the mission's pinned contract as a task JSON. Save it under the\n" +
+			"benchmark's incidents/ directory so every future candidate is judged on it.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if exportSplit != "dev" && exportSplit != "heldout" {
+				return fmt.Errorf("--split must be dev or heldout")
+			}
+			requireRunningGatewayHTTP()
+			m, err := gatewayHTTPGetTyped[missionView]("/v1/missions/" + args[0])
+			if err != nil {
+				return err
+			}
+			if len(m.Contract) == 0 || string(m.Contract) == "null" {
+				return fmt.Errorf("mission %s has no contract to export", m.ID)
+			}
+			id := exportID
+			if id == "" {
+				id = "incident-" + strings.SplitN(m.ID, "-", 2)[0]
+			}
+			b, err := json.MarshalIndent(map[string]any{"id": id, "split": exportSplit, "contract": m.Contract}, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(b))
+			return nil
+		},
+	}
+	exportTask.Flags().StringVar(&exportSplit, "split", "heldout", "benchmark split for the task (dev or heldout)")
+	exportTask.Flags().StringVar(&exportID, "task-id", "", "task id (default incident-<mission id prefix>)")
 
 	cancel := &cobra.Command{
 		Use:   "cancel <id>",
@@ -138,7 +179,7 @@ func missionCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(create, list, show, cancel, missionEvalCmd())
+	cmd.AddCommand(create, list, show, cancel, exportTask, missionEvalCmd())
 	return cmd
 }
 

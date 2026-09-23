@@ -13,14 +13,14 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | E. Enforced boundaries | verified | EVIDENCE.md §E |
 | F. Evaluation suite | verified | EVIDENCE.md §F |
 | G. Improvement lifecycle | verified (scripted candidates; live improvement NOT DEMONSTRATED) | EVIDENCE.md §G |
-| H. Product completion | in_progress | — |
+| H. Product completion | verified | EVIDENCE.md §H |
 
 ## Reporting dimensions (do not set optimistically)
 
 | Dimension | State |
 |---|---|
-| SOURCE READY | no (in progress) |
-| OFFLINE/INTEGRATION VERIFIED | Phases A–G |
+| SOURCE READY | yes, for review (A–H complete on the branch; not merged) |
+| OFFLINE/INTEGRATION VERIFIED | Phases A–H (local + GitHub Actions on PR #1) |
 | LIVE PROVIDER VERIFIED | BLOCKED: no provider credentials or budget |
 | COMMERCIAL LICENSE READY | BLOCKED: CC BY-NC 4.0 upstream |
 | PRODUCTION RELEASE APPROVED | no: not requested |
@@ -41,4 +41,4 @@ go test -race -tags integration ./tests/invariants/... ./tests/integration/
 ## Handoff
 
 - Branch: `claude/blissful-pascal-jo32ao`.
-- Next action: Phase H: journeys (coding, read-only research, recovery + learning), onboarding, release manifest, evidence pack, final report.
+- Next action: owner decisions in BAO-CAO-CUOI.md §4 (merge PR #1, live-provider budget, licensing).

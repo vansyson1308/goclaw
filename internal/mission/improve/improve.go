@@ -91,12 +91,9 @@ type Benchmark struct {
 func LoadBenchmark(dir string) (*Benchmark, error) {
 	b := &Benchmark{Dir: dir, Candidates: map[string]*Candidate{}}
 	if err := loadJSONDir(filepath.Join(dir, "tasks"), func(raw []byte, name string) error {
-		var t Task
-		if err := strictJSON(raw, &t); err != nil {
+		t, err := parseTask(raw)
+		if err != nil {
 			return err
-		}
-		if t.ID == "" || (t.Split != evalsuite.SplitDev && t.Split != evalsuite.SplitHeldOut) || len(t.Contract) == 0 {
-			return fmt.Errorf("task needs id, split dev|heldout and a contract")
 		}
 		b.Tasks = append(b.Tasks, t)
 		return nil
@@ -117,6 +114,17 @@ func LoadBenchmark(dir string) (*Benchmark, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+func parseTask(raw []byte) (Task, error) {
+	var t Task
+	if err := strictJSON(raw, &t); err != nil {
+		return t, err
+	}
+	if t.ID == "" || (t.Split != evalsuite.SplitDev && t.Split != evalsuite.SplitHeldOut) || len(t.Contract) == 0 || string(t.Contract) == "null" {
+		return t, fmt.Errorf("task needs id, split dev|heldout and a contract")
+	}
+	return t, nil
 }
 
 func loadJSONDir(dir string, fn func([]byte, string) error) error {
@@ -263,8 +271,8 @@ func Gate(champion, candidate *Score) Decision {
 // promotion) to the benchmark.
 func (b *Benchmark) AddTasks(dir string) error {
 	return loadJSONDir(dir, func(raw []byte, name string) error {
-		var t Task
-		if err := strictJSON(raw, &t); err != nil {
+		t, err := parseTask(raw)
+		if err != nil {
 			return err
 		}
 		for _, x := range b.Tasks {

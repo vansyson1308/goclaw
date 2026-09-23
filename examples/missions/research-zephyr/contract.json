@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "title": "When was the Zephyr protocol retired?",
+  "objective": "Using only the documents in docs/, find the year the Zephyr protocol was retired and write a one-line answer with the year to ANSWER.md. Do not change anything in docs/.",
+  "constraints": [
+    "Read-only research: docs/ must stay unchanged"
+  ],
+  "agent": "mission-researcher",
+  "workspace": {
+    "source_dir": "facts"
+  },
+  "acceptance": [
+    {
+      "id": "answer",
+      "description": "ANSWER.md states the retirement year",
+      "kind": "file_contains",
+      "path": "ANSWER.md",
+      "text": "2019",
+      "must_change": true
+    },
+    {
+      "id": "docs-unchanged",
+      "description": "source documents are untouched (hidden checksum guard)",
+      "kind": "command",
+      "command": [
+        "sh",
+        "guard.sh"
+      ],
+      "overlay_dir": "facts-guard",
+      "timeout_seconds": 60
+    }
+  ],
+  "limits": {
+    "max_iterations": 8,
+    "timeout_seconds": 300,
+    "tools": [
+      "read_file",
+      "list_files",
+      "write_file"
+    ]
+  }
+}

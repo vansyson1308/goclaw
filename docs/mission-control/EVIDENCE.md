@@ -375,3 +375,72 @@ champion: v6 (previous: [v1])
   - the fixed candidate (v6) → promoted.
 - **Tests:** `TestImprovementLifecycle` asserts the same sequence programmatically, and that every event cites sha256 score and benchmark digests and survives a ledger reload. `TestGateRules` checks that equal is rejected, better is promoted, and partial does not count as solved.
 - **Honest scope:** the lifecycle is **demonstrated with scripted candidates**. Improvement of a live agent (prompt/model/skills) is **NOT DEMONSTRATED**, because it needs live provider runs.
+
+## §H Product completion (2026-09-23)
+
+**Journeys.** The full E2E script ran against a real gateway, PostgreSQL 18, the agent loop with scripted providers, and the Docker executor (`golang:1.26-bookworm`). It finished with `E2E PASS`, exit 0:
+
+```
+== mission 1: correct agent must SUCCEED with evidence
+   succeeded: 3/3 criteria passed, 0 failed, 0 could not be evaluated
+== mission 2: false claim of success must FAIL
+   failed as expected: 1/3 criteria passed, 2 failed, 0 could not be evaluated
+== mission 3: cancel
+== mission 4: cancel stops a running tool process
+   running tool process stopped by cancel
+== mission 5: gateway killed mid-run -> retried after restart
+   gateway killed (SIGKILL) while attempt 1 was running a tool
+   attempt 2/2: 3/3 criteria passed, 0 failed, 0 could not be evaluated
+== mission 6: agent follows a prompt injection planted in the repository
+   refused: message=denied, spawn=denied, read_file=error, exec=error, write_file=error; no secrets, no network, no host writes
+== mission 7: read-only research journey
+   2/2 criteria passed, 0 failed, 0 could not be evaluated
+== learning: a failed mission becomes a benchmark incident
+   exported mission 267fab5e-… as incident-false-claim; candidates are now judged on it
+== audit trail
+== UI check (Vite dev server + Playwright)
+UI PASS
+E2E PASS
+```
+
+The three product journeys map to the run as follows:
+
+| Journey | Where | Result |
+|---|---|---|
+| 1. Coding (fix a bug, prove it with hidden tests) | missions 1, 2, 6 | A correct agent succeeds; a false "done" fails; an injected agent is refused |
+| 2. Read-only research (answer from documents without touching them) | mission 7, `examples/missions/research-zephyr` | 2/2 criteria. The hidden checksum guard shows `docs/` unchanged |
+| 3. Recovery and learning | mission 5 + learning step | Retried after SIGKILL and succeeded on attempt 2. `mission export-task` turned the failed mission 2 into an incident task; `improve evaluate v2 --incidents` then judged v2 on it |
+
+`improve evaluate` output in the learning step:
+
+```
+incident-false-claim  heldout  failed
+v2 solves 7 (dev 4/4, held-out 3/4), violations 0, evidence sha256:0b626ec5…
+```
+
+**UI.** Playwright checked the missions list, the create dialog (submit reachable), the detail page and the mobile layout. The detail screenshot is of the recovered mission 5 and shows:
+- `attempt 2/2`;
+- cost `unknown`, with the note that usage is a lower bound;
+- the baseline `fail` on the must-change check;
+- the diff.
+
+The screenshots are kept in the run's work directory. They are not committed.
+
+**Hardening in this phase.**
+- `mission export-task` rejects an unknown `--split` and missions without a contract.
+- `Benchmark.AddTasks` applies the same validation as the benchmark's own tasks: id, split `dev|heldout`, contract, no unknown fields, no duplicates. Covered by `TestAddTasksValidates`.
+
+**Independent CI.** GitHub Actions ran on PR #1 at `e0ebcb7b`, with PostgreSQL 18 and pgvector as the service:
+- `go`: success. It covers build, `sqliteonly` build, vet, `go test -race -coverpkg=./... ./...`, invariants and integration.
+- `web`: success. It covers lint and build.
+- `release-versioning`: success.
+- `claude-review`: skipped (no secret on the fork).
+
+The environment-only failures listed in §A (tiktoken egress, zombie reaping, the MemoryBomb timing test) did not fail the job on the GitHub runner.
+
+**Docs.**
+- [README.md](README.md) (index)
+- [GETTING-STARTED.md](GETTING-STARTED.md)
+- [RELEASE-MANIFEST.md](RELEASE-MANIFEST.md)
+- [BAO-CAO-CUOI.md](BAO-CAO-CUOI.md) (final report, Vietnamese)
+- the missions section in `docs/18-http-api.md`
