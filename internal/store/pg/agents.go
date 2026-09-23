@@ -139,7 +139,9 @@ func (s *PGAgentStore) BackfillAgentEmbeddings(ctx context.Context) (int, error)
 }
 
 // agentSelectCols is the column list for all agent SELECT queries.
-const agentSelectCols = `id, agent_key, display_name, frontmatter, owner_id, provider, model,
+// display_name and status are nullable in the schema (legacy rows) but scan
+// into plain strings, so they are coalesced to the column defaults.
+const agentSelectCols = `id, agent_key, COALESCE(display_name, '') AS display_name, frontmatter, owner_id, provider, model,
 		 context_window, max_tool_iterations, workspace, restrict_to_workspace,
 		 tools_config, sandbox_config, subagents_config, memory_config,
 		 compaction_config, context_pruning, other_config,
@@ -147,7 +149,7 @@ const agentSelectCols = `id, agent_key, display_name, frontmatter, owner_id, pro
 		 self_evolve, skill_evolve, skill_nudge_interval,
 		 reasoning_config, workspace_sharing, chatgpt_oauth_routing,
 		 model_fallback, shell_deny_groups, kg_dedup_config,
-		 agent_type, is_default, status, budget_monthly_cents, created_at, updated_at, tenant_id`
+		 agent_type, is_default, COALESCE(status, 'active') AS status, budget_monthly_cents, created_at, updated_at, tenant_id`
 
 // sqlExecer is satisfied by both *sql.DB and *sql.Tx, allowing helper
 // functions to be called within or outside a transaction.
@@ -775,6 +777,10 @@ func scanAgentRows(rows *sql.Rows) ([]store.AgentData, error) {
 	for rows.Next() {
 		d, err := scanAgentRow(rows)
 		if err != nil {
+			// Skipping keeps one bad row from hiding the rest, but it must
+			// not be silent: an agent vanishing from lists is otherwise
+			// undiagnosable.
+			slog.Warn("agents.scan_row_skipped", "error", err)
 			continue
 		}
 		result = append(result, *d)

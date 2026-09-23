@@ -67,3 +67,30 @@ func TestSQLiteProviderStoreReadsTextAndBlobSettings(t *testing.T) {
 		}
 	}
 }
+
+// A row with NULL display_name/api_base/api_key must not fail list scans.
+func TestSQLiteProviderStoreToleratesNullTextColumns(t *testing.T) {
+	db := openTestDB(t)
+	if err := EnsureSchema(db); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	initSqlx(db)
+	providerStore := NewSQLiteProviderStore(db, "")
+	ctx := store.WithTenantID(context.Background(), store.MasterTenantID)
+
+	id := uuid.New()
+	if _, err := db.Exec(`INSERT INTO llm_providers (id, name, provider_type, tenant_id) VALUES (?, 'legacy-null', 'openai_compat', ?)`,
+		id.String(), store.MasterTenantID.String()); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	list, err := providerStore.ListProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListProviders: %v", err)
+	}
+	if len(list) != 1 || list[0].DisplayName != "" || list[0].APIBase != "" || list[0].APIKey != "" {
+		t.Fatalf("unexpected list: %+v", list)
+	}
+	if _, err := providerStore.GetProviderByName(ctx, "legacy-null"); err != nil {
+		t.Fatalf("GetProviderByName: %v", err)
+	}
+}

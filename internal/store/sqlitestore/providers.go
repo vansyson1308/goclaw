@@ -15,7 +15,8 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
-const providerSelectCols = `id, name, display_name, provider_type, api_base, api_key, enabled, settings, created_at, updated_at, tenant_id`
+// Nullable text columns are coalesced so one NULL row cannot fail a list scan.
+const providerSelectCols = `id, name, COALESCE(display_name, '') AS display_name, provider_type, COALESCE(api_base, '') AS api_base, COALESCE(api_key, '') AS api_key, enabled, settings, created_at, updated_at, tenant_id`
 
 // SQLiteProviderStore implements store.ProviderStore backed by SQLite.
 type SQLiteProviderStore struct {

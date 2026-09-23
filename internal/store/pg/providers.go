@@ -13,6 +13,11 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
+// providerSelectCols maps nullable text columns to "" so a single legacy row
+// with NULL display_name/api_base/api_key (allowed by the schema since v1)
+// cannot fail the whole list scan and hide every provider.
+const providerSelectCols = `id, name, COALESCE(display_name, '') AS display_name, provider_type, COALESCE(api_base, '') AS api_base, COALESCE(api_key, '') AS api_key, enabled, settings, created_at, updated_at, tenant_id`
+
 // PGProviderStore implements store.ProviderStore backed by Postgres.
 type PGProviderStore struct {
 	db     *sql.DB
@@ -78,7 +83,7 @@ func (s *PGProviderStore) GetProvider(ctx context.Context, id uuid.UUID) (*store
 	}
 	var p store.LLMProviderData
 	err = pkgSqlxDB.GetContext(ctx, &p,
-		`SELECT id, name, display_name, provider_type, api_base, api_key, enabled, settings, created_at, updated_at, tenant_id
+		`SELECT `+providerSelectCols+`
 		 FROM llm_providers WHERE id = $1`+tClause,
 		append([]any{id}, tArgs...)...,
 	)
@@ -96,7 +101,7 @@ func (s *PGProviderStore) GetProviderByName(ctx context.Context, name string) (*
 	}
 	var p store.LLMProviderData
 	err = pkgSqlxDB.GetContext(ctx, &p,
-		`SELECT id, name, display_name, provider_type, api_base, api_key, enabled, settings, created_at, updated_at, tenant_id
+		`SELECT `+providerSelectCols+`
 		 FROM llm_providers WHERE name = $1`+tClause,
 		append([]any{name}, tArgs...)...,
 	)
@@ -114,7 +119,7 @@ func (s *PGProviderStore) ListProviders(ctx context.Context) ([]store.LLMProvide
 	}
 	var result []store.LLMProviderData
 	err = pkgSqlxDB.SelectContext(ctx, &result,
-		`SELECT id, name, display_name, provider_type, api_base, api_key, enabled, settings, created_at, updated_at, tenant_id
+		`SELECT `+providerSelectCols+`
 		 FROM llm_providers WHERE true`+tClause+` ORDER BY name`, tArgs...)
 	if err != nil {
 		return nil, err
@@ -129,7 +134,7 @@ func (s *PGProviderStore) ListProviders(ctx context.Context) ([]store.LLMProvide
 func (s *PGProviderStore) ListAllProviders(ctx context.Context) ([]store.LLMProviderData, error) {
 	var result []store.LLMProviderData
 	err := pkgSqlxDB.SelectContext(ctx, &result,
-		`SELECT id, name, display_name, provider_type, api_base, api_key, enabled, settings, created_at, updated_at, tenant_id
+		`SELECT `+providerSelectCols+`
 		 FROM llm_providers WHERE true ORDER BY name`)
 	if err != nil {
 		return nil, err
