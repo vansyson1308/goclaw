@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -381,6 +382,17 @@ func (h *SkillsHandler) applySkillSuggestionPatch(r *http.Request, skillID uuid.
 	}
 	defer commitLock() //nolint:errcheck
 
+	// A previous attempt may have recorded the version and then failed before
+	// activation or before marking the suggestion applied. Resume from that
+	// recorded version instead of re-patching (a find/replace would no longer
+	// match and a second version would be minted). Checked under the version
+	// lock so concurrent retries are serialized.
+	if prior, err := h.versionFromSuggestion(r.Context(), skillID, sg.ID); err != nil {
+		return nil, err
+	} else if prior != nil {
+		return h.resumeSkillSuggestionApply(r, skillID, slug, cleanTarget, sg, prior)
+	}
+
 	destDir := filepath.Join(h.tenantSkillsDir(r), slug, fmt.Sprintf("%d", newVersion))
 	tmpDir := destDir + ".tmp-" + uuid.NewString()
 	if err := copyDir(currentDir, tmpDir); err != nil {
@@ -430,18 +442,9 @@ func (h *SkillsHandler) applySkillSuggestionPatch(r *http.Request, skillID uuid.
 	if err != nil {
 		return nil, err
 	}
-	if err := h.skills.UpdateSkill(r.Context(), skillID, map[string]any{
-		"version":    newVersion,
-		"file_path":  destDir,
-		"file_size":  size,
-		"file_hash":  &hash,
-		"updated_at": time.Now(),
-	}); err != nil {
-		return nil, fmt.Errorf("update skill: %w", err)
-	}
-	// The active skill row now points at destDir; keep files even if
-	// version history or suggestion metadata fails after this point.
-	removeDestOnError = false
+	// Record version history BEFORE activating: if recording fails, the skill
+	// stays on its current version and the staged directory is removed, so the
+	// active skill never points at a version with no history row.
 	changedFiles, _ := json.Marshal([]string{cleanTarget})
 	if _, err := h.evolutionStore.CreateSkillVersion(r.Context(), store.SkillVersion{
 		SkillID:                 skillID,
@@ -454,9 +457,15 @@ func (h *SkillsHandler) applySkillSuggestionPatch(r *http.Request, skillID uuid.
 	}); err != nil {
 		return nil, fmt.Errorf("record skill version: %w", err)
 	}
+	// The version row now references destDir; keep the immutable files so a
+	// retry can resume activation from them.
+	removeDestOnError = false
+	if err := h.activateSkillVersion(r, skillID, newVersion, destDir, size, hash); err != nil {
+		return nil, err
+	}
 	applied, err := h.evolutionStore.MarkSuggestionApplied(r.Context(), sg.ID, newVersion, "user", store.ActorIDFromContext(r.Context()))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mark suggestion applied (retry resumes from version %d): %w", newVersion, err)
 	}
 	h.logSkillActivity(r, "skill.suggestion.applied", skillID, map[string]any{
 		"suggestion_id": sg.ID.String(),
@@ -580,4 +589,72 @@ func hashSkillDir(dir string) (string, int64, error) {
 		return "", 0, err
 	}
 	return fmt.Sprintf("%x", h.Sum(nil)), size, nil
+}
+
+// versionFromSuggestion returns the version row a previous apply attempt of
+// this suggestion recorded, if any.
+func (h *SkillsHandler) versionFromSuggestion(ctx context.Context, skillID, suggestionID uuid.UUID) (*store.SkillVersion, error) {
+	versions, err := h.evolutionStore.ListSkillVersions(ctx, skillID, 100)
+	if err != nil {
+		return nil, fmt.Errorf("list skill versions: %w", err)
+	}
+	for i := range versions {
+		if v := versions[i].CreatedFromSuggestionID; v != nil && *v == suggestionID && versions[i].SkillID == skillID {
+			return &versions[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func (h *SkillsHandler) activateSkillVersion(r *http.Request, skillID uuid.UUID, version int, dir string, size int64, hash string) error {
+	if err := h.skills.UpdateSkill(r.Context(), skillID, map[string]any{
+		"version":    version,
+		"file_path":  dir,
+		"file_size":  size,
+		"file_hash":  &hash,
+		"updated_at": time.Now(),
+	}); err != nil {
+		return fmt.Errorf("activate skill version %d (retry resumes): %w", version, err)
+	}
+	return nil
+}
+
+// resumeSkillSuggestionApply finishes an apply whose version was already
+// recorded: it verifies the immutable version files still match the recorded
+// hash, activates them if needed, and marks the suggestion applied.
+func (h *SkillsHandler) resumeSkillSuggestionApply(r *http.Request, skillID uuid.UUID, slug string, cleanTarget string, sg *store.SkillImprovementSuggestion, prior *store.SkillVersion) (*store.SkillImprovementSuggestion, error) {
+	_, _, activeVersion, _, ok := h.skills.GetSkillFilePath(r.Context(), skillID)
+	if !ok {
+		return nil, errSkillEvolutionSkillNotFound
+	}
+	dir := filepath.Join(h.tenantSkillsDir(r), slug, fmt.Sprintf("%d", prior.Version))
+	hash, size, err := hashSkillDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resume apply: version %d files unreadable: %w", prior.Version, err)
+	}
+	if hash != prior.ContentHash {
+		return nil, fmt.Errorf("resume apply: version %d files changed since they were recorded (hash mismatch); manual review required", prior.Version)
+	}
+	// Only move forward: if a newer version became active meanwhile (another
+	// suggestion or a manual edit), re-activating this one would silently
+	// drop that change. The version stays in history; the suggestion is
+	// still recorded as applied at its version.
+	if activeVersion < prior.Version {
+		if err := h.activateSkillVersion(r, skillID, prior.Version, dir, size, hash); err != nil {
+			return nil, err
+		}
+	}
+	applied, err := h.evolutionStore.MarkSuggestionApplied(r.Context(), sg.ID, prior.Version, "user", store.ActorIDFromContext(r.Context()))
+	if err != nil {
+		return nil, fmt.Errorf("mark suggestion applied (retry resumes from version %d): %w", prior.Version, err)
+	}
+	h.logSkillActivity(r, "skill.suggestion.applied", skillID, map[string]any{
+		"suggestion_id":  sg.ID.String(),
+		"changed_files":  []string{cleanTarget},
+		"active_version": activeVersion,
+		"new_version":    prior.Version,
+		"content_hash":   hash,
+		"resumed":        true,
+	})
+	return applied, nil
 }

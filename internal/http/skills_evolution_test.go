@@ -71,7 +71,10 @@ func TestApplySkillSuggestionPatchCreatesNewReferenceFile(t *testing.T) {
 	}
 }
 
-func TestApplySkillSuggestionPatchKeepsActiveFilesWhenVersionRecordFails(t *testing.T) {
+// Version history is recorded before activation: if recording fails the skill
+// must stay on its current version with no orphaned version directory, so the
+// active skill never points at files that have no history row.
+func TestApplySkillSuggestionPatchVersionRecordFailureKeepsCurrentVersion(t *testing.T) {
 	handler, skillStore, ctx, root := newTestUploadHandler(t)
 	evolution := &skillEvolutionStoreStub{createVersionErr: errors.New("version store unavailable")}
 	handler.SetEvolutionStore(evolution, nil)
@@ -84,43 +87,104 @@ func TestApplySkillSuggestionPatchKeepsActiveFilesWhenVersionRecordFails(t *test
 		t.Fatalf("write skill: %v", err)
 	}
 	skillID := skillStore.seedCustomSkill("failure-skill", currentDir, "active", nil)
-	content := "Keep active files when metadata recording fails.\n"
+	suggestion := referenceSuggestion(t, skillID, "Recovery notes.\n")
+	req := httptest.NewRequest(http.MethodPost, "/v1/skills/"+skillID.String()+"/evolution/suggestions/"+suggestion.ID.String()+"/apply", nil).WithContext(ctx)
+
+	_, err := handler.applySkillSuggestionPatch(req, skillID, suggestion)
+	if err == nil || !strings.Contains(err.Error(), "record skill version") {
+		t.Fatalf("error = %v, want record skill version failure", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "skills-store", "failure-skill", "2")); !os.IsNotExist(err) {
+		t.Fatalf("orphan version dir left behind: %v", err)
+	}
+	info, ok := skillStore.GetSkillByID(ctx, skillID)
+	if !ok || info.BaseDir != currentDir || info.Version != 1 {
+		t.Fatalf("skill must stay on v1 at %q, got (%q, v%d)", currentDir, info.BaseDir, info.Version)
+	}
+}
+
+// If marking the suggestion applied fails after activation, a retry resumes
+// from the recorded version: no second version, no re-patch.
+func TestApplySkillSuggestionPatchRetryResumesAfterMarkAppliedFailure(t *testing.T) {
+	handler, skillStore, ctx, root := newTestUploadHandler(t)
+	evolution := &skillEvolutionStoreStub{markAppliedErr: errors.New("db blip")}
+	handler.SetEvolutionStore(evolution, nil)
+
+	currentDir := filepath.Join(root, "skills-store", "resume-skill", "1")
+	if err := os.MkdirAll(currentDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(currentDir, "SKILL.md"), []byte(skillMarkdown("Resume Skill", "resume-skill")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	skillID := skillStore.seedCustomSkill("resume-skill", currentDir, "active", nil)
+	suggestion := referenceSuggestion(t, skillID, "Resume notes.\n")
+	req := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
+
+	if _, err := handler.applySkillSuggestionPatch(req, skillID, suggestion); err == nil || !strings.Contains(err.Error(), "mark suggestion applied") {
+		t.Fatalf("first attempt: want mark-applied failure, got %v", err)
+	}
+	if len(evolution.versions) != 1 {
+		t.Fatalf("versions after first attempt = %d, want 1", len(evolution.versions))
+	}
+	evolution.markAppliedErr = nil
+	applied, err := handler.applySkillSuggestionPatch(req, skillID, suggestion)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if applied.AppliedVersion == nil || *applied.AppliedVersion != 2 {
+		t.Fatalf("applied version = %v, want 2", applied.AppliedVersion)
+	}
+	if len(evolution.versions) != 1 {
+		t.Fatalf("retry minted another version: %d rows", len(evolution.versions))
+	}
+	if _, err := os.Stat(filepath.Join(root, "skills-store", "resume-skill", "3")); !os.IsNotExist(err) {
+		t.Fatal("retry must not create version 3")
+	}
+	info, _ := skillStore.GetSkillByID(ctx, skillID)
+	if info.Version != 2 {
+		t.Fatalf("active version = %d, want 2", info.Version)
+	}
+}
+
+// Tampered version files are not silently activated on resume.
+func TestApplySkillSuggestionPatchResumeRejectsTamperedFiles(t *testing.T) {
+	handler, skillStore, ctx, root := newTestUploadHandler(t)
+	evolution := &skillEvolutionStoreStub{markAppliedErr: errors.New("db blip")}
+	handler.SetEvolutionStore(evolution, nil)
+	currentDir := filepath.Join(root, "skills-store", "tamper-skill", "1")
+	if err := os.MkdirAll(currentDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(currentDir, "SKILL.md"), []byte(skillMarkdown("Tamper Skill", "tamper-skill")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	skillID := skillStore.seedCustomSkill("tamper-skill", currentDir, "active", nil)
+	suggestion := referenceSuggestion(t, skillID, "Notes.\n")
+	req := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
+	_, _ = handler.applySkillSuggestionPatch(req, skillID, suggestion)
+	if err := os.WriteFile(filepath.Join(root, "skills-store", "tamper-skill", "2", "SKILL.md"), []byte("tampered"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	evolution.markAppliedErr = nil
+	if _, err := handler.applySkillSuggestionPatch(req, skillID, suggestion); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
+		t.Fatalf("want hash mismatch, got %v", err)
+	}
+}
+
+func referenceSuggestion(t *testing.T, skillID uuid.UUID, content string) *store.SkillImprovementSuggestion {
+	t.Helper()
 	patch, err := json.Marshal(skillDraftPatch{Content: &content})
 	if err != nil {
-		t.Fatalf("marshal draft patch: %v", err)
+		t.Fatal(err)
 	}
-	suggestion := &store.SkillImprovementSuggestion{
+	return &store.SkillImprovementSuggestion{
 		ID:             uuid.New(),
 		SkillID:        skillID,
 		TargetFile:     "references/recovery.md",
 		DraftPatch:     patch,
 		Status:         store.SkillSuggestionStatusApproved,
 		SuggestionType: "skill_reference_add",
-	}
-	req := httptest.NewRequest(http.MethodPost, "/v1/skills/"+skillID.String()+"/evolution/suggestions/"+suggestion.ID.String()+"/apply", nil).WithContext(ctx)
-
-	_, err = handler.applySkillSuggestionPatch(req, skillID, suggestion)
-	if err == nil || !strings.Contains(err.Error(), "record skill version") {
-		t.Fatalf("error = %v, want record skill version failure", err)
-	}
-
-	newDir := filepath.Join(root, "skills-store", "failure-skill", "2")
-	if _, err := os.Stat(newDir); err != nil {
-		t.Fatalf("new active skill dir missing after metadata failure: %v", err)
-	}
-	created, err := os.ReadFile(filepath.Join(newDir, "references", "recovery.md"))
-	if err != nil {
-		t.Fatalf("read preserved reference: %v", err)
-	}
-	if string(created) != content {
-		t.Fatalf("preserved reference = %q, want %q", created, content)
-	}
-	info, ok := skillStore.GetSkillByID(ctx, skillID)
-	if !ok {
-		t.Fatal("skill not found after apply failure")
-	}
-	if info.BaseDir != newDir || info.Version != 2 {
-		t.Fatalf("skill active target = (%q, v%d), want (%q, v2)", info.BaseDir, info.Version, newDir)
 	}
 }
 
@@ -289,4 +353,41 @@ func (s *skillEvolutionStoreStub) ListSkillVersions(context.Context, uuid.UUID, 
 
 func (s *skillEvolutionStoreStub) GetSkillVersion(context.Context, uuid.UUID, int) (*store.SkillVersion, error) {
 	return nil, nil
+}
+
+// A retry must never move the skill back to an older version: if another
+// change became active after the failed attempt, it is kept.
+func TestApplySkillSuggestionPatchResumeNeverDowngradesActiveVersion(t *testing.T) {
+	handler, skillStore, ctx, root := newTestUploadHandler(t)
+	evolution := &skillEvolutionStoreStub{markAppliedErr: errors.New("db blip")}
+	handler.SetEvolutionStore(evolution, nil)
+	currentDir := filepath.Join(root, "skills-store", "fwd-skill", "1")
+	if err := os.MkdirAll(currentDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(currentDir, "SKILL.md"), []byte(skillMarkdown("Fwd Skill", "fwd-skill")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	skillID := skillStore.seedCustomSkill("fwd-skill", currentDir, "active", nil)
+	req := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
+
+	a := referenceSuggestion(t, skillID, "A notes.\n")
+	_, _ = handler.applySkillSuggestionPatch(req, skillID, a) // v2 recorded+active, mark fails
+	evolution.markAppliedErr = nil
+	b := referenceSuggestion(t, skillID, "B notes.\n")
+	b.TargetFile = "references/b.md"
+	if _, err := handler.applySkillSuggestionPatch(req, skillID, b); err != nil { // v3 active
+		t.Fatalf("apply B: %v", err)
+	}
+	applied, err := handler.applySkillSuggestionPatch(req, skillID, a) // resume A
+	if err != nil {
+		t.Fatalf("resume A: %v", err)
+	}
+	if applied.AppliedVersion == nil || *applied.AppliedVersion != 2 {
+		t.Fatalf("A applied version = %v, want 2", applied.AppliedVersion)
+	}
+	info, _ := skillStore.GetSkillByID(ctx, skillID)
+	if info.Version != 3 {
+		t.Fatalf("active version = %d, want 3 (B must not be reverted)", info.Version)
+	}
 }
