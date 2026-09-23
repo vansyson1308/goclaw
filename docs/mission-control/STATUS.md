@@ -8,8 +8,8 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 |---|---|---|
 | A. Upstream integration | verified | EVIDENCE.md §A |
 | B. Evolution correctness | verified | EVIDENCE.md §B |
-| C. Mission vertical slice | in_progress | — |
-| D. Durable recovery | pending | — |
+| C. Mission vertical slice | verified | EVIDENCE.md §C (incl. adversarial review fixes) |
+| D. Durable recovery | in_progress | store layer done (067b3aaf) |
 | E. Enforced boundaries | pending | — |
 | F. Evaluation suite | pending | — |
 | G. Improvement lifecycle | pending | — |
@@ -20,7 +20,7 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | Dimension | State |
 |---|---|
 | SOURCE READY | no (in progress) |
-| OFFLINE/INTEGRATION VERIFIED | partial: Phases A–B |
+| OFFLINE/INTEGRATION VERIFIED | partial: Phases A–C |
 | LIVE PROVIDER VERIFIED | BLOCKED: no provider credentials or budget |
 | COMMERCIAL LICENSE READY | BLOCKED: CC BY-NC 4.0 upstream |
 | PRODUCTION RELEASE APPROVED | no: not requested |
@@ -41,4 +41,4 @@ go test -race -tags integration ./tests/invariants/... ./tests/integration/
 ## Handoff
 
 - Branch: `claude/blissful-pascal-jo32ao`.
-- Next action: Phase C (mission contract and vertical slice).
+- Next action: Phase D service (claim/heartbeat/fencing, retrying recovery), mission tool guard + receipts, fault tests.

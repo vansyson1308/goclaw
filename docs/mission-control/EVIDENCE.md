@@ -116,3 +116,71 @@ Normal execution, retry, concurrency and injected failures were each checked for
 - The desktop suggestions list was always empty (it read `.suggestions` from a bare-array response).
 - The desktop showed the requested status instead of the server's resulting status.
 - The applied config was never cache-invalidated.
+
+## §C Mission vertical slice (2026-09-23)
+
+### What was built
+- **Mission core:** contract v1 with a digest; isolated workspace with a base snapshot; verifiers outside the agent; evidence rules; CAS lifecycle.
+- **Offline runs:** a scripted provider (env-gated) for deterministic runs with no LLM spend.
+- **Surfaces:**
+  - HTTP `/v1/missions`;
+  - CLI `goclaw mission`;
+  - web Missions page (list, contract editor, evidence view);
+  - PG migration 000099 + SQLite v62.
+
+### Gate C (real gateway + PostgreSQL + agent loop + scripted provider)
+`scripts/mission-control/e2e-mission.sh` with `UI_CHECK=1` passed on f3d7c876.
+
+1. **Correct agent → `succeeded`.** 3/3 criteria passed:
+   - the hidden `behavior` test has `baseline_status=fail` and reports `tests.TestAcceptanceSumIncludesNegatives=pass`;
+   - `pins.source` and `pins.overlays.behavior` are recorded;
+   - no internal findings;
+   - the diff contains the fix;
+   - the hidden test file is absent from `changed_files`;
+   - the source repository is unmodified;
+   - the CLI `show` works.
+2. **"False claim" agent** (says "All done", changes nothing) → `failed` (1/3: only the guard passes). The narrative is kept only as the summary.
+3. **Cancel** → `cancelled`; a second cancel → 409.
+4. **Audit trail** contains `verifying` → `succeeded`.
+5. **UI (Playwright, Vite dev):**
+   - list statuses are correct;
+   - the detail view shows 3 passing criteria and the diff;
+   - a mission created from the UI reaches `succeeded`;
+   - Submit is reachable in the dialog (this check caught a real bug: the dialog did not scroll);
+   - no horizontal overflow at 390px;
+   - no mission API errors.
+
+   Screenshots are in the work directory (not committed).
+
+### Independent adversarial review (fresh reviewer agent, read-only, proofs on a copy)
+It found 3 high, 3 medium and 7 low issues. **All high and medium issues are fixed** in f3d7c876 (M2 in Phase D). Each fix has a regression test, and mutation checks confirm the tests fail when the fix is removed.
+
+| Finding | Status | Test |
+|---|---|---|
+| H1: `TestMain`/`os.Exit(0)` makes every `go test` pass | Fixed: `expect_tests` (explicit pass in `go test -json`) + integrity check → `blocked` | `TestTestMainHijackCannotSucceed`, `TestExpectTestsRequiresExplicitPass` |
+| H2: agent-controlled `.git` (fsmonitor/diff.external ran host commands, forged diff, `info/exclude` hid files) | Fixed: git dir outside workspace, hardened git flags, `add --force`, nested `.git` → `blocked` | `TestWorkspaceGitConfigCannotRunCommandsOrForgeDiff`, `TestGitignoreCannotHideChanges` |
+| H3: any tenant operator could run host commands; secrets readable via `/proc/<ppid>/environ`; overlays tamperable | Fixed/mitigated: create needs master scope; `PR_SET_DUMPABLE=0` (verified with uid 65534: read denied); overlays and source pinned; `"."` rejected. **Residual:** the host executor is not a boundary (Phase E) | `TestMissionCreateRequiresMasterScope`, `TestOverlayTamperingIsDetected`, `TestSourceChangeBeforeStartIsBlocked`, `TestSourceRootItselfIsRejected` |
+| M1: invalid UTF-8 in the diff left the mission stuck in `verifying` (PG 22021) | Fixed: text cleaning + rune-boundary cut + blocked fallback | `TestEvidenceIsAlwaysStorableText`, `TestEvidenceRejectedByStoreStillEnds` |
+| M2: startup recovery could kill missions run by another instance | **Phase D** (leases/fencing) | — |
+| M3: mission pin not exclusive (team/tenant paths) | Fixed: workspace-confined runs | `TestWorkspaceConfinedIgnoresExtraAllowedPaths`, `TestInjectContext_Mission*` |
+| L1: unknown cost bypassed `max_cost_usd` | Fixed → `blocked` | `TestUnknownCostWithLimitIsNotSuccess` |
+| L2: deleting a test counted as "test added" | Fixed | `TestDeletedTestFileIsNotEvidence` |
+| L3: truth-table wording | Doc fixed (blocked takes precedence) | — |
+| L4: no cleanup | Scratch removed; workspace retention policy still open | `TestScratchIsRemovedAfterVerification` |
+| L5: SQLite lacks the status CHECK; desktop is not wired | Accepted (D16: desktop N/A in v1) | — |
+| L6: host path shown to viewers | Fixed: redacted outside the master scope | `TestMissionGetRedactsHostPathsForTenants` |
+| L7: cancel does not reach other instances | **Phase D** (heartbeat sees the cancel) | — |
+
+### Other gates on f3d7c876
+- `go vet ./...` and `go build -tags sqliteonly ./...` are clean.
+- `go test ./...`: only the known environment failures in the §A table (tokencount egress, zombie reaping).
+- `-race`:
+  - SQLite store and mission package pass after fixing a race in my own test (`TestSourceChangeBeforeStartIsBlocked` mutated the fake runner without a lock);
+  - invariants pass;
+  - integration passes except the inherited timing test `TestHooksB2_MemoryBombBoundedByTimeout` (§A).
+- **Flaky test found and fixed at the root:** `TestHooksTracing_*` seeded traces with a zero `created_at`, so the collector's startup prune could delete the trace before its span flushed (FK violation). Failures were 11/600 before the fix and 0/600 after (f1acfa6e).
+- **Web:** lint 0 errors (4 old warnings), build OK, vitest 56 files / 360 tests pass.
+
+### Honest limits of Gate C
+- The scripted provider verifies the **contract** of the agent loop and missions, not a live model (LIVE PROVIDER: BLOCKED).
+- Verifier commands run agent-written code on the host. See MISSIONS.md "Threat model and residual risk".
