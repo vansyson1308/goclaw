@@ -79,6 +79,7 @@ type codexToolCallAcc struct {
 	callID  string
 	name    string
 	rawArgs string
+	seq     int // first-seen order; the map holding accumulators is unordered
 }
 
 type codexContentPart struct {

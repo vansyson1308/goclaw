@@ -1242,3 +1242,40 @@ func TestCodexProviderDoesNotRetryAfterVisibleOutput(t *testing.T) {
 
 	}
 }
+
+// Tool calls must come back in stream order: accumulators live in a map, and
+// map iteration order would otherwise shuffle dependent calls.
+func TestCodexProviderChatStreamToolCallsPreserveOrder(t *testing.T) {
+	names := []string{"step_a", "step_b", "step_c", "step_d", "step_e", "step_f"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for i, name := range names {
+			fmt.Fprintf(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"item_%d\",\"call_id\":\"call_%d\",\"name\":%q,\"arguments\":\"{}\"}}\n\n", i, i, name)
+		}
+		fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer server.Close()
+
+	p := NewCodexProvider("test", &staticTokenSource{token: "test"}, server.URL, "gpt-4o")
+	p.retryConfig.Attempts = 1
+
+	for range 20 {
+		result, err := p.ChatStream(context.Background(), ChatRequest{
+			Messages: []Message{{Role: "user", Content: "go"}},
+		}, nil)
+		if err != nil {
+			t.Fatalf("ChatStream: %v", err)
+		}
+		if len(result.ToolCalls) != len(names) {
+			t.Fatalf("ToolCalls length = %d, want %d", len(result.ToolCalls), len(names))
+		}
+		for i, tc := range result.ToolCalls {
+			if tc.Name != names[i] {
+				t.Fatalf("ToolCalls[%d] = %q, want %q (order not preserved)", i, tc.Name, names[i])
+			}
+		}
+	}
+}

@@ -243,3 +243,30 @@ func TestParseResponse_ValidToolCallArgs(t *testing.T) {
 		t.Errorf("unexpected ParseError: %q", result.ToolCalls[0].ParseError)
 	}
 }
+
+// Tool calls must keep the provider's index order across many parallel calls.
+func TestChatStream_ToolCallsPreserveIndexOrder(t *testing.T) {
+	var chunks []string
+	const n = 8
+	for i := range n {
+		chunks = append(chunks, fmt.Sprintf(`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":%d,"id":"call_%d","type":"function","function":{"name":"tool_%d","arguments":"{}"}}]}}]}`+"\n\n", i, i, i))
+	}
+	chunks = append(chunks, `data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}`+"\n\n", "data: [DONE]\n\n")
+
+	server := newOpenAISSEServer(t, chunks)
+	p := newTestOpenAIProvider(server.URL)
+	for range 20 {
+		result, err := p.ChatStream(context.Background(), ChatRequest{Model: "gpt-4", Messages: []Message{{Role: "user", Content: "x"}}}, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result.ToolCalls) != n {
+			t.Fatalf("got %d tool calls, want %d", len(result.ToolCalls), n)
+		}
+		for i, tc := range result.ToolCalls {
+			if want := fmt.Sprintf("tool_%d", i); tc.Name != want {
+				t.Fatalf("ToolCalls[%d] = %q, want %q", i, tc.Name, want)
+			}
+		}
+	}
+}
