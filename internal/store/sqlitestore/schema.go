@@ -16,7 +16,7 @@ var schemaSQL string
 
 // SchemaVersion is the current SQLite schema version.
 // Bump this when adding new migration steps below.
-const SchemaVersion = 61
+const SchemaVersion = 62
 
 // migrations maps version → SQL to apply when upgrading FROM that version.
 // schema.sql always represents the LATEST full schema (for fresh DBs).
@@ -95,6 +95,52 @@ BEGIN
 END;`
 
 var migrations = map[int]string{
+	// Version 61 → 62: missions + mission_events (PG migration 000099).
+	61: `CREATE TABLE IF NOT EXISTS missions (
+    id              TEXT NOT NULL PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id),
+    owner_id        TEXT NOT NULL,
+    agent_key       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    contract        TEXT NOT NULL,
+    contract_digest TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'planned',
+    status_reason   TEXT,
+    executor        TEXT,
+    workspace_path  TEXT,
+    base_revision   TEXT,
+    verification    TEXT,
+    diff            TEXT,
+    diff_truncated  INTEGER NOT NULL DEFAULT 0,
+    changed_files   TEXT,
+    summary         TEXT,
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    cost_usd        REAL,
+    iterations      INTEGER NOT NULL DEFAULT 0,
+    state_version   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    started_at      TEXT,
+    finished_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_missions_tenant_created ON missions(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
+CREATE TABLE IF NOT EXISTS mission_events (
+    id          TEXT NOT NULL PRIMARY KEY,
+    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
+    mission_id  TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    actor       TEXT NOT NULL,
+    message     TEXT,
+    detail      TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mission_events_mission ON mission_events(mission_id, created_at);
+`,
+
 	// Version 60 → 61: transactional apply/rollback bookkeeping for agent
 	// evolution suggestions + append-only audit trail (PG migration 000098).
 	// Version 60 → 61: evolution apply/rollback bookkeeping + audit table (PG

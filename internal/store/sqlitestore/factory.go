@@ -76,6 +76,7 @@ func NewSQLiteStores(cfg store.StoreConfig) (*store.Stores, error) {
 		Episodic:               NewSQLiteEpisodicStore(db),
 		EvolutionMetrics:       NewSQLiteEvolutionMetricsStore(db),
 		EvolutionSuggestions:   NewSQLiteEvolutionSuggestionStore(db),
+		Missions:               NewSQLiteMissionStore(db),
 		KnowledgeGraph:         NewSQLiteKnowledgeGraphStore(db),
 		Vault:                  NewSQLiteVaultStore(db),
 		BitrixPortals:          NewSQLiteBitrixPortalStore(db, cfg.EncryptionKey),

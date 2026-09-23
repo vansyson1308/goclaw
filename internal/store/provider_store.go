@@ -28,16 +28,19 @@ const (
 	ProviderYesScale        = "yescale"
 	ProviderZai             = "zai"
 	ProviderZaiCoding       = "zai_coding"
-	ProviderOllama          = "ollama"          // local or self-hosted Ollama (no API key)
-	ProviderOllamaCloud     = "ollama_cloud"    // Ollama Cloud (Bearer token required)
-	ProviderACP             = "acp"             // ACP (Agent Client Protocol) agent subprocess
-	ProviderNovita          = "novita"          // Novita AI (OpenAI-compatible endpoint)
-	ProviderBytePlus        = "byteplus"        // BytePlus ModelArk (Seed 2.0 models)
-	ProviderBytePlusCoding  = "byteplus_coding" // BytePlus ModelArk Coding Plan
-	ProviderVertex          = "vertex"          // Google Cloud Vertex AI (OAuth2 service account + ADC)
-	ProviderKimiCoding      = "kimi_coding"     // Moonshot Kimi Coding (OpenAI-compat, requires fixed User-Agent)
-	ProviderAtlasCloud      = "atlascloud"      // Atlas Cloud (OpenAI-compatible endpoint)
-	ProviderAPIRoute        = "api_route"       // API Route (OpenAI-compatible endpoint)
+	ProviderOllama          = "ollama" // local or self-hosted Ollama (no API key)
+	// ProviderScripted replays canned turns for offline runs; accepted only when
+	// GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 (never in ValidProviderTypes).
+	ProviderScripted       = "scripted"
+	ProviderOllamaCloud    = "ollama_cloud"    // Ollama Cloud (Bearer token required)
+	ProviderACP            = "acp"             // ACP (Agent Client Protocol) agent subprocess
+	ProviderNovita         = "novita"          // Novita AI (OpenAI-compatible endpoint)
+	ProviderBytePlus       = "byteplus"        // BytePlus ModelArk (Seed 2.0 models)
+	ProviderBytePlusCoding = "byteplus_coding" // BytePlus ModelArk Coding Plan
+	ProviderVertex         = "vertex"          // Google Cloud Vertex AI (OAuth2 service account + ADC)
+	ProviderKimiCoding     = "kimi_coding"     // Moonshot Kimi Coding (OpenAI-compat, requires fixed User-Agent)
+	ProviderAtlasCloud     = "atlascloud"      // Atlas Cloud (OpenAI-compatible endpoint)
+	ProviderAPIRoute       = "api_route"       // API Route (OpenAI-compatible endpoint)
 
 	// MiniMax defaults.
 	MiniMaxDefaultAPIBase = "https://api.minimax.io/v1"

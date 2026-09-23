@@ -331,6 +331,24 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 			registerACPFromDB(registry, p, configuredShellDenyGroups(cfg))
 			continue
 		}
+		// Scripted provider (offline fixtures) — only when explicitly enabled.
+		if p.ProviderType == store.ProviderScripted {
+			if !providers.ScriptedProviderEnabled() {
+				slog.Warn("scripted provider skipped: set "+providers.ScriptedProviderEnvVar+"=1 to enable", "name", p.Name)
+				continue
+			}
+			script, err := providers.ParseScript(p.Settings)
+			if err == nil {
+				var prov *providers.ScriptedProvider
+				if prov, err = providers.NewScriptedProvider(p.Name, script); err == nil {
+					registry.RegisterForTenant(p.TenantID, prov)
+					slog.Warn("registered SCRIPTED provider (canned responses, offline use only)", "name", p.Name)
+					continue
+				}
+			}
+			slog.Warn("scripted provider invalid", "name", p.Name, "error", err)
+			continue
+		}
 		// Local Ollama requires no API key — handle before the key guard (same pattern as ClaudeCLI).
 		// api_base is stored with /v1 (normalized at write time), so no suffix appending needed.
 		if p.ProviderType == store.ProviderOllama {

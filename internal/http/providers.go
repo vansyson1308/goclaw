@@ -256,6 +256,22 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) providerRu
 		h.providerReg.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))
 		return providerRuntimeRegistered
 	}
+	// Scripted provider (offline fixtures): mirrors startup registration.
+	if p.ProviderType == store.ProviderScripted {
+		if !providers.ScriptedProviderEnabled() {
+			return providerRuntimeSkipped
+		}
+		script, err := providers.ParseScript(p.Settings)
+		if err != nil {
+			return providerRuntimeInvalidConfig
+		}
+		prov, err := providers.NewScriptedProvider(p.Name, script)
+		if err != nil {
+			return providerRuntimeInvalidConfig
+		}
+		h.providerReg.RegisterForTenant(p.TenantID, prov)
+		return providerRuntimeRegistered
+	}
 	// Ollama doesn't need an API key — handle before the key guard (same as startup).
 	// In Docker, swap localhost → host.docker.internal so the container can reach the host.
 	if p.ProviderType == store.ProviderOllama {
@@ -628,7 +644,8 @@ func (h *ProvidersHandler) handleCreateProvider(w http.ResponseWriter, r *http.R
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidSlug, "name")})
 		return
 	}
-	if !store.ValidProviderTypes[p.ProviderType] {
+	scriptedAllowed := p.ProviderType == store.ProviderScripted && providers.ScriptedProviderEnabled()
+	if !store.ValidProviderTypes[p.ProviderType] && !scriptedAllowed {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "unsupported provider_type")})
 		return
 	}

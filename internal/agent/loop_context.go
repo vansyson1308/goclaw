@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -246,6 +247,18 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 			ctx = tools.WithToolTeamWorkspace(ctx, read.workspace)
 			ctx = tools.WithToolTeamRoot(ctx, read.root)
 		}
+	}
+
+	// Mission workspace: exclusive, fail-closed pin (no team/delegation mixing).
+	if req.MissionWorkspace != "" {
+		if isArtifactDelegation || req.TeamWorkspace != "" {
+			return contextSetupResult{}, fmt.Errorf("mission workspace cannot be combined with team or delegation workspaces")
+		}
+		info, err := os.Stat(req.MissionWorkspace)
+		if err != nil || !info.IsDir() || !filepath.IsAbs(req.MissionWorkspace) {
+			return contextSetupResult{}, fmt.Errorf("mission workspace unavailable: %q", req.MissionWorkspace)
+		}
+		ctx = tools.WithToolWorkspace(ctx, filepath.Clean(req.MissionWorkspace))
 	}
 
 	// Team workspace: dispatched task overrides default workspace.

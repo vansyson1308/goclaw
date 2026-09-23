@@ -2415,3 +2415,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS mcp_oauth_tokens_global_uq
 CREATE UNIQUE INDEX IF NOT EXISTS mcp_oauth_tokens_user_uq
     ON mcp_oauth_tokens (server_id, tenant_id, user_id) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_server_tenant ON mcp_oauth_tokens (server_id, tenant_id);
+
+-- ============================================================
+-- Missions (docs/mission-control/MISSIONS.md)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS missions (
+    id              TEXT NOT NULL PRIMARY KEY,
+    tenant_id       TEXT NOT NULL REFERENCES tenants(id),
+    owner_id        TEXT NOT NULL,
+    agent_key       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    contract        TEXT NOT NULL,
+    contract_digest TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'planned',
+    status_reason   TEXT,
+    executor        TEXT,
+    workspace_path  TEXT,
+    base_revision   TEXT,
+    verification    TEXT,
+    diff            TEXT,
+    diff_truncated  INTEGER NOT NULL DEFAULT 0,
+    changed_files   TEXT,
+    summary         TEXT,
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    cost_usd        REAL,
+    iterations      INTEGER NOT NULL DEFAULT 0,
+    state_version   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    started_at      TEXT,
+    finished_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_missions_tenant_created ON missions(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
+CREATE TABLE IF NOT EXISTS mission_events (
+    id          TEXT NOT NULL PRIMARY KEY,
+    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
+    mission_id  TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    from_status TEXT,
+    to_status   TEXT,
+    actor       TEXT NOT NULL,
+    message     TEXT,
+    detail      TEXT,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mission_events_mission ON mission_events(mission_id, created_at);

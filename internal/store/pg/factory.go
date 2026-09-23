@@ -66,6 +66,7 @@ func NewPGStores(cfg store.StoreConfig) (*store.Stores, error) {
 		Episodic:               NewPGEpisodicStore(db),
 		EvolutionMetrics:       NewPGEvolutionMetricsStore(db),
 		EvolutionSuggestions:   NewPGEvolutionSuggestionStore(db),
+		Missions:               NewPGMissionStore(db),
 		BitrixPortals:          NewPGBitrixPortalStore(db, cfg.EncryptionKey),
 		Hooks:                  NewPGHookStore(db),
 		Webhooks:               NewPGWebhookStore(db),

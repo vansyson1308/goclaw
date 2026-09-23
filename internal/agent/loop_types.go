@@ -680,6 +680,10 @@ type RunRequest struct {
 	// TeamWorkspace overrides the member agent's workspace with the team's workspace
 	// so file operations (read/write/image/audio) use the shared team directory.
 	TeamWorkspace string
+	// MissionWorkspace pins file and exec tools to a mission's prepared,
+	// isolated workspace. Unlike TeamWorkspace it is fail-closed: the
+	// directory must already exist and no fallback workspace is used.
+	MissionWorkspace string
 
 	// enrichedInputMessage is populated by the media stage and consumed by the
 	// first persistence checkpoint. It keeps current-turn MediaRefs and logical

@@ -102,6 +102,17 @@ type pipelineCallbackSet struct {
 func (l *Loop) makeResolveWorkspace(req *RunRequest) func(ctx context.Context, input *pipeline.RunInput) (*workspace.WorkspaceContext, error) {
 	resolver := workspace.NewResolver()
 	return func(ctx context.Context, input *pipeline.RunInput) (*workspace.WorkspaceContext, error) {
+		if req.MissionWorkspace != "" {
+			// Keep the prompt's workspace in line with the pinned tool workspace.
+			return &workspace.WorkspaceContext{
+				ActivePath:       req.MissionWorkspace,
+				Scope:            workspace.ScopeDelegate,
+				MemoryScope:      "user",
+				KGScope:          "user",
+				OwnerID:          input.UserID,
+				EnforcementLabel: "You are working on a mission. Only access files inside the mission workspace; use relative paths.",
+			}, nil
+		}
 		var teamID *string
 		if input.TeamID != "" {
 			teamID = &input.TeamID

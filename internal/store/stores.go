@@ -45,6 +45,7 @@ type Stores struct {
 	Episodic              EpisodicStore
 	EvolutionMetrics      EvolutionMetricsStore
 	EvolutionSuggestions  EvolutionSuggestionStore
+	Missions              MissionStore
 	BitrixPortals         BitrixPortalStore
 	// Hooks is hooks.HookStore — typed as any to avoid import cycle
 	// (hooks package imports store for context helpers).
