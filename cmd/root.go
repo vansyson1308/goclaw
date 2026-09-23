@@ -51,6 +51,7 @@ func init() {
 	rootCmd.AddCommand(tracesCmd())
 	rootCmd.AddCommand(migrateCmd())
 	rootCmd.AddCommand(upgradeCmd())
+	rootCmd.AddCommand(evolutionCmd())
 	rootCmd.AddCommand(backupCmd())
 	rootCmd.AddCommand(restoreCmd())
 	rootCmd.AddCommand(tenantBackupCmd())

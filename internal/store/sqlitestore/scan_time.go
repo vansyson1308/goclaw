@@ -93,3 +93,12 @@ func (nt *nullSqliteTime) Scan(src any) error {
 func (nt *nullSqliteTime) NullTime() sql.NullTime {
 	return sql.NullTime{Time: nt.Time, Valid: nt.Valid}
 }
+
+// ptr returns a pointer to the time, or nil when NULL.
+func (nt nullSqliteTime) ptr() *time.Time {
+	if !nt.Valid {
+		return nil
+	}
+	t := nt.Time
+	return &t
+}

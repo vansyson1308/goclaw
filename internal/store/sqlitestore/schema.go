@@ -16,7 +16,7 @@ var schemaSQL string
 
 // SchemaVersion is the current SQLite schema version.
 // Bump this when adding new migration steps below.
-const SchemaVersion = 60
+const SchemaVersion = 61
 
 // migrations maps version → SQL to apply when upgrading FROM that version.
 // schema.sql always represents the LATEST full schema (for fresh DBs).
@@ -95,6 +95,13 @@ BEGIN
 END;`
 
 var migrations = map[int]string{
+	// Version 60 → 61: transactional apply/rollback bookkeeping for agent
+	// evolution suggestions + append-only audit trail (PG migration 000098).
+	// Version 60 → 61: evolution apply/rollback bookkeeping + audit table (PG
+	// 000098). Placeholder only: EnsureSchema builds the real patch with
+	// sqliteEvolutionApplyStateMigrationPatch so column adds are idempotent.
+	60: `SELECT 1;`,
+
 	// Version 59 → 60: keep an append-only copy of group capture. Pending rows are
 	// deleted when the buffer is handed to the agent and when compaction replaces
 	// them with a summary; before this table those deletes destroyed the only copy.
@@ -1613,6 +1620,12 @@ func EnsureSchema(db *sql.DB) error {
 					return fmt.Errorf("inspect channel pending message parent column: %w", err)
 				}
 			}
+			if v == 60 {
+				patch, err = sqliteEvolutionApplyStateMigrationPatch(db)
+				if err != nil {
+					return fmt.Errorf("inspect evolution suggestion columns: %w", err)
+				}
+			}
 			if v == 58 {
 				patch, err = sqliteSubagentRootAgentMigrationPatch(db)
 				if err != nil {
@@ -1825,4 +1838,46 @@ func seedMasterTenant(db *sql.DB) error {
 		slog.Warn("sqlite: seed master tenant failed", "error", err)
 	}
 	return nil
+}
+
+// sqliteEvolutionEventsDDL creates the evolution audit table (v60 → v61).
+const sqliteEvolutionEventsDDL = `CREATE TABLE IF NOT EXISTS agent_evolution_events (
+    id            TEXT NOT NULL PRIMARY KEY,
+    tenant_id     TEXT NOT NULL REFERENCES tenants(id),
+    suggestion_id TEXT NOT NULL REFERENCES agent_evolution_suggestions(id) ON DELETE CASCADE,
+    agent_id      TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    from_status   TEXT NOT NULL,
+    to_status     TEXT NOT NULL,
+    actor         TEXT NOT NULL,
+    detail        TEXT,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_evo_events_suggestion ON agent_evolution_events(suggestion_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_evo_events_tenant ON agent_evolution_events(tenant_id);
+`
+
+// sqliteEvolutionApplyStateMigrationPatch adds the apply/rollback bookkeeping
+// columns that are missing (v60 → v61). Idempotent: DBs created from the full
+// schema already have them.
+func sqliteEvolutionApplyStateMigrationPatch(db *sql.DB) (string, error) {
+	columns := []struct{ name, ddl string }{
+		{"applied_at", "TEXT"},
+		{"applied_by", "TEXT"},
+		{"rolled_back_at", "TEXT"},
+		{"rolled_back_by", "TEXT"},
+		{"applied_change", "TEXT"},
+		{"state_version", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	patch := ""
+	for _, col := range columns {
+		hasColumn, err := sqliteColumnExists(db, "agent_evolution_suggestions", col.name)
+		if err != nil {
+			return "", err
+		}
+		if !hasColumn {
+			patch += fmt.Sprintf("ALTER TABLE agent_evolution_suggestions ADD COLUMN %s %s;\n", col.name, col.ddl)
+		}
+	}
+	return patch + sqliteEvolutionEventsDDL, nil
 }

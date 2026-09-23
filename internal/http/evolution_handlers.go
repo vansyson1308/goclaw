@@ -1,7 +1,9 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -10,8 +12,10 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // EvolutionHandler serves evolution metrics and suggestion endpoints.
@@ -25,11 +29,11 @@ type EvolutionHandler struct {
 	skillLoader *skills.Loader
 	dataDir     string
 
-	// Optional: agent store for applying threshold suggestions.
+	// Optional: agent store for applying agent-scoped config suggestions.
 	agentStore store.AgentStore
 
-	// Optional: tenant tool config for disabling tools on SuggestToolOrder approval.
-	toolTenantCfgs store.BuiltinToolTenantConfigStore
+	// Optional: broadcasts agent cache invalidation after a config change.
+	msgBus *bus.MessageBus
 }
 
 // EvolutionHandlerOpt configures optional EvolutionHandler dependencies.
@@ -44,14 +48,14 @@ func WithSkillCreation(ss store.SkillManageStore, loader *skills.Loader, dataDir
 	}
 }
 
-// WithAgentStore enables threshold suggestion auto-apply on approval.
+// WithAgentStore enables applying agent-scoped config suggestions (tool_order).
 func WithAgentStore(as store.AgentStore) EvolutionHandlerOpt {
 	return func(h *EvolutionHandler) { h.agentStore = as }
 }
 
-// WithToolTenantCfgs enables tool disabling on SuggestToolOrder approval.
-func WithToolTenantCfgs(tc store.BuiltinToolTenantConfigStore) EvolutionHandlerOpt {
-	return func(h *EvolutionHandler) { h.toolTenantCfgs = tc }
+// WithMessageBus enables agent cache invalidation after applied/rolled-back changes.
+func WithMessageBus(mb *bus.MessageBus) EvolutionHandlerOpt {
+	return func(h *EvolutionHandler) { h.msgBus = mb }
 }
 
 func NewEvolutionHandler(m store.EvolutionMetricsStore, s store.EvolutionSuggestionStore, opts ...EvolutionHandlerOpt) *EvolutionHandler {
@@ -66,6 +70,7 @@ func (h *EvolutionHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/agents/{agentID}/evolution/metrics", h.auth(h.handleGetMetrics))
 	mux.HandleFunc("GET /v1/agents/{agentID}/evolution/suggestions", h.auth(h.handleListSuggestions))
 	mux.HandleFunc("PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}", h.auth(h.handleUpdateSuggestion))
+	mux.HandleFunc("GET /v1/agents/{agentID}/evolution/suggestions/{suggestionID}/events", h.auth(h.handleListEvents))
 }
 
 func (h *EvolutionHandler) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -170,9 +175,13 @@ func (h *EvolutionHandler) handleListSuggestions(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, suggestions)
 }
 
-// handleUpdateSuggestion updates a suggestion's status (approve/reject/rollback).
+// handleUpdateSuggestion reviews a suggestion: approve (apply when the type
+// has a reversible config change), reject, or roll back an applied one.
+// The audit actor is always the authenticated identity; a client-supplied
+// reviewed_by is ignored.
 func (h *EvolutionHandler) handleUpdateSuggestion(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
+	ctx := r.Context()
 	agentID, err := uuid.Parse(r.PathValue("agentID"))
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid agent ID"})
@@ -186,7 +195,7 @@ func (h *EvolutionHandler) handleUpdateSuggestion(w http.ResponseWriter, r *http
 	}
 
 	// Verify suggestion belongs to the agent in the URL path.
-	existing, err := h.suggestions.GetSuggestion(r.Context(), suggestionID)
+	existing, err := h.suggestions.GetSuggestion(ctx, suggestionID)
 	if err != nil || existing == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "suggestion not found"})
 		return
@@ -198,94 +207,178 @@ func (h *EvolutionHandler) handleUpdateSuggestion(w http.ResponseWriter, r *http
 
 	var body struct {
 		Status     string `json:"status"`
-		ReviewedBy string `json:"reviewed_by"`
 		SkillDraft string `json:"skill_draft,omitempty"` // override draft content for skill_add approval
+		Reason     string `json:"reason,omitempty"`
 	}
 	if !bindJSON(w, r, locale, &body) {
 		return
 	}
+	actor := evolutionActor(ctx)
 
-	// Validate status transition.
 	switch body.Status {
-	case "approved", "rejected", "rolled_back":
-		// valid
-	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be approved, rejected, or rolled_back"})
-		return
-	}
-
-	// Use auth context user if reviewed_by not provided.
-	reviewedBy := body.ReviewedBy
-	if reviewedBy == "" {
-		reviewedBy = store.UserIDFromContext(r.Context())
-	}
-
-	// Handle approval: dispatch by suggestion type.
-	if body.Status == "approved" {
-		switch existing.SuggestionType {
-		case store.SuggestSkillAdd:
-			if err := h.applySkillDraft(r.Context(), *existing, body.SkillDraft, reviewedBy); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "action": "skill_created"})
-			return
-
-		case store.SuggestToolOrder:
-			action := "tool_order_approved"
-			if h.toolTenantCfgs != nil {
-				// Extract tool name from suggestion parameters.
-				var params map[string]any
-				if err := json.Unmarshal(existing.Parameters, &params); err == nil {
-					if toolName, _ := params["tool"].(string); toolName != "" {
-						// Disable tool at tenant level using existing infrastructure.
-						if err := h.toolTenantCfgs.Set(r.Context(), existing.TenantID, toolName, false); err != nil {
-							slog.Warn("evolution.tool_order.disable_failed", "tool", toolName, "error", err)
-						} else {
-							action = "tool_disabled"
-						}
-					}
-				}
-			}
-			if err := h.suggestions.UpdateSuggestionStatus(r.Context(), suggestionID, "applied", reviewedBy); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "action": action})
-			return
-
-		case store.SuggestThreshold:
-			if h.agentStore == nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "threshold auto-apply not available"})
-				return
-			}
-			// Count recent retrieval data points for guardrail check.
-			since := time.Now().AddDate(0, 0, -7)
-			recentMetrics, err := h.metrics.QueryMetrics(r.Context(), agentID, store.MetricRetrieval, since, 500)
-			if err != nil {
-				slog.Warn("evolution.query_metrics_for_guardrail failed", "error", err)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to query metrics for guardrail check"})
-				return
-			}
-			guardrails := agent.DefaultGuardrails()
-			if err := agent.CheckGuardrails(guardrails, *existing, len(recentMetrics)); err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-				return
-			}
-			if err := agent.ApplySuggestion(r.Context(), h.agentStore, h.suggestions, *existing, guardrails); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "action": "threshold_applied"})
+	case store.SuggestionApproved:
+		h.approveSuggestion(w, r, *existing, body.SkillDraft, actor)
+	case store.SuggestionRejected:
+		updated, err := h.suggestions.TransitionSuggestion(ctx, store.SuggestionTransition{
+			// "applying" is included so an operator can resolve a claim left by
+			// a crash (see `goclaw evolution reconcile`); any side effect that
+			// did complete (e.g. a created skill) is left for them to handle.
+			ID: suggestionID, From: []string{store.SuggestionPending, store.SuggestionApproved, store.SuggestionApplying},
+			To: store.SuggestionRejected, Actor: actor, Action: "reject",
+			Detail: map[string]any{"reason": body.Reason},
+		})
+		writeTransitionResult(w, updated, "rejected", err)
+	case store.SuggestionRolledBack:
+		if existing.SuggestionType == store.SuggestSkillAdd {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "skill_add cannot be rolled back here; archive or delete the created skill instead"})
 			return
 		}
-		// Other types: fall through to status-only update.
+		updated, err := agent.RollbackSuggestion(ctx, h.suggestions, *existing, actor, body.Reason)
+		if err == nil {
+			h.invalidateAgent(ctx, agentID)
+		}
+		writeTransitionResult(w, updated, "rolled_back", err)
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be approved, rejected, or rolled_back"})
 	}
+}
 
-	if err := h.suggestions.UpdateSuggestionStatus(r.Context(), suggestionID, body.Status, reviewedBy); err != nil {
-		slog.Warn("evolution.update_suggestion failed", "error", err)
+func (h *EvolutionHandler) approveSuggestion(w http.ResponseWriter, r *http.Request, sg store.EvolutionSuggestion, skillDraft, actor string) {
+	ctx := r.Context()
+	switch sg.SuggestionType {
+	case store.SuggestSkillAdd:
+		updated, err := h.applySkillDraft(ctx, sg, skillDraft, actor)
+		writeTransitionResult(w, updated, "skill_created", err)
+
+	case store.SuggestToolOrder:
+		if h.agentStore == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tool_order apply not available"})
+			return
+		}
+		ag, err := h.agentStore.GetByID(ctx, sg.AgentID)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "agent not found"})
+			return
+		}
+		g := agent.GuardrailsForAgent(ag)
+		if err := agent.CheckLockedTarget(g, "tools_config", []string{"deny"}); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		dataPoints, err := h.toolCallCount(ctx, sg)
+		if err != nil {
+			slog.Warn("evolution.query_metrics_for_guardrail failed", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to query metrics for guardrail check"})
+			return
+		}
+		if err := agent.CheckGuardrails(g, sg, dataPoints); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		updated, err := agent.ApplyToolOrder(ctx, h.suggestions, sg, actor)
+		if err == nil {
+			h.invalidateAgent(ctx, sg.AgentID)
+		}
+		writeTransitionResult(w, updated, "tool_denied_for_agent", err)
+
+	default:
+		// threshold (and unknown types): no safe automatic change exists.
+		updated, err := agent.AcknowledgeAdvisory(ctx, h.suggestions, sg, actor,
+			"advisory suggestion: review manually; no automatic config change is applied")
+		writeTransitionResult(w, updated, "acknowledged", err)
+	}
+}
+
+// toolCallCount counts the tool's recorded calls over the last 7 days — the
+// data behind a tool_order suggestion — for the MinDataPoints guardrail.
+func (h *EvolutionHandler) toolCallCount(ctx context.Context, sg store.EvolutionSuggestion) (int, error) {
+	var params struct {
+		Tool string `json:"tool"`
+	}
+	_ = json.Unmarshal(sg.Parameters, &params)
+	aggs, err := h.metrics.AggregateToolMetrics(ctx, sg.AgentID, time.Now().AddDate(0, 0, -7))
+	if err != nil {
+		return 0, err
+	}
+	for _, a := range aggs {
+		if a.ToolName == params.Tool {
+			return a.CallCount, nil
+		}
+	}
+	return 0, nil
+}
+
+// handleListEvents returns the audit trail of a suggestion.
+func (h *EvolutionHandler) handleListEvents(w http.ResponseWriter, r *http.Request) {
+	agentID, err1 := uuid.Parse(r.PathValue("agentID"))
+	suggestionID, err2 := uuid.Parse(r.PathValue("suggestionID"))
+	if err1 != nil || err2 != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ID"})
+		return
+	}
+	sg, err := h.suggestions.GetSuggestion(r.Context(), suggestionID)
+	if err != nil || sg == nil || sg.AgentID != agentID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "suggestion not found"})
+		return
+	}
+	events, err := h.suggestions.ListSuggestionEvents(r.Context(), suggestionID)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	if events == nil {
+		events = []store.EvolutionEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+func (h *EvolutionHandler) invalidateAgent(ctx context.Context, agentID uuid.UUID) {
+	if h.msgBus == nil || h.agentStore == nil {
+		return
+	}
+	ag, err := h.agentStore.GetByID(ctx, agentID)
+	if err != nil {
+		return
+	}
+	h.msgBus.Broadcast(bus.Event{
+		Name:    protocol.EventCacheInvalidate,
+		Payload: bus.CacheInvalidatePayload{Kind: bus.CacheKindAgent, Key: ag.AgentKey},
+	})
+}
+
+// evolutionActor is the authenticated identity recorded in the audit trail.
+func evolutionActor(ctx context.Context) string {
+	if id := store.ActorIDFromContext(ctx); id != "" {
+		return id
+	}
+	if role := store.RoleFromContext(ctx); role != "" {
+		return "token:" + role
+	}
+	return "unknown"
+}
+
+func writeTransitionResult(w http.ResponseWriter, sg *store.EvolutionSuggestion, action string, err error) {
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "action": action, "suggestion": sg})
+	case errors.Is(err, store.ErrSuggestionStateConflict), errors.Is(err, agent.ErrRollbackConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	case errors.Is(err, agent.ErrNotApplicable):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	default:
+		slog.Warn("evolution.transition failed", "action", action, "error", err)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+}
+
+// HandleUpdateSuggestionForTest invokes the review handler without auth
+// middleware. Integration tests must inject tenant and user into the request
+// context. Production code MUST go through RegisterRoutes.
+func (h *EvolutionHandler) HandleUpdateSuggestionForTest(w http.ResponseWriter, r *http.Request) {
+	h.handleUpdateSuggestion(w, r)
+}
+
+// HandleListEventsForTest invokes the audit-trail handler without auth middleware.
+func (h *EvolutionHandler) HandleListEventsForTest(w http.ResponseWriter, r *http.Request) {
+	h.handleListEvents(w, r)
 }

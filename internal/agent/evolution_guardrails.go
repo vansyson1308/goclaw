@@ -3,12 +3,12 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"slices"
+	"strings"
 
-	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
@@ -30,8 +30,38 @@ func DefaultGuardrails() AdaptationGuardrails {
 	}
 }
 
+// GuardrailsForAgent returns the agent's configured guardrails
+// (other_config.evolution_guardrails) layered over the defaults. Missing or
+// non-positive numeric fields keep their default; the UI writes this key.
+func GuardrailsForAgent(ag *store.AgentData) AdaptationGuardrails {
+	g := DefaultGuardrails()
+	if ag == nil || len(ag.OtherConfig) == 0 {
+		return g
+	}
+	var oc struct {
+		Guardrails *AdaptationGuardrails `json:"evolution_guardrails"`
+	}
+	if err := json.Unmarshal(ag.OtherConfig, &oc); err != nil || oc.Guardrails == nil {
+		return g
+	}
+	c := oc.Guardrails
+	if c.MaxDeltaPerCycle > 0 {
+		g.MaxDeltaPerCycle = c.MaxDeltaPerCycle
+	}
+	if c.MinDataPoints > 0 {
+		g.MinDataPoints = c.MinDataPoints
+	}
+	if c.RollbackOnDrop > 0 {
+		g.RollbackOnDrop = c.RollbackOnDrop
+	}
+	g.LockedParams = c.LockedParams
+	return g
+}
+
 // CheckGuardrails validates a suggestion against guardrail constraints.
 // Returns an error describing the violation, or nil if safe to apply.
+// LockedParams match suggestion parameter keys and, via CheckLockedTarget,
+// the dotted config path a change would touch.
 func CheckGuardrails(g AdaptationGuardrails, sg store.EvolutionSuggestion, dataPoints int) error {
 	// Check minimum data points.
 	minDP := g.MinDataPoints
@@ -53,178 +83,158 @@ func CheckGuardrails(g AdaptationGuardrails, sg store.EvolutionSuggestion, dataP
 			}
 		}
 	}
-
-	// Threshold suggestions: the applied delta is capped at MaxDeltaPerCycle in ApplySuggestion,
-	// so no additional delta check is needed here. MinDataPoints and LockedParams already guard safety.
-
 	return nil
 }
 
-// ApplySuggestion applies an approved suggestion's parameters to the agent's other_config JSONB.
-// Stores the previous values in the suggestion's parameters for rollback.
-// Scope: only retrieval-related parameters. Never security or core settings.
-func ApplySuggestion(ctx context.Context, agentStore store.AgentStore, sugStore store.EvolutionSuggestionStore, sg store.EvolutionSuggestion, guardrails AdaptationGuardrails) error {
-	// Load current agent config.
-	agent, err := agentStore.GetByID(ctx, sg.AgentID)
-	if err != nil {
-		return fmt.Errorf("load agent: %w", err)
+// CheckLockedTarget rejects a change to a config path listed in LockedParams
+// (dotted form, e.g. "tools_config.deny").
+func CheckLockedTarget(g AdaptationGuardrails, column string, path []string) error {
+	target := column + "." + strings.Join(path, ".")
+	if slices.Contains(g.LockedParams, target) {
+		return fmt.Errorf("parameter %q is locked", target)
 	}
-
-	var otherConfig map[string]any
-	if len(agent.OtherConfig) > 0 {
-		_ = json.Unmarshal(agent.OtherConfig, &otherConfig)
-	}
-	if otherConfig == nil {
-		otherConfig = make(map[string]any)
-	}
-
-	// Store baseline for rollback: snapshot current retrieval params.
-	baseline := make(map[string]any)
-	if v, ok := otherConfig["retrieval_threshold"]; ok {
-		baseline["retrieval_threshold"] = v
-	}
-
-	// Apply suggestion-specific changes based on type.
-	switch sg.SuggestionType {
-	case store.SuggestThreshold:
-		// Raise retrieval threshold by MaxDeltaPerCycle (bounded by guardrails).
-		current, _ := otherConfig["retrieval_threshold"].(float64)
-		if current == 0 {
-			current = 0.3 // default threshold
-		}
-		delta := guardrails.MaxDeltaPerCycle
-		if delta <= 0 {
-			delta = 0.05 // fallback
-		}
-		newThreshold := current + delta
-		if newThreshold > 0.95 {
-			newThreshold = 0.95
-		}
-		otherConfig["retrieval_threshold"] = newThreshold
-	default:
-		// Non-threshold suggestions are informational only, no auto-apply.
-		return fmt.Errorf("suggestion type %q does not support auto-apply", sg.SuggestionType)
-	}
-
-	// Save updated config.
-	configJSON, _ := json.Marshal(otherConfig)
-	if err := agentStore.Update(ctx, sg.AgentID, map[string]any{
-		"other_config": json.RawMessage(configJSON),
-	}); err != nil {
-		return fmt.Errorf("update agent config: %w", err)
-	}
-
-	// Persist baseline into suggestion parameters for future rollback.
-	var sgParams map[string]any
-	_ = json.Unmarshal(sg.Parameters, &sgParams)
-	if sgParams == nil {
-		sgParams = make(map[string]any)
-	}
-	sgParams["_baseline"] = baseline
-	updatedParams, _ := json.Marshal(sgParams)
-	if err := sugStore.UpdateSuggestionParameters(ctx, sg.ID, updatedParams); err != nil {
-		return fmt.Errorf("save baseline: %w", err)
-	}
-	if err := sugStore.UpdateSuggestionStatus(ctx, sg.ID, "applied", "auto-adapt"); err != nil {
-		return fmt.Errorf("update suggestion status: %w", err)
-	}
-
-	slog.Info("evolution.auto_adapt.applied", "agent", sg.AgentID, "type", sg.SuggestionType)
 	return nil
 }
 
-// RollbackSuggestion reverts an applied suggestion by restoring baseline values.
-func RollbackSuggestion(ctx context.Context, agentStore store.AgentStore, sugStore store.EvolutionSuggestionStore, sg store.EvolutionSuggestion) error {
-	// Extract baseline from suggestion params.
-	var sgParams map[string]any
-	if err := json.Unmarshal(sg.Parameters, &sgParams); err != nil {
-		return fmt.Errorf("parse suggestion params: %w", err)
+var (
+	// ErrRollbackConflict means the config no longer holds the applied value,
+	// so rolling back would overwrite a newer, unrelated change.
+	ErrRollbackConflict = errors.New("rollback conflict: config changed since apply")
+	// ErrNotApplicable means the suggestion type has no reversible config change.
+	ErrNotApplicable = errors.New("suggestion type has no config change to apply or roll back")
+)
+
+// ApplyToolOrder applies an approved tool_order suggestion by adding the tool
+// to the originating agent's tools_config.deny — scoped to that agent only.
+// Status check, config write, baseline and audit are one transaction.
+func ApplyToolOrder(ctx context.Context, sugStore store.EvolutionSuggestionStore, sg store.EvolutionSuggestion, actor string) (*store.EvolutionSuggestion, error) {
+	if sg.SuggestionType != store.SuggestToolOrder {
+		return nil, ErrNotApplicable
 	}
-	baseline, _ := sgParams["_baseline"].(map[string]any)
-	if baseline == nil {
-		return fmt.Errorf("no baseline data for rollback")
+	var params struct {
+		Tool string `json:"tool"`
 	}
-
-	// Load current config and restore baseline values.
-	agent, err := agentStore.GetByID(ctx, sg.AgentID)
-	if err != nil {
-		return fmt.Errorf("load agent: %w", err)
+	if err := json.Unmarshal(sg.Parameters, &params); err != nil || strings.TrimSpace(params.Tool) == "" {
+		return nil, fmt.Errorf("tool_order suggestion has no tool parameter")
 	}
-	var otherConfig map[string]any
-	if len(agent.OtherConfig) > 0 {
-		_ = json.Unmarshal(agent.OtherConfig, &otherConfig)
-	}
-	if otherConfig == nil {
-		otherConfig = make(map[string]any)
-	}
+	tool := strings.TrimSpace(params.Tool)
+	path := []string{"deny"}
 
-	// Restore each baseline parameter.
-	maps.Copy(otherConfig, baseline)
-
-	configJSON, _ := json.Marshal(otherConfig)
-	if err := agentStore.Update(ctx, sg.AgentID, map[string]any{
-		"other_config": json.RawMessage(configJSON),
-	}); err != nil {
-		return fmt.Errorf("rollback agent config: %w", err)
-	}
-
-	if err := sugStore.UpdateSuggestionStatus(ctx, sg.ID, "rolled_back", "auto-adapt"); err != nil {
-		return fmt.Errorf("update suggestion status: %w", err)
-	}
-
-	slog.Info("evolution.auto_adapt.rolled_back", "agent", sg.AgentID, "type", sg.SuggestionType)
-	return nil
-}
-
-// EvaluateApplied checks if applied suggestions improved or degraded quality.
-// Rolls back suggestions where quality dropped more than the guardrail threshold.
-func EvaluateApplied(ctx context.Context, agentID uuid.UUID, guardrails AdaptationGuardrails,
-	metricsStore store.EvolutionMetricsStore, sugStore store.EvolutionSuggestionStore,
-	agentStore store.AgentStore) error {
-
-	// Find applied suggestions for this agent.
-	applied, err := sugStore.ListSuggestions(ctx, agentID, "applied", 20)
-	if err != nil {
-		return err
-	}
-
-	rollbackPct := guardrails.RollbackOnDrop
-	if rollbackPct <= 0 {
-		rollbackPct = 20.0
-	}
-
-	for _, sg := range applied {
-		// Only evaluate threshold suggestions (the only auto-apply type).
-		if sg.SuggestionType != store.SuggestThreshold {
-			continue
-		}
-
-		// Compare current retrieval usage to baseline.
-		var sgParams map[string]any
-		_ = json.Unmarshal(sg.Parameters, &sgParams)
-		baselineRate, _ := sgParams["current_usage_rate"].(float64)
-		if baselineRate == 0 {
-			continue
-		}
-
-		// Get current retrieval metrics.
-		currentAggs, err := metricsStore.AggregateRetrievalMetrics(ctx, agentID, sg.CreatedAt)
-		if err != nil || len(currentAggs) == 0 {
-			continue
-		}
-
-		// Check if usage rate dropped significantly.
-		for _, agg := range currentAggs {
-			drop := (baselineRate - agg.UsageRate) / baselineRate * 100
-			if drop > rollbackPct {
-				slog.Warn("evolution.auto_adapt.quality_drop",
-					"agent", agentID, "source", agg.Source,
-					"baseline", baselineRate, "current", agg.UsageRate, "drop_pct", drop)
-				_ = RollbackSuggestion(ctx, agentStore, sugStore, sg)
-				break
+	return sugStore.TransitionSuggestion(ctx, store.SuggestionTransition{
+		ID:     sg.ID,
+		From:   []string{store.SuggestionPending, store.SuggestionApproved},
+		To:     store.SuggestionApplied,
+		Actor:  actor,
+		Action: "apply",
+		Column: "tools_config",
+		Detail: map[string]any{"tool": tool, "scope": "agent"},
+		Mutate: func(_ *store.EvolutionSuggestion, current json.RawMessage) (json.RawMessage, *store.AgentConfigChange, error) {
+			before, err := store.ConfigGetPath(current, path)
+			if err != nil {
+				return nil, nil, err
 			}
-		}
-	}
+			var deny []string
+			if before.Present {
+				if err := json.Unmarshal(before.Value, &deny); err != nil {
+					return nil, nil, fmt.Errorf("tools_config.deny is not a string list: %w", err)
+				}
+			}
+			if slices.Contains(deny, tool) {
+				return nil, nil, fmt.Errorf("%w: tool %q is already denied for this agent", store.ErrSuggestionStateConflict, tool)
+			}
+			afterVal, _ := json.Marshal(append(slices.Clone(deny), tool))
+			after := store.ConfigValue{Present: true, Value: afterVal}
+			next, err := store.ConfigSetPath(current, path, after)
+			if err != nil {
+				return nil, nil, err
+			}
+			return next, &store.AgentConfigChange{Column: "tools_config", Path: path, Before: before, After: after}, nil
+		},
+	})
+}
 
-	return nil
+// RollbackSuggestion reverts an applied suggestion to its exact prior state
+// (including removing keys that did not exist before). It refuses with
+// ErrRollbackConflict when the current value differs from what was applied.
+func RollbackSuggestion(ctx context.Context, sugStore store.EvolutionSuggestionStore, sg store.EvolutionSuggestion, actor, reason string) (*store.EvolutionSuggestion, error) {
+	change := sg.AppliedChange
+	legacy := false
+	if change == nil {
+		// Rows applied before migration 000098 kept a presence-less baseline in
+		// parameters._baseline (threshold only). A key missing from it was
+		// absent before apply, so restoring means deleting it.
+		c, ok := legacyThresholdChange(sg)
+		if !ok {
+			return nil, ErrNotApplicable
+		}
+		change, legacy = c, true
+	}
+	return sugStore.TransitionSuggestion(ctx, store.SuggestionTransition{
+		ID:     sg.ID,
+		From:   []string{store.SuggestionApplied},
+		To:     store.SuggestionRolledBack,
+		Actor:  actor,
+		Action: "rollback",
+		Column: change.Column,
+		Detail: map[string]any{"reason": reason, "legacy_baseline": legacy},
+		Mutate: func(locked *store.EvolutionSuggestion, current json.RawMessage) (json.RawMessage, *store.AgentConfigChange, error) {
+			c := change
+			if locked.AppliedChange != nil {
+				c = locked.AppliedChange // authoritative copy under lock
+			}
+			now, err := store.ConfigGetPath(current, c.Path)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !legacy && !store.ConfigValuesEqual(now, c.After) {
+				return nil, nil, fmt.Errorf("%w (at %s.%s)", ErrRollbackConflict, c.Column, strings.Join(c.Path, "."))
+			}
+			next, err := store.ConfigSetPath(current, c.Path, c.Before)
+			if err != nil {
+				return nil, nil, err
+			}
+			return next, &store.AgentConfigChange{Column: c.Column, Path: c.Path, Before: now, After: c.Before}, nil
+		},
+	})
+}
+
+func legacyThresholdChange(sg store.EvolutionSuggestion) (*store.AgentConfigChange, bool) {
+	if sg.SuggestionType != store.SuggestThreshold {
+		return nil, false
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(sg.Parameters, &params) != nil {
+		return nil, false
+	}
+	raw, ok := params["_baseline"]
+	if !ok {
+		return nil, false
+	}
+	var baseline map[string]json.RawMessage
+	if json.Unmarshal(raw, &baseline) != nil || baseline == nil {
+		return nil, false
+	}
+	before := store.ConfigValue{}
+	if v, ok := baseline["retrieval_threshold"]; ok {
+		before = store.ConfigValue{Present: true, Value: v}
+	}
+	return &store.AgentConfigChange{Column: "other_config", Path: []string{"retrieval_threshold"}, Before: before}, true
+}
+
+// AcknowledgeAdvisory records review of a suggestion type that has no safe
+// automatic change (see docs/mission-control/DECISIONS.md D5). Status moves to
+// "approved"; nothing in the agent's config changes.
+func AcknowledgeAdvisory(ctx context.Context, sugStore store.EvolutionSuggestionStore, sg store.EvolutionSuggestion, actor, reason string) (*store.EvolutionSuggestion, error) {
+	updated, err := sugStore.TransitionSuggestion(ctx, store.SuggestionTransition{
+		ID:     sg.ID,
+		From:   []string{store.SuggestionPending},
+		To:     store.SuggestionApproved,
+		Actor:  actor,
+		Action: "acknowledge",
+		Detail: map[string]any{"advisory": true, "reason": reason},
+	})
+	if err == nil {
+		slog.Info("evolution.suggestion.acknowledged", "suggestion", sg.ID, "type", sg.SuggestionType)
+	}
+	return updated, err
 }

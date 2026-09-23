@@ -1837,11 +1837,33 @@ CREATE TABLE IF NOT EXISTS agent_evolution_suggestions (
     status          TEXT NOT NULL DEFAULT 'pending',
     reviewed_by     TEXT,
     reviewed_at     TEXT,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    applied_at      TEXT,
+    applied_by      TEXT,
+    rolled_back_at  TEXT,
+    rolled_back_by  TEXT,
+    applied_change  TEXT,
+    state_version   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_evo_suggestions_agent ON agent_evolution_suggestions(agent_id, status);
 CREATE INDEX IF NOT EXISTS idx_evo_suggestions_tenant ON agent_evolution_suggestions(tenant_id);
+
+CREATE TABLE IF NOT EXISTS agent_evolution_events (
+    id            TEXT NOT NULL PRIMARY KEY,
+    tenant_id     TEXT NOT NULL REFERENCES tenants(id),
+    suggestion_id TEXT NOT NULL REFERENCES agent_evolution_suggestions(id) ON DELETE CASCADE,
+    agent_id      TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    from_status   TEXT NOT NULL,
+    to_status     TEXT NOT NULL,
+    actor         TEXT NOT NULL,
+    detail        TEXT,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_evo_events_suggestion ON agent_evolution_events(suggestion_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_evo_events_tenant ON agent_evolution_events(tenant_id);
 
 -- ============================================================
 -- Table: kg_dedup_candidates (V3 dedup review queue)

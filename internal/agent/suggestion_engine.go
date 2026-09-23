@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -89,12 +90,17 @@ func (e *SuggestionEngine) Analyze(ctx context.Context, agentID uuid.UUID) ([]st
 		Since:         since,
 	}
 
-	// Load existing pending suggestions to avoid duplicates (composite key: type + metric key).
-	existing, _ := e.suggestions.ListSuggestions(ctx, agentID, "pending", 100)
+	// Load existing suggestions to avoid duplicates (composite key: type + metric key).
+	existing, err := e.suggestions.ListSuggestions(ctx, agentID, "", 500)
+	if err != nil {
+		return nil, err
+	}
 	existingKeys := make(map[dedupKey]bool, len(existing))
 	for _, sg := range existing {
-		mk := extractMetricKey(sg.Parameters, sg.SuggestionType)
-		existingKeys[dedupKey{sg.SuggestionType, mk}] = true
+		if suppressesNewSuggestion(sg, time.Now()) {
+			mk := extractMetricKey(sg.Parameters, sg.SuggestionType)
+			existingKeys[dedupKey{sg.SuggestionType, mk}] = true
+		}
 	}
 
 	var created []store.EvolutionSuggestion
@@ -107,7 +113,8 @@ func (e *SuggestionEngine) Analyze(ctx context.Context, agentID uuid.UUID) ([]st
 		if sg == nil {
 			continue
 		}
-		// Skip if pending suggestion with same type + metric key already exists.
+		// Skip if an open, applied, or recently declined suggestion with the
+		// same type + metric key already exists.
 		mk := extractMetricKey(sg.Parameters, sg.SuggestionType)
 		if existingKeys[dedupKey{sg.SuggestionType, mk}] {
 			continue
@@ -115,7 +122,7 @@ func (e *SuggestionEngine) Analyze(ctx context.Context, agentID uuid.UUID) ([]st
 
 		sg.ID = uuid.New()
 		sg.AgentID = agentID
-		sg.Status = "pending"
+		sg.Status = store.SuggestionPending
 		if err := e.suggestions.CreateSuggestion(ctx, *sg); err != nil {
 			slog.Warn("evolution.suggestion.create_failed", "rule", rule.Name(), "agent", agentID, "error", err)
 			continue
@@ -125,6 +132,30 @@ func (e *SuggestionEngine) Analyze(ctx context.Context, agentID uuid.UUID) ([]st
 	}
 
 	return created, nil
+}
+
+// reviewCooldown keeps a rejected or rolled-back suggestion from being
+// re-proposed until a fresh window of metrics has accumulated.
+const reviewCooldown = 7 * 24 * time.Hour
+
+// suppressesNewSuggestion reports whether sg blocks proposing the same
+// type + metric key again. Before this, only "pending" blocked, so every
+// reviewed suggestion reappeared on the next 6-hourly run.
+func suppressesNewSuggestion(sg store.EvolutionSuggestion, now time.Time) bool {
+	switch sg.Status {
+	case store.SuggestionPending, store.SuggestionApplying, store.SuggestionApplied:
+		return true
+	case store.SuggestionApproved:
+		// Only advisory types stop at "approved" (acknowledged); re-propose
+		// after the cooldown if the signal persists.
+		return sg.ReviewedAt == nil || now.Sub(*sg.ReviewedAt) < reviewCooldown
+	case store.SuggestionRejected:
+		return sg.ReviewedAt != nil && now.Sub(*sg.ReviewedAt) < reviewCooldown
+	case store.SuggestionRolledBack:
+		return sg.RolledBackAt != nil && now.Sub(*sg.RolledBackAt) < reviewCooldown
+	default:
+		return false
+	}
 }
 
 // AnalyzeAll runs analysis for all agents with evolution metrics in a tenant.
@@ -142,4 +173,39 @@ func (e *SuggestionEngine) AnalyzeAll(ctx context.Context, agentIDs []uuid.UUID)
 func marshalParams(params map[string]any) json.RawMessage {
 	data, _ := json.Marshal(params)
 	return data
+}
+
+// ListEvolutionAgents returns active agents, across all active tenants, that
+// have both evolution metrics and suggestions enabled. Agents are listed per
+// tenant because a bare-context AgentStore.List fails closed (returns none).
+func ListEvolutionAgents(ctx context.Context, tenants store.TenantStore, agents store.AgentStore) ([]store.AgentData, error) {
+	if tenants == nil || agents == nil {
+		return nil, fmt.Errorf("tenant or agent store unavailable")
+	}
+	tenantList, err := tenants.ListTenants(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []store.AgentData
+	for _, t := range tenantList {
+		if t.Status != "" && t.Status != store.TenantStatusActive {
+			continue
+		}
+		list, err := agents.List(store.WithTenantID(ctx, t.ID), "")
+		if err != nil {
+			slog.Warn("evolution.list_tenant_agents_failed", "tenant", t.ID, "error", err)
+			continue
+		}
+		for _, ag := range list {
+			if ag.Status != store.AgentStatusActive {
+				continue
+			}
+			flags := ag.ParseV3Flags()
+			if !flags.EvolutionMetrics || !flags.EvolutionSuggest {
+				continue
+			}
+			out = append(out, ag)
+		}
+	}
+	return out, nil
 }

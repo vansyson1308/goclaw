@@ -17,9 +17,14 @@ const evolutionCronLockID int64 = 0x65766F6C // "evol"
 // evolutionRunHours defines when analysis runs each day (server local time).
 var evolutionRunHours = []int{3, 9, 15, 21}
 
-// runEvolutionCron runs the v3 evolution suggestion engine (every 6 hours at 3:00/9:00/15:00/21:00)
-// and evaluation/rollback check (weekly on Sundays at 3:00 AM) as a background goroutine.
+// runEvolutionCron runs the v3 evolution suggestion engine (every 6 hours at
+// 3:00/9:00/15:00/21:00 server-local time) as a background goroutine.
 // Designed to be called with `go runEvolutionCron(...)`.
+//
+// There is no automatic metric-driven rollback: the only auto-applied type
+// used to be "threshold", whose metric could not justify the change (see
+// docs/mission-control/DECISIONS.md D5). Applied changes are rolled back
+// explicitly via the API, which restores the exact prior state.
 func runEvolutionCron(stores *store.Stores, engine *agent.SuggestionEngine) {
 	// Wait 1 minute after startup for warm-up, then run first analysis.
 	time.Sleep(1 * time.Minute)
@@ -33,12 +38,6 @@ func runEvolutionCron(stores *store.Stores, engine *agent.SuggestionEngine) {
 		timer.Stop()
 
 		runSuggestionAnalysis(stores, engine)
-
-		// Weekly evaluation: Sunday at 3:00 AM only.
-		now := time.Now()
-		if now.Weekday() == time.Sunday && now.Hour() < 4 {
-			runEvolutionEvaluation(stores)
-		}
 	}
 }
 
@@ -94,8 +93,8 @@ func releaseAdvisoryLock(ctx context.Context, conn *sql.Conn) {
 }
 
 // runSuggestionAnalysis lists agents with evolution enabled and runs analysis.
-// Note: List(ctx, "") uses bare context (no tenant) to list ALL agents cross-tenant.
-// Per-agent calls are scoped via WithTenantID.
+// Agents are listed per tenant: a bare-context Agents.List fails closed and
+// returns nothing, which silently disabled this job.
 func runSuggestionAnalysis(stores *store.Stores, engine *agent.SuggestionEngine) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
@@ -108,7 +107,7 @@ func runSuggestionAnalysis(stores *store.Stores, engine *agent.SuggestionEngine)
 	}
 	defer releaseAdvisoryLock(ctx, conn)
 
-	agents, err := stores.Agents.List(ctx, "")
+	agents, err := agent.ListEvolutionAgents(ctx, stores.Tenants, stores.Agents)
 	if err != nil {
 		slog.Warn("evolution.cron.list_agents_failed", "error", err)
 		return
@@ -116,16 +115,6 @@ func runSuggestionAnalysis(stores *store.Stores, engine *agent.SuggestionEngine)
 
 	var count int
 	for _, ag := range agents {
-		if ag.Status != store.AgentStatusActive {
-			continue
-		}
-		flags := ag.ParseV3Flags()
-		if !flags.EvolutionMetrics {
-			continue
-		}
-		if !flags.EvolutionSuggest {
-			continue // metrics enabled but suggestions disabled — skip analysis
-		}
 		agentCtx := store.WithTenantID(ctx, ag.TenantID)
 		if _, err := engine.Analyze(agentCtx, ag.ID); err != nil {
 			slog.Debug("evolution.cron.analyze_failed", "agent", ag.ID, "error", err)
@@ -135,35 +124,5 @@ func runSuggestionAnalysis(stores *store.Stores, engine *agent.SuggestionEngine)
 
 	if count > 0 {
 		slog.Info("evolution.cron.analysis_complete", "agents", count)
-	}
-}
-
-// runEvolutionEvaluation checks applied suggestions and rolls back quality drops.
-func runEvolutionEvaluation(stores *store.Stores) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	agents, err := stores.Agents.List(ctx, "")
-	if err != nil {
-		slog.Warn("evolution.cron.eval_list_failed", "error", err)
-		return
-	}
-
-	guardrails := agent.DefaultGuardrails()
-	for _, ag := range agents {
-		if ag.Status != store.AgentStatusActive {
-			continue
-		}
-		flags := ag.ParseV3Flags()
-		if !flags.EvolutionMetrics {
-			continue
-		}
-		if !flags.EvolutionSuggest {
-			continue // skip evaluation for agents with suggestions disabled
-		}
-		agentCtx := store.WithTenantID(ctx, ag.TenantID)
-		if err := agent.EvaluateApplied(agentCtx, ag.ID, guardrails, stores.EvolutionMetrics, stores.EvolutionSuggestions, stores.Agents); err != nil {
-			slog.Debug("evolution.cron.eval_failed", "agent", ag.ID, "error", err)
-		}
 	}
 }

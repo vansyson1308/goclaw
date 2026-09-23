@@ -75,10 +75,10 @@ func TenantTables() []TableDef {
 		{Name: "mcp_user_credentials", Tier: 3, HasTenantID: true},
 		{Name: "secure_cli_agent_grants", Tier: 3, HasTenantID: true},
 		{Name: "secure_cli_user_credentials", Tier: 3, HasTenantID: true},
-		{Name: "system_configs", Tier: 3, HasTenantID: true, OrderBy: "key"},                        // PK (key, tenant_id) — no id column
-		{Name: "builtin_tool_tenant_configs", Tier: 3, HasTenantID: true, OrderBy: "tool_name"},      // PK (tool_name, tenant_id) — no id column
-		{Name: "skill_tenant_configs", Tier: 3, HasTenantID: true, OrderBy: "skill_id"},              // PK (skill_id, tenant_id) — no id column
-		{Name: "webhooks", Tier: 3, HasTenantID: true}, // FK -> agents, channel_instances
+		{Name: "system_configs", Tier: 3, HasTenantID: true, OrderBy: "key"},                    // PK (key, tenant_id) — no id column
+		{Name: "builtin_tool_tenant_configs", Tier: 3, HasTenantID: true, OrderBy: "tool_name"}, // PK (tool_name, tenant_id) — no id column
+		{Name: "skill_tenant_configs", Tier: 3, HasTenantID: true, OrderBy: "skill_id"},         // PK (skill_id, tenant_id) — no id column
+		{Name: "webhooks", Tier: 3, HasTenantID: true},                                          // FK -> agents, channel_instances
 		// hook_agents has no tenant_id — filter via JOIN hooks; composite PK (hook_id, agent_id).
 		{
 			Name:        "hook_agents",
@@ -90,6 +90,7 @@ func TenantTables() []TableDef {
 
 		// Tier 4: FK to Tier 3
 		{Name: "kg_relations", Tier: 4, HasTenantID: true},
+		{Name: "agent_evolution_events", Tier: 4, HasTenantID: true}, // FK → agent_evolution_suggestions (tier 3)
 		{Name: "team_tasks", Tier: 4, HasTenantID: true},
 		// vault_links has no tenant_id — filter via JOIN vault_documents
 		{
