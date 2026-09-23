@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,113 +11,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
-
-// memStore is an in-memory store.MissionStore for service tests.
-type memStore struct {
-	mu       sync.Mutex
-	missions map[uuid.UUID]*store.Mission
-	events   []store.MissionEvent
-}
-
-func newMemStore() *memStore { return &memStore{missions: map[uuid.UUID]*store.Mission{}} }
-
-func (s *memStore) CreateMission(ctx context.Context, m *store.Mission, actor string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m.ID, m.TenantID, m.CreatedAt = uuid.New(), store.TenantIDFromContext(ctx), time.Now()
-	cp := *m
-	s.missions[m.ID] = &cp
-	s.events = append(s.events, store.MissionEvent{MissionID: m.ID, Kind: "transition", ToStatus: m.Status, Actor: actor})
-	return nil
-}
-
-func (s *memStore) GetMission(ctx context.Context, id uuid.UUID) (*store.Mission, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m, ok := s.missions[id]
-	if !ok || m.TenantID != store.TenantIDFromContext(ctx) {
-		return nil, nil
-	}
-	cp := *m
-	return &cp, nil
-}
-
-func (s *memStore) ListMissions(context.Context, int) ([]store.Mission, error) { return nil, nil }
-
-func (s *memStore) ListActiveMissionsAllTenants(context.Context) ([]store.Mission, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []store.Mission
-	for _, m := range s.missions {
-		if slices.Contains(store.MissionActiveStatuses, m.Status) {
-			out = append(out, *m)
-		}
-	}
-	return out, nil
-}
-
-func (s *memStore) TransitionMission(ctx context.Context, id uuid.UUID, from []string, to, actor, msg string, u store.MissionUpdate) (*store.Mission, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	m, ok := s.missions[id]
-	if !ok || m.TenantID != store.TenantIDFromContext(ctx) {
-		return nil, store.ErrMissionNotFound
-	}
-	if !slices.Contains(from, m.Status) {
-		return nil, fmt.Errorf("%w: %s", store.ErrMissionStateConflict, m.Status)
-	}
-	s.events = append(s.events, store.MissionEvent{MissionID: id, Kind: "transition", FromStatus: m.Status, ToStatus: to, Actor: actor, Message: msg})
-	m.Status = to
-	if u.StatusReason != nil {
-		m.StatusReason = *u.StatusReason
-	}
-	if u.WorkspacePath != nil {
-		m.WorkspacePath = *u.WorkspacePath
-	}
-	if u.BaseRevision != nil {
-		m.BaseRevision = *u.BaseRevision
-	}
-	if u.Verification != nil {
-		m.Verification = u.Verification
-	}
-	if u.Diff != nil {
-		m.Diff = *u.Diff
-	}
-	if u.ChangedFiles != nil {
-		m.ChangedFiles = u.ChangedFiles
-	}
-	if u.Summary != nil {
-		m.Summary = *u.Summary
-	}
-	if u.Executor != nil {
-		m.Executor = *u.Executor
-	}
-	if u.FinishedAt != nil {
-		m.FinishedAt = u.FinishedAt
-	}
-	if u.CostUSD != nil {
-		m.CostUSD = u.CostUSD
-	}
-	cp := *m
-	return &cp, nil
-}
-
-func (s *memStore) AppendMissionEvent(_ context.Context, ev store.MissionEvent) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.events = append(s.events, ev)
-	return nil
-}
-
-func (s *memStore) ListMissionEvents(context.Context, uuid.UUID) ([]store.MissionEvent, error) {
-	return nil, nil
-}
 
 // fakeRunner simulates the agent by applying edits to the mission workspace.
 type fakeRunner struct {

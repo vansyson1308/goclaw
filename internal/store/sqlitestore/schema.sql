@@ -2446,7 +2446,12 @@ CREATE TABLE IF NOT EXISTS missions (
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     started_at      TEXT,
-    finished_at     TEXT
+    finished_at     TEXT,
+    attempt          INTEGER NOT NULL DEFAULT 0,
+    max_attempts     INTEGER NOT NULL DEFAULT 1,
+    lease_owner      TEXT,
+    lease_expires_at TEXT,
+    usage_incomplete INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_missions_tenant_created ON missions(tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_missions_status ON missions(status);
@@ -2463,3 +2468,19 @@ CREATE TABLE IF NOT EXISTS mission_events (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS idx_mission_events_mission ON mission_events(mission_id, created_at);
+CREATE TABLE IF NOT EXISTS mission_receipts (
+    tenant_id    TEXT NOT NULL REFERENCES tenants(id),
+    mission_id   TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    attempt      INTEGER NOT NULL,
+    seq          INTEGER NOT NULL,
+    tool         TEXT NOT NULL,
+    action_class TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('denied','started','ok','error')),
+    reason       TEXT,
+    args_digest  TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (mission_id, attempt, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_mission_receipts_tenant ON mission_receipts(tenant_id);

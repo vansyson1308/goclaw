@@ -10,6 +10,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/store/pg"
+	"github.com/nextlevelbuilder/goclaw/internal/store/storetest"
 )
 
 func TestMissionStoreLifecycleCASAndIsolation(t *testing.T) {
@@ -110,4 +111,12 @@ func TestMissionStoreLifecycleCASAndIsolation(t *testing.T) {
 			t.Fatal("list must omit diff")
 		}
 	}
+}
+
+func TestMissionStoreLeasesAndReceipts(t *testing.T) {
+	db := testDB(t)
+	tenantA, _ := seedTenantAgent(t, db)
+	tenantB, _ := seedTenantAgent(t, db)
+	t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM missions WHERE tenant_id IN ($1, $2)`, tenantA, tenantB) })
+	storetest.MissionLeases(t, pg.NewPGMissionStore(db), tenantCtx(tenantA), tenantCtx(tenantB))
 }

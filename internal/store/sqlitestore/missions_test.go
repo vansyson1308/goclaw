@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/store/storetest"
 )
 
 func TestSQLiteMissionStoreLifecycle(t *testing.T) {
@@ -49,4 +50,11 @@ func TestSQLiteMissionStoreLifecycle(t *testing.T) {
 	if len(active) != 0 {
 		t.Fatalf("no active missions expected, got %d", len(active))
 	}
+}
+
+func TestSQLiteMissionStoreLeasesAndReceipts(t *testing.T) {
+	db := newHookTestDB(t)
+	tenantA, _ := seedHookTenantAgent(t, db)
+	tenantB, _ := seedHookTenantAgent(t, db)
+	storetest.MissionLeases(t, NewSQLiteMissionStore(db), sqliteTenantCtx(tenantA), sqliteTenantCtx(tenantB))
 }

@@ -25,7 +25,8 @@ func NewSQLiteMissionStore(db *sql.DB) *SQLiteMissionStore { return &SQLiteMissi
 const missionCols = `id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status,
 	status_reason, executor, workspace_path, base_revision, verification, diff, diff_truncated,
 	changed_files, summary, input_tokens, output_tokens, cost_usd, iterations, state_version,
-	created_at, updated_at, started_at, finished_at`
+	created_at, updated_at, started_at, finished_at,
+	usage_incomplete, attempt, max_attempts, lease_owner, lease_expires_at`
 
 func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	var m store.Mission
@@ -34,11 +35,13 @@ func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	var reason, executor, wsPath, baseRev, diff, summary sql.NullString
 	var cost sql.NullFloat64
 	var created, updated sqliteTime
-	var started, finished nullSqliteTime
+	var started, finished, leaseUntil nullSqliteTime
+	var leaseOwner sql.NullString
 	if err := row.Scan(&id, &tenant, &m.OwnerID, &m.AgentKey, &m.Title, &contract, &m.ContractDigest, &m.Status,
 		&reason, &executor, &wsPath, &baseRev, &verification, &diff, &m.DiffTruncated,
 		&changed, &summary, &m.InputTokens, &m.OutputTokens, &cost, &m.Iterations, &m.StateVersion,
-		&created, &updated, &started, &finished); err != nil {
+		&created, &updated, &started, &finished,
+		&m.UsageIncomplete, &m.Attempt, &m.MaxAttempts, &leaseOwner, &leaseUntil); err != nil {
 		return nil, err
 	}
 	m.ID, _ = uuid.Parse(id)
@@ -58,6 +61,7 @@ func scanMission(row interface{ Scan(...any) error }) (*store.Mission, error) {
 	}
 	m.CreatedAt, m.UpdatedAt = created.Time, updated.Time
 	m.StartedAt, m.FinishedAt = started.ptr(), finished.ptr()
+	m.LeaseOwner, m.LeaseExpiresAt = leaseOwner.String, leaseUntil.ptr()
 	return &m, nil
 }
 
@@ -75,6 +79,9 @@ func (s *SQLiteMissionStore) CreateMission(ctx context.Context, m *store.Mission
 	if m.Status == "" {
 		m.Status = store.MissionPlanned
 	}
+	if m.MaxAttempts <= 0 {
+		m.MaxAttempts = 1
+	}
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -82,9 +89,9 @@ func (s *SQLiteMissionStore) CreateMission(ctx context.Context, m *store.Mission
 	}
 	defer tx.Rollback() //nolint:errcheck
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO missions (id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID.String(), tenantID.String(), m.OwnerID, m.AgentKey, m.Title, string(m.Contract), m.ContractDigest, m.Status,
+		`INSERT INTO missions (id, tenant_id, owner_id, agent_key, title, contract, contract_digest, status, max_attempts, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID.String(), tenantID.String(), m.OwnerID, m.AgentKey, m.Title, string(m.Contract), m.ContractDigest, m.Status, m.MaxAttempts,
 		now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
@@ -148,8 +155,11 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var current string
-	err = tx.QueryRowContext(ctx, `SELECT status FROM missions WHERE id = ? AND tenant_id = ?`, id.String(), tenantID.String()).Scan(&current)
+	var current, leaseOwner string
+	var attempt, maxAttempts int
+	err = tx.QueryRowContext(ctx,
+		`SELECT status, attempt, max_attempts, COALESCE(lease_owner, '') FROM missions WHERE id = ? AND tenant_id = ?`,
+		id.String(), tenantID.String()).Scan(&current, &attempt, &maxAttempts, &leaseOwner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrMissionNotFound
 	}
@@ -158,6 +168,12 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 	}
 	if !slices.Contains(from, current) {
 		return nil, fmt.Errorf("%w: status is %q, expected one of %v", store.ErrMissionStateConflict, current, from)
+	}
+	if f := u.Fence; f != nil && (leaseOwner != f.Owner || attempt != f.Attempt) {
+		return nil, fmt.Errorf("%w: %w (held by %q attempt %d)", store.ErrMissionStateConflict, store.ErrMissionLeaseLost, leaseOwner, attempt)
+	}
+	if u.Claim != nil && attempt >= maxAttempts {
+		return nil, fmt.Errorf("%w: no attempts left (%d/%d)", store.ErrMissionStateConflict, attempt, maxAttempts)
 	}
 	sets := []string{"status = ?", "updated_at = ?", "state_version = state_version + 1"}
 	args := []any{to, nowText()}
@@ -210,6 +226,17 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 	}
 	if u.FinishedAt != nil {
 		add("finished_at", u.FinishedAt.UTC().Format(time.RFC3339Nano))
+	}
+	if u.UsageIncomplete != nil {
+		add("usage_incomplete", *u.UsageIncomplete)
+	}
+	switch {
+	case u.Claim != nil:
+		add("lease_owner", u.Claim.Owner)
+		add("lease_expires_at", u.Claim.Until.UTC().Format(time.RFC3339Nano))
+		sets = append(sets, "attempt = attempt + 1")
+	case u.ClearLease:
+		sets = append(sets, "lease_owner = NULL", "lease_expires_at = NULL")
 	}
 	args = append(args, id.String(), tenantID.String())
 	if _, err := tx.ExecContext(ctx, `UPDATE missions SET `+strings.Join(sets, ", ")+` WHERE id = ? AND tenant_id = ?`, args...); err != nil {
@@ -285,6 +312,84 @@ func (s *SQLiteMissionStore) ListMissionEvents(ctx context.Context, missionID uu
 		}
 		e.CreatedAt = created.Time
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLiteMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID, fence store.MissionFence, until time.Time) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE missions SET lease_expires_at = ?
+		 WHERE id = ? AND tenant_id = ? AND lease_owner = ? AND attempt = ?
+		   AND status IN ('planned','preparing','running','verifying')`,
+		until.UTC().Format(time.RFC3339Nano), id.String(), tenantIDForInsert(ctx).String(), fence.Owner, fence.Attempt)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return store.ErrMissionLeaseLost
+	}
+	return nil
+}
+
+func (s *SQLiteMissionStore) BeginMissionReceipt(ctx context.Context, r store.MissionReceipt, fence store.MissionFence) error {
+	tenantID := tenantIDForInsert(ctx).String()
+	var reason any
+	if r.Reason != "" {
+		reason = r.Reason
+	}
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO mission_receipts (tenant_id, mission_id, attempt, seq, tool, action_class, status, reason, args_digest, created_at, updated_at)
+		 SELECT tenant_id, id, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM missions
+		 WHERE id = ? AND tenant_id = ? AND lease_owner = ? AND attempt = ?
+		   AND status IN ('preparing','running','verifying')
+		 ON CONFLICT (mission_id, attempt, seq) DO NOTHING`,
+		r.Attempt, r.Seq, r.Tool, r.ActionClass, r.Status, reason, r.ArgsDigest, nowText(), nowText(),
+		r.MissionID.String(), tenantID, fence.Owner, r.Attempt)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var exists int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM mission_receipts WHERE mission_id = ? AND tenant_id = ? AND attempt = ? AND seq = ?`,
+			r.MissionID.String(), tenantID, r.Attempt, r.Seq).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return store.ErrMissionLeaseLost
+		}
+	}
+	return nil
+}
+
+func (s *SQLiteMissionStore) CompleteMissionReceipt(ctx context.Context, missionID uuid.UUID, attempt, seq int, status string, durationMS int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE mission_receipts SET status = ?, duration_ms = ?, updated_at = ?
+		 WHERE mission_id = ? AND tenant_id = ? AND attempt = ? AND seq = ? AND status = 'started'`,
+		status, durationMS, nowText(), missionID.String(), tenantIDForInsert(ctx).String(), attempt, seq)
+	return err
+}
+
+func (s *SQLiteMissionStore) ListMissionReceipts(ctx context.Context, missionID uuid.UUID) ([]store.MissionReceipt, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT mission_id, attempt, seq, tool, action_class, status, COALESCE(reason, ''), args_digest, duration_ms, created_at
+		 FROM mission_receipts WHERE mission_id = ? AND tenant_id = ? ORDER BY attempt, seq`,
+		missionID.String(), tenantIDForInsert(ctx).String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []store.MissionReceipt{}
+	for rows.Next() {
+		var r store.MissionReceipt
+		var mid string
+		var created sqliteTime
+		if err := rows.Scan(&mid, &r.Attempt, &r.Seq, &r.Tool, &r.ActionClass, &r.Status, &r.Reason, &r.ArgsDigest, &r.DurationMS, &created); err != nil {
+			return nil, err
+		}
+		r.MissionID, _ = uuid.Parse(mid)
+		r.CreatedAt = created.Time
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

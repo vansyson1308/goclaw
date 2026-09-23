@@ -16,7 +16,7 @@ var schemaSQL string
 
 // SchemaVersion is the current SQLite schema version.
 // Bump this when adding new migration steps below.
-const SchemaVersion = 62
+const SchemaVersion = 63
 
 // migrations maps version → SQL to apply when upgrading FROM that version.
 // schema.sql always represents the LATEST full schema (for fresh DBs).
@@ -95,6 +95,11 @@ BEGIN
 END;`
 
 var migrations = map[int]string{
+	// Version 62 → 63: mission attempts, leases and write-ahead tool receipts
+	// (PG migration 000100). Built at runtime by sqliteMissionLeaseMigrationPatch
+	// so the column adds are idempotent.
+	62: `SELECT 1;`,
+
 	// Version 61 → 62: missions + mission_events (PG migration 000099).
 	61: `CREATE TABLE IF NOT EXISTS missions (
     id              TEXT NOT NULL PRIMARY KEY,
@@ -1666,6 +1671,12 @@ func EnsureSchema(db *sql.DB) error {
 					return fmt.Errorf("inspect channel pending message parent column: %w", err)
 				}
 			}
+			if v == 62 {
+				patch, err = sqliteMissionLeaseMigrationPatch(db)
+				if err != nil {
+					return fmt.Errorf("inspect mission lease columns: %w", err)
+				}
+			}
 			if v == 60 {
 				patch, err = sqliteEvolutionApplyStateMigrationPatch(db)
 				if err != nil {
@@ -1926,4 +1937,45 @@ func sqliteEvolutionApplyStateMigrationPatch(db *sql.DB) (string, error) {
 		}
 	}
 	return patch + sqliteEvolutionEventsDDL, nil
+}
+
+const sqliteMissionReceiptsDDL = `CREATE TABLE IF NOT EXISTS mission_receipts (
+    tenant_id    TEXT NOT NULL REFERENCES tenants(id),
+    mission_id   TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+    attempt      INTEGER NOT NULL,
+    seq          INTEGER NOT NULL,
+    tool         TEXT NOT NULL,
+    action_class TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('denied','started','ok','error')),
+    reason       TEXT,
+    args_digest  TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (mission_id, attempt, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_mission_receipts_tenant ON mission_receipts(tenant_id);
+`
+
+// sqliteMissionLeaseMigrationPatch adds mission attempt/lease columns that
+// are missing and the receipts table (PG migration 000100).
+func sqliteMissionLeaseMigrationPatch(db *sql.DB) (string, error) {
+	columns := []struct{ name, ddl string }{
+		{"attempt", "INTEGER NOT NULL DEFAULT 0"},
+		{"max_attempts", "INTEGER NOT NULL DEFAULT 1"},
+		{"lease_owner", "TEXT"},
+		{"lease_expires_at", "TEXT"},
+		{"usage_incomplete", "INTEGER NOT NULL DEFAULT 0"},
+	}
+	patch := ""
+	for _, col := range columns {
+		hasColumn, err := sqliteColumnExists(db, "missions", col.name)
+		if err != nil {
+			return "", err
+		}
+		if !hasColumn {
+			patch += fmt.Sprintf("ALTER TABLE missions ADD COLUMN %s %s;\n", col.name, col.ddl)
+		}
+	}
+	return patch + sqliteMissionReceiptsDDL, nil
 }
