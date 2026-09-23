@@ -86,7 +86,7 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 		return
 	}
 	execName := s.exec.Name()
-	upd := store.MissionUpdate{Executor: &execName, Claim: &store.MissionClaim{Owner: s.cfg.WorkerID, Until: s.cfg.Now().Add(s.cfg.LeaseTTL)}}
+	upd := store.MissionUpdate{Executor: &execName, Claim: &store.MissionClaim{Owner: s.cfg.WorkerID, TTL: s.cfg.LeaseTTL}}
 	if m.StartedAt == nil {
 		now := time.Now().UTC()
 		upd.StartedAt = &now
@@ -121,8 +121,9 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 
 // heartbeat renews the lease every TTL/3. It stops the attempt when the
 // lease is lost (cancelled elsewhere, or another worker took over after a
-// partition) or cannot be renewed for a whole TTL (store unreachable), so
-// a worker never keeps acting on a mission it may no longer own.
+// partition) or has not been renewed for 2/3 of a TTL (store unreachable),
+// i.e. before anyone else can consider it expired, so a worker never keeps
+// acting on a mission it may no longer own.
 func (s *Service) heartbeat(ctx context.Context, id uuid.UUID, fence store.MissionFence, cancel context.CancelCauseFunc) (stop func()) {
 	done := make(chan struct{})
 	var once sync.Once
@@ -136,14 +137,16 @@ func (s *Service) heartbeat(ctx context.Context, id uuid.UUID, fence store.Missi
 				return
 			case <-t.C:
 			}
-			err := s.store.RenewMissionLease(ctx, id, fence, s.cfg.Now().Add(s.cfg.LeaseTTL))
+			rctx, rcancel := context.WithTimeout(ctx, s.cfg.LeaseTTL/3)
+			err := s.store.RenewMissionLease(rctx, id, fence, s.cfg.LeaseTTL)
+			rcancel()
 			switch {
 			case err == nil:
 				lastOK = s.cfg.Now()
 			case errors.Is(err, store.ErrMissionLeaseLost):
 				cancel(errLeaseLost)
 				return
-			case s.cfg.Now().Sub(lastOK) >= s.cfg.LeaseTTL:
+			case s.cfg.Now().Sub(lastOK) >= 2*s.cfg.LeaseTTL/3:
 				slog.Warn("mission.lease_unrenewable", "mission", id, "error", err)
 				cancel(errLeaseUnrenewable)
 				return
@@ -151,6 +154,15 @@ func (s *Service) heartbeat(ctx context.Context, id uuid.UUID, fence store.Missi
 		}
 	}()
 	return func() { once.Do(func() { close(done) }) }
+}
+
+// note records progress for this attempt, unless it has already lost
+// ownership (a stale worker must not add to the new attempt's timeline).
+func (a *attempt) note(ctx, bctx context.Context, msg string, detail any) {
+	if stopped(ctx) != nil {
+		return
+	}
+	a.s.note(bctx, a.id, fmt.Sprintf("attempt %d: %s", a.fence.Attempt, msg), detail)
 }
 
 // stopped reports whether the attempt lost ownership; its remaining work
@@ -189,7 +201,7 @@ func (a *attempt) run(ctx, bctx context.Context, m *store.Mission, c *Contract) 
 		return
 	}
 	if len(pw.Skipped) > 0 {
-		s.note(bctx, id, fmt.Sprintf("skipped %d non-regular entries (symlinks/special files)", len(pw.Skipped)), pw.Skipped)
+		a.note(ctx, bctx, fmt.Sprintf("skipped %d non-regular entries (symlinks/special files)", len(pw.Skipped)), pw.Skipped)
 	}
 	overlays, err := s.resolveOverlays(c)
 	if err != nil {
@@ -203,7 +215,7 @@ func (a *attempt) run(ctx, bctx context.Context, m *store.Mission, c *Contract) 
 	// Checks that must prove the change are run on the untouched baseline first.
 	baseline := Baseline(ctx, c, env)
 	if len(baseline) > 0 {
-		s.note(bctx, id, fmt.Sprintf("baseline evaluated for %d must_change check(s)", len(baseline)), baselineSummary(baseline))
+		a.note(ctx, bctx, fmt.Sprintf("baseline evaluated for %d must_change check(s)", len(baseline)), baselineSummary(baseline))
 	}
 	if _, err = a.transition(bctx, StatusPreparing, StatusRunning, "agent run started",
 		store.MissionUpdate{WorkspacePath: &pw.Path, BaseRevision: &pw.BaseRevision}); err != nil {
@@ -231,24 +243,43 @@ func (a *attempt) run(ctx, bctx context.Context, m *store.Mission, c *Contract) 
 		return
 	}
 	usage, costOK := aggregateUsage(m, out)
-	var runReason string
-	if out != nil {
-		if c.Limits.MaxCostUSD > 0 && out.CostUSD != nil && *out.CostUSD > c.Limits.MaxCostUSD {
-			runReason = fmt.Sprintf("cost limit exceeded: $%.4f > $%.4f", *out.CostUSD, c.Limits.MaxCostUSD)
-		}
-		if out.LoopKilled {
-			runReason = "agent run stopped by the loop detector"
-		}
+	runReason := costLimitReason(c.Limits.MaxCostUSD, usage)
+	if out != nil && out.LoopKilled {
+		runReason = "agent run stopped by the loop detector"
 	}
 	if runErr != nil {
 		runReason = "agent run failed: " + runErr.Error()
 	}
+
+	// Nothing the attempt started may outlive it or touch the evidence.
+	if killed := killProcessesUnder(a.dir); len(killed) > 0 {
+		a.note(ctx, bctx, fmt.Sprintf("stopped %d process(es) left running in the workspace", len(killed)), killed)
+	}
+	// Freeze the workspace: the diff, the integrity scan and every check are
+	// computed from this one copy, so a late write cannot make the recorded
+	// evidence and the verified tree disagree.
+	nested, _ := findNestedGit(pw.Path)
+	evidence := filepath.Join(a.dir, "evidence-"+uuid.NewString()[:8])
+	notCopied, err := copyTree(pw.Path, evidence)
+	if err != nil {
+		a.finish(bctx, StatusRunning, StatusBlocked, "could not freeze the workspace for verification: "+err.Error(), usage)
+		return
+	}
+	if len(notCopied) > 0 {
+		a.note(ctx, bctx, fmt.Sprintf("%d non-regular entries (symlinks/special files) are not part of the evidence", len(notCopied)), notCopied)
+	}
+	epw := &PreparedWorkspace{Path: evidence, GitDir: pw.GitDir, BaseRevision: pw.BaseRevision}
+	env.Workspace = evidence
+	usage.WorkspacePath = &evidence
 	if _, err = a.transition(bctx, StatusRunning, StatusVerifying, "verifying acceptance criteria", usage); err != nil {
 		return
 	}
 
 	// Evidence is collected even when the run failed, so users see real state.
-	diff, diffErr := Diff(bctx, pw)
+	diff, diffErr := Diff(bctx, epw)
+	if diffErr == nil {
+		diff.Nested = append(nested, diff.Nested...)
+	}
 	upd := store.MissionUpdate{}
 	if diffErr == nil {
 		env.Changed = diff.Present
@@ -290,6 +321,15 @@ func (a *attempt) run(ctx, bctx context.Context, m *store.Mission, c *Contract) 
 		reason = fmt.Sprintf("attempt %d/%d: %s", m.Attempt, m.MaxAttempts, reason)
 	}
 	a.finish(bctx, StatusVerifying, final, reason, upd)
+}
+
+// costLimitReason checks the limit against the mission's total cost across
+// attempts, not only the current attempt's.
+func costLimitReason(limit float64, u store.MissionUpdate) string {
+	if limit > 0 && u.CostUSD != nil && *u.CostUSD > limit {
+		return fmt.Sprintf("cost limit exceeded: $%.4f > $%.4f (all attempts)", *u.CostUSD, limit)
+	}
+	return ""
 }
 
 // aggregateUsage adds this attempt's usage to the mission totals. costOK is

@@ -42,7 +42,11 @@ func newToolGuard(ctx context.Context, st store.MissionStore, id uuid.UUID, fenc
 	return g
 }
 
-func (g *toolGuard) Begin(_ context.Context, tool string, args map[string]any) (func(bool), error) {
+func (g *toolGuard) Begin(ctx context.Context, tool string, args map[string]any) (func(bool), error) {
+	if err := ctx.Err(); err != nil {
+		// The run is being stopped (timeout, cancel, lost lease): start nothing new.
+		return nil, fmt.Errorf("tool call refused: the mission run is stopping (%v)", err)
+	}
 	r := store.MissionReceipt{
 		MissionID:   g.missionID,
 		Attempt:     g.fence.Attempt,

@@ -33,6 +33,16 @@ func TestRunTokenBudgetStopsBeforeNextCall(t *testing.T) {
 	}
 }
 
+// Review D/M3: cached input tokens (reported outside prompt_tokens by
+// Anthropic) count against the budget.
+func TestRunTokenBudgetCountsCachedInput(t *testing.T) {
+	state := &pipeline.RunState{}
+	state.Think.TotalUsage = providers.Usage{PromptTokens: 500, CacheReadTokens: 99000, CompletionTokens: 500}
+	if err := checkRunLimits(&RunRequest{TokenBudget: 10000}, state, nil); !errors.Is(err, ErrTokenBudgetExhausted) {
+		t.Fatalf("cached input ignored by the budget: %v", err)
+	}
+}
+
 func TestMissionRefusesProvidersThatRunTheirOwnTools(t *testing.T) {
 	p := nativeToolsProvider{}
 	err := checkRunLimits(&RunRequest{MissionWorkspace: "/ws"}, &pipeline.RunState{}, p)
@@ -44,4 +54,16 @@ func TestMissionRefusesProvidersThatRunTheirOwnTools(t *testing.T) {
 	}
 	var _ providers.NativeToolExecutor = (*providers.ClaudeCLIProvider)(nil)
 	var _ providers.NativeToolExecutor = (*providers.ACPProvider)(nil)
+}
+
+// Review D/H1: an agent with model_fallback wraps its provider; a CLI
+// candidate inside the wrapper must still be refused for missions.
+func TestMissionRefusesFallbackChainWithNativeToolProvider(t *testing.T) {
+	chain := providers.NewModelFallbackProvider(
+		providers.FallbackCandidate{ProviderName: "openai", Provider: &providers.OpenAIProvider{}},
+		[]providers.FallbackCandidate{{ProviderName: "claude-cli", Provider: &providers.ClaudeCLIProvider{}}}, 2, false)
+	err := checkRunLimits(&RunRequest{MissionWorkspace: "/ws"}, &pipeline.RunState{}, chain)
+	if err == nil || !strings.Contains(err.Error(), "cannot be used for missions") {
+		t.Fatalf("fallback chain with a CLI candidate allowed: %v", err)
+	}
 }

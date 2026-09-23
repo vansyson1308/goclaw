@@ -32,7 +32,7 @@ func newGuardFixture(t *testing.T) *guardFixture {
 	must(t, st.CreateMission(ctx, m, "alice"))
 	fence := store.MissionFence{Owner: "w1", Attempt: 1}
 	_, err := st.TransitionMission(ctx, m.ID, []string{StatusPlanned}, StatusRunning, "sys", "",
-		store.MissionUpdate{Claim: &store.MissionClaim{Owner: "w1", Until: time.Now().Add(time.Minute)}})
+		store.MissionUpdate{Claim: &store.MissionClaim{Owner: "w1", TTL: time.Minute}})
 	must(t, err)
 	ws := t.TempDir()
 	reg := tools.NewRegistry()
@@ -147,5 +147,21 @@ func TestUnacknowledgedCallStaysStarted(t *testing.T) {
 	recs, _ := f.st.ListMissionReceipts(f.ctx, f.id)
 	if len(recs) != 1 || recs[0].Status != store.ReceiptStarted {
 		t.Fatalf("want an unacknowledged started receipt, got %+v", recs)
+	}
+}
+
+// Review D/M4: once the run is stopping (timeout, cancel), no new tool call
+// starts, even if the lease is still held.
+func TestToolGuardRefusesCallsAfterTheRunStops(t *testing.T) {
+	f := newGuardFixture(t)
+	g := newToolGuard(f.ctx, f.st, f.id, f.fence, contractWithTools())
+	stopped, cancel := context.WithCancel(tools.WithToolWorkspace(f.ctx, f.ws))
+	cancel()
+	res := f.reg.ExecuteWithContext(tools.WithCallGuard(stopped, g), "write_file", map[string]any{"path": "late.txt", "content": "x"}, "", "", "", "", nil)
+	if !res.IsError || !strings.Contains(res.ForLLM, "stopping") {
+		t.Fatalf("call after stop: %+v", res)
+	}
+	if _, err := os.Stat(filepath.Join(f.ws, "late.txt")); !os.IsNotExist(err) {
+		t.Fatal("tool ran after the run stopped")
 	}
 }

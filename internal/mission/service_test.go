@@ -213,9 +213,11 @@ func TestMissionSucceedsOnlyWithVerifiedFixAndTest(t *testing.T) {
 	if res["tests"].ContractDigest == "" || res["tests"].Executor != "host" {
 		t.Errorf("evidence lacks digest/executor: %+v", res["tests"])
 	}
-	// The agent was pinned to the prepared workspace, never the source.
-	if r.lastIn.Workspace != m.WorkspacePath || !strings.HasSuffix(r.lastIn.Workspace, "/workspace") {
-		t.Errorf("runner workspace %q vs mission %q", r.lastIn.Workspace, m.WorkspacePath)
+	// The agent was pinned to the prepared workspace, never the source; the
+	// mission points at the frozen evidence copy of that same attempt.
+	if !strings.HasSuffix(r.lastIn.Workspace, "/attempt-1/workspace") ||
+		filepath.Dir(r.lastIn.Workspace) != filepath.Dir(m.WorkspacePath) || !strings.Contains(m.WorkspacePath, "/evidence-") {
+		t.Errorf("runner workspace %q vs mission evidence %q", r.lastIn.Workspace, m.WorkspacePath)
 	}
 	src, _ := os.ReadFile(filepath.Join(svc.cfg.SourceRoot, "sumrepo", "sum.go"))
 	if string(src) != buggySum {

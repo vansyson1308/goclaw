@@ -115,6 +115,11 @@ type MissionUpdate struct {
 	Claim *MissionClaim
 	// ClearLease releases the lease (terminal transitions, requeue).
 	ClearLease bool
+	// RequireLeaseExpired makes the transition conditional on the lease
+	// being absent or expired by the store's clock, checked under the row
+	// lock, so recovery never takes a mission from a worker that is still
+	// renewing, whatever the local clocks say.
+	RequireLeaseExpired bool
 }
 
 // MissionFence identifies one worker's hold on one attempt.
@@ -123,10 +128,11 @@ type MissionFence struct {
 	Attempt int
 }
 
-// MissionClaim starts an attempt held by Owner until Until.
+// MissionClaim starts an attempt held by Owner for TTL, measured by the
+// store's clock (the database's, for PostgreSQL).
 type MissionClaim struct {
 	Owner string
-	Until time.Time
+	TTL   time.Duration
 }
 
 // MissionReceipt records one tool call made during a mission attempt. It is
@@ -170,9 +176,10 @@ type MissionStore interface {
 	AppendMissionEvent(ctx context.Context, ev MissionEvent) error
 	ListMissionEvents(ctx context.Context, missionID uuid.UUID) ([]MissionEvent, error)
 	ListActiveMissionsAllTenants(ctx context.Context) ([]Mission, error)
-	// RenewMissionLease extends the lease held by fence while the mission is
-	// active. It returns ErrMissionLeaseLost when the lease is not held.
-	RenewMissionLease(ctx context.Context, id uuid.UUID, fence MissionFence, until time.Time) error
+	// RenewMissionLease extends the lease held by fence to now+ttl (store
+	// clock) while the mission is active. It returns ErrMissionLeaseLost
+	// when the lease is not held.
+	RenewMissionLease(ctx context.Context, id uuid.UUID, fence MissionFence, ttl time.Duration) error
 	// BeginMissionReceipt inserts a receipt, fenced by the lease. A duplicate
 	// (mission, attempt, seq) is ignored. Denied receipts use the same path.
 	BeginMissionReceipt(ctx context.Context, r MissionReceipt, fence MissionFence) error

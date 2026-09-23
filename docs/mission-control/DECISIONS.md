@@ -53,3 +53,10 @@
   - Every call gets a receipt, written before it runs (fail-closed). A receipt that stays `started` means the outcome is unknown.
   - Providers that run their own tools (Claude CLI, ACP) are refused for missions, because the guard cannot see their calls.
   - `limits.max_tokens` is enforced before each model call. Compaction and summarization calls are not counted (documented gap).
+- **D20 Phase D review outcomes.**
+  - Lease time comes from the database clock and is checked under the row lock (no cross-gateway clock trust).
+  - Evidence is computed from a frozen copy after sweeping leftover processes.
+  - Receipts are accepted only while `running`.
+  - The cost limit applies to the mission total; the token budget counts cached input.
+  - Fallback chains inherit native-tool refusal.
+  - Residual gaps are listed in MISSIONS.md "Known limits" rather than claimed closed.

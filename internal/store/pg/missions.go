@@ -156,8 +156,10 @@ func (s *PGMissionStore) TransitionMission(ctx context.Context, id uuid.UUID, fr
 	defer tx.Rollback() //nolint:errcheck
 	var cur missionLockState
 	err = tx.QueryRowContext(ctx,
-		`SELECT status, attempt, max_attempts, COALESCE(lease_owner, '') FROM missions WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
-		id, tenantID).Scan(&cur.status, &cur.attempt, &cur.maxAttempts, &cur.leaseOwner)
+		`SELECT status, attempt, max_attempts, COALESCE(lease_owner, ''),
+		        (lease_expires_at IS NULL OR lease_expires_at < NOW())
+		 FROM missions WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, tenantID).Scan(&cur.status, &cur.attempt, &cur.maxAttempts, &cur.leaseOwner, &cur.leaseExpired)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrMissionNotFound
 	}
@@ -226,8 +228,8 @@ func (s *PGMissionStore) TransitionMission(ctx context.Context, id uuid.UUID, fr
 	switch {
 	case u.Claim != nil:
 		add("lease_owner", u.Claim.Owner)
-		add("lease_expires_at", u.Claim.Until)
-		sets = append(sets, "attempt = attempt + 1")
+		args = append(args, u.Claim.TTL.Milliseconds())
+		sets = append(sets, fmt.Sprintf("lease_expires_at = NOW() + ($%d * interval '1 millisecond')", len(args)), "attempt = attempt + 1")
 	case u.ClearLease:
 		sets = append(sets, "lease_owner = NULL", "lease_expires_at = NULL")
 	}
@@ -301,6 +303,7 @@ func (s *PGMissionStore) ListMissionEvents(ctx context.Context, missionID uuid.U
 type missionLockState struct {
 	status, leaseOwner   string
 	attempt, maxAttempts int
+	leaseExpired         bool
 }
 
 // check enforces the status compare-and-set plus the optional fence/claim.
@@ -311,18 +314,21 @@ func (c missionLockState) check(from []string, u store.MissionUpdate) error {
 	if f := u.Fence; f != nil && (c.leaseOwner != f.Owner || c.attempt != f.Attempt) {
 		return fmt.Errorf("%w: %w (held by %q attempt %d)", store.ErrMissionStateConflict, store.ErrMissionLeaseLost, c.leaseOwner, c.attempt)
 	}
+	if u.RequireLeaseExpired && !c.leaseExpired {
+		return fmt.Errorf("%w: lease held by %q has not expired", store.ErrMissionStateConflict, c.leaseOwner)
+	}
 	if u.Claim != nil && c.attempt >= c.maxAttempts {
 		return fmt.Errorf("%w: %w (%d/%d)", store.ErrMissionStateConflict, store.ErrMissionNoAttempts, c.attempt, c.maxAttempts)
 	}
 	return nil
 }
 
-func (s *PGMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID, fence store.MissionFence, until time.Time) error {
+func (s *PGMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID, fence store.MissionFence, ttl time.Duration) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE missions SET lease_expires_at = $1
+		`UPDATE missions SET lease_expires_at = NOW() + ($1 * interval '1 millisecond')
 		 WHERE id = $2 AND tenant_id = $3 AND lease_owner = $4 AND attempt = $5
 		   AND status IN ('planned','preparing','running','verifying')`,
-		until, id, store.TenantIDFromContext(ctx), fence.Owner, fence.Attempt)
+		ttl.Milliseconds(), id, store.TenantIDFromContext(ctx), fence.Owner, fence.Attempt)
 	if err != nil {
 		return err
 	}
@@ -334,22 +340,25 @@ func (s *PGMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID, fe
 
 func (s *PGMissionStore) BeginMissionReceipt(ctx context.Context, r store.MissionReceipt, fence store.MissionFence) error {
 	tenantID := store.TenantIDFromContext(ctx)
+	if r.Attempt != fence.Attempt {
+		return store.ErrMissionLeaseLost
+	}
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO mission_receipts (tenant_id, mission_id, attempt, seq, tool, action_class, status, reason, args_digest)
 		 SELECT tenant_id, id, $3, $4, $5, $6, $7, $8, $9 FROM missions
-		 WHERE id = $2 AND tenant_id = $1 AND lease_owner = $10 AND attempt = $3
-		   AND status IN ('preparing','running','verifying')
+		 WHERE id = $2 AND tenant_id = $1 AND lease_owner = $10 AND attempt = $3 AND status = 'running'
 		 ON CONFLICT (mission_id, attempt, seq) DO NOTHING`,
 		tenantID, r.MissionID, r.Attempt, r.Seq, r.Tool, r.ActionClass, r.Status, nilStr(r.Reason), r.ArgsDigest, fence.Owner)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		// Either a duplicate (idempotent) or the lease is gone.
+		// A duplicate is idempotent only while the lease is still held.
 		var exists bool
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM mission_receipts WHERE mission_id = $1 AND tenant_id = $2 AND attempt = $3 AND seq = $4)`,
-			r.MissionID, tenantID, r.Attempt, r.Seq).Scan(&exists); err != nil {
+			`SELECT EXISTS (SELECT 1 FROM mission_receipts WHERE mission_id = $1 AND tenant_id = $2 AND attempt = $3 AND seq = $4)
+			    AND EXISTS (SELECT 1 FROM missions WHERE id = $1 AND tenant_id = $2 AND lease_owner = $5 AND attempt = $3 AND status = 'running')`,
+			r.MissionID, tenantID, r.Attempt, r.Seq, fence.Owner).Scan(&exists); err != nil {
 			return err
 		}
 		if !exists {

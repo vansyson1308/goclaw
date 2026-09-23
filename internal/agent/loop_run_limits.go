@@ -15,7 +15,9 @@ var ErrTokenBudgetExhausted = errors.New("run token budget exhausted")
 // checkRunLimits runs before every model call of a run.
 func checkRunLimits(req *RunRequest, state *pipeline.RunState, provider providers.Provider) error {
 	if req.TokenBudget > 0 {
-		used := int64(state.Think.TotalUsage.PromptTokens + state.Think.TotalUsage.CompletionTokens)
+		// Cached input counts: providers such as Anthropic report cache reads
+		// and writes outside prompt_tokens.
+		used := int64(pipeline.InputContextTokens(state.Think.TotalUsage) + state.Think.TotalUsage.CompletionTokens)
 		if used >= req.TokenBudget {
 			return fmt.Errorf("%w: %d of %d tokens used", ErrTokenBudgetExhausted, used, req.TokenBudget)
 		}

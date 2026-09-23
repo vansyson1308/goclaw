@@ -18,8 +18,10 @@ type RecoveryReport struct {
 }
 
 // Recover finds missions that no live worker owns and makes progress on
-// them. A mission leased by another worker is left alone until its lease
-// expires, so running several gateways on one database is safe:
+// them. Lease expiry is judged by the store's clock under the row lock, so
+// a mission leased by a worker that is still renewing is never taken over,
+// whatever the local clocks say. Running several gateways on one database
+// is therefore safe:
 //   - planned and unleased (queued in a process that died, or requeued):
 //     started in this process;
 //   - preparing/running/verifying with an expired or missing lease (the
@@ -31,13 +33,9 @@ func (s *Service) Recover(ctx context.Context) (RecoveryReport, error) {
 	if err != nil {
 		return rep, err
 	}
-	now := s.cfg.Now()
 	for _, m := range active {
 		if s.isLive(m.ID) {
 			continue
-		}
-		if m.LeaseExpiresAt != nil && m.LeaseExpiresAt.After(now) {
-			continue // another worker holds it
 		}
 		tctx := store.WithTenantID(ctx, m.TenantID)
 		if m.Status == StatusPlanned {
@@ -54,9 +52,9 @@ func (s *Service) Recover(ctx context.Context) (RecoveryReport, error) {
 		if m.Attempt < m.MaxAttempts {
 			msg := lost + "; retrying in a fresh workspace"
 			upd, err := s.store.TransitionMission(tctx, m.ID, []string{m.Status}, StatusPlanned, ActorSystem, msg,
-				store.MissionUpdate{Fence: &fence, ClearLease: true, UsageIncomplete: &incomplete, StatusReason: &msg})
+				store.MissionUpdate{Fence: &fence, ClearLease: true, RequireLeaseExpired: true, UsageIncomplete: &incomplete, StatusReason: &msg})
 			if err != nil {
-				continue // someone else recovered it, or it moved on
+				continue // lease still live, someone else recovered it, or it moved on
 			}
 			rep.Retried++
 			s.resume(tctx, upd)
@@ -65,7 +63,7 @@ func (s *Service) Recover(ctx context.Context) (RecoveryReport, error) {
 		reason := "interrupted: " + lost + "; no attempts left"
 		finished := time.Now().UTC()
 		if _, err := s.store.TransitionMission(tctx, m.ID, []string{m.Status}, StatusFailed, ActorSystem, reason,
-			store.MissionUpdate{Fence: &fence, ClearLease: true, UsageIncomplete: &incomplete, StatusReason: &reason, FinishedAt: &finished}); err == nil {
+			store.MissionUpdate{Fence: &fence, ClearLease: true, RequireLeaseExpired: true, UsageIncomplete: &incomplete, StatusReason: &reason, FinishedAt: &finished}); err == nil {
 			rep.Failed++
 		}
 	}

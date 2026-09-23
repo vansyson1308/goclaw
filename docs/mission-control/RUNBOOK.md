@@ -40,3 +40,11 @@ Before enabling, check `DOCKERHUB_IMAGE` in those workflows (`digitop/goclaw` up
 
 - The Standard edition only notifies about new upstream releases (`internal/gateway/update_check.go`).
 - The Lite desktop self-updater downloads from `nextlevelbuilder/goclaw` `lite-v*` releases (`internal/updater/updater.go`). Do not ship Lite builds from this fork until that is repointed.
+
+## Missions operations
+
+- **Enable:** `GOCLAW_MISSIONS=1`, `GOCLAW_MISSIONS_SOURCE_ROOT=<dir with sources and hidden overlays>`, optional `GOCLAW_MISSIONS_MAX_CONCURRENT`, `GOCLAW_MISSIONS_LEASE_SECONDS` (default 60, minimum 3).
+- **Run the gateway as an unprivileged user.** Until the container executor exists, verifier commands run on the host; `PR_SET_DUMPABLE` only protects the gateway's secrets from same-uid, non-root processes.
+- **Upgrades:** stop every gateway that uses the database, run `goclaw migrate up`, then start the new version. Do not mix pre-Phase-D and newer gateways on one database: an old gateway's startup recovery fails every active mission, even ones leased by a live new gateway.
+- **Crash or restart:** nothing to do. Active missions are retried by the next recovery pass after their lease expires; `attempt` shows which attempt finished, and `usage_incomplete` marks totals as a lower bound.
+- **Disk:** each attempt keeps `workspace/`, `base.git/` and one `evidence-*/` copy under `<data>/missions/<tenant>/<mission>/`. There is no automatic retention yet; remove old mission directories manually once their evidence is no longer needed.

@@ -27,17 +27,24 @@ func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Conte
 	if m.MaxAttempts != 2 {
 		t.Fatalf("max attempts %d", m.MaxAttempts)
 	}
-	now := time.Now().UTC().Truncate(time.Millisecond)
 	w1 := store.MissionFence{Owner: "worker-1", Attempt: 1}
 
-	// Claim starts attempt 1 and takes the lease.
+	// Claim starts attempt 1 and takes the lease for a TTL on the store's clock.
+	before := time.Now()
 	got, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionPlanned}, store.MissionPreparing, "sys", "claim",
-		store.MissionUpdate{Claim: &store.MissionClaim{Owner: w1.Owner, Until: now.Add(time.Minute)}})
+		store.MissionUpdate{Claim: &store.MissionClaim{Owner: w1.Owner, TTL: time.Minute}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Attempt != 1 || got.LeaseOwner != "worker-1" || got.LeaseExpiresAt == nil || !got.LeaseExpiresAt.Equal(now.Add(time.Minute)) {
+	if got.Attempt != 1 || got.LeaseOwner != "worker-1" || got.LeaseExpiresAt == nil ||
+		got.LeaseExpiresAt.Before(before.Add(time.Minute-5*time.Second)) || got.LeaseExpiresAt.After(time.Now().Add(time.Minute+5*time.Second)) {
 		t.Fatalf("claim state: attempt=%d owner=%q until=%v", got.Attempt, got.LeaseOwner, got.LeaseExpiresAt)
+	}
+	// Recovery may only take a mission whose lease has expired, judged under
+	// the row lock by the store's clock.
+	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionPreparing}, store.MissionPlanned, "sys", "",
+		store.MissionUpdate{Fence: &w1, ClearLease: true, RequireLeaseExpired: true}); !errors.Is(err, store.ErrMissionStateConflict) {
+		t.Fatalf("requeue of a live lease: want conflict, got %v", err)
 	}
 
 	// Fenced transitions: the holder passes, anyone else is refused with a
@@ -57,13 +64,13 @@ func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Conte
 	}
 
 	// Lease renewal: only the holder, only while active.
-	if err := ms.RenewMissionLease(ctxA, m.ID, w1, now.Add(2*time.Minute)); err != nil {
+	if err := ms.RenewMissionLease(ctxA, m.ID, w1, 2*time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if err := ms.RenewMissionLease(ctxA, m.ID, stale, now.Add(2*time.Minute)); !errors.Is(err, store.ErrMissionLeaseLost) {
+	if err := ms.RenewMissionLease(ctxA, m.ID, stale, 2*time.Minute); !errors.Is(err, store.ErrMissionLeaseLost) {
 		t.Fatalf("stale renew: %v", err)
 	}
-	if err := ms.RenewMissionLease(ctxB, m.ID, w1, now.Add(2*time.Minute)); !errors.Is(err, store.ErrMissionLeaseLost) {
+	if err := ms.RenewMissionLease(ctxB, m.ID, w1, 2*time.Minute); !errors.Is(err, store.ErrMissionLeaseLost) {
 		t.Fatalf("cross-tenant renew: %v", err)
 	}
 
@@ -105,12 +112,32 @@ func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Conte
 		t.Fatal("cross-tenant receipts visible")
 	}
 
+	// Receipts are only accepted while the attempt is running: nothing may
+	// run once verification has started.
+	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionRunning}, store.MissionVerifying, "sys", "", store.MissionUpdate{Fence: &w1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.BeginMissionReceipt(ctxA, store.MissionReceipt{MissionID: m.ID, Attempt: 1, Seq: 7, Tool: "exec", ActionClass: "exec", Status: store.ReceiptStarted, ArgsDigest: "v"}, w1); !errors.Is(err, store.ErrMissionLeaseLost) {
+		t.Fatalf("receipt while verifying: want refusal, got %v", err)
+	}
+	// Even a duplicate of an existing receipt is refused once it may no longer run.
+	if err := ms.BeginMissionReceipt(ctxA, r, w1); !errors.Is(err, store.ErrMissionLeaseLost) {
+		t.Fatalf("duplicate receipt after the run: want refusal, got %v", err)
+	}
+	// A receipt for another attempt than the fence is refused.
+	if err := ms.BeginMissionReceipt(ctxA, store.MissionReceipt{MissionID: m.ID, Attempt: 2, Seq: 1, Tool: "exec", ActionClass: "exec", Status: store.ReceiptStarted, ArgsDigest: "v"}, w1); !errors.Is(err, store.ErrMissionLeaseLost) {
+		t.Fatalf("receipt attempt differs from fence: %v", err)
+	}
+	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionVerifying}, store.MissionRunning, "sys", "", store.MissionUpdate{Fence: &w1}); err != nil {
+		t.Fatal(err)
+	}
+
 	// Requeue after a lost worker: fenced by the stale holder, lease cleared.
 	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionRunning}, store.MissionPlanned, "sys", "requeue",
 		store.MissionUpdate{Fence: &w1, ClearLease: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ms.RenewMissionLease(ctxA, m.ID, w1, now.Add(3*time.Minute)); !errors.Is(err, store.ErrMissionLeaseLost) {
+	if err := ms.RenewMissionLease(ctxA, m.ID, w1, 3*time.Minute); !errors.Is(err, store.ErrMissionLeaseLost) {
 		t.Fatalf("renew after requeue: %v", err)
 	}
 	if err := ms.BeginMissionReceipt(ctxA, store.MissionReceipt{MissionID: m.ID, Attempt: 1, Seq: 9, Tool: "exec", ActionClass: "exec", Status: store.ReceiptStarted, ArgsDigest: "z"}, w1); !errors.Is(err, store.ErrMissionLeaseLost) {
@@ -118,9 +145,15 @@ func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Conte
 	}
 	w2 := store.MissionFence{Owner: "worker-2", Attempt: 2}
 	got, err = ms.TransitionMission(ctxA, m.ID, []string{store.MissionPlanned}, store.MissionPreparing, "sys", "claim",
-		store.MissionUpdate{Claim: &store.MissionClaim{Owner: w2.Owner, Until: now.Add(time.Minute)}})
+		store.MissionUpdate{Claim: &store.MissionClaim{Owner: w2.Owner, TTL: 50 * time.Millisecond}})
 	if err != nil || got.Attempt != 2 || got.LeaseOwner != "worker-2" {
 		t.Fatalf("second claim: %+v %v", got, err)
+	}
+	// Once the short lease has run out, an expiry-conditioned requeue works.
+	time.Sleep(150 * time.Millisecond)
+	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionPreparing}, store.MissionPreparing, "sys", "",
+		store.MissionUpdate{Fence: &w2, RequireLeaseExpired: true}); err != nil {
+		t.Fatalf("expired lease not recognised: %v", err)
 	}
 	// The old holder's attempt-1 fence no longer works, even for the same owner name.
 	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionPreparing}, store.MissionFailed, "sys", "", store.MissionUpdate{Fence: &w1}); !errors.Is(err, store.ErrMissionLeaseLost) {
@@ -131,7 +164,7 @@ func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Conte
 		t.Fatal(err)
 	}
 	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionPlanned}, store.MissionPreparing, "sys", "claim",
-		store.MissionUpdate{Claim: &store.MissionClaim{Owner: "worker-3", Until: now.Add(time.Minute)}}); !errors.Is(err, store.ErrMissionStateConflict) || !errors.Is(err, store.ErrMissionNoAttempts) {
+		store.MissionUpdate{Claim: &store.MissionClaim{Owner: "worker-3", TTL: time.Minute}}); !errors.Is(err, store.ErrMissionStateConflict) || !errors.Is(err, store.ErrMissionNoAttempts) {
 		t.Fatalf("claim beyond max attempts: want conflict, got %v", err)
 	}
 	// Terminal transition with ClearLease leaves no lease behind.

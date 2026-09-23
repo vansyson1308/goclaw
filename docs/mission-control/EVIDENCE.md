@@ -184,3 +184,77 @@ It found 3 high, 3 medium and 7 low issues. **All high and medium issues are fix
 ### Honest limits of Gate C
 - The scripted provider verifies the **contract** of the agent loop and missions, not a live model (LIVE PROVIDER: BLOCKED).
 - Verifier commands run agent-written code on the host. See MISSIONS.md "Threat model and residual risk".
+
+## §D Durable recovery and bounded execution (2026-09-23)
+
+### What was built
+- **Leased attempts:**
+  - claim, heartbeat and fencing by `(owner, attempt)`;
+  - lease time is set and judged by the **DB clock** under the row lock;
+  - self-stop at 2/3 TTL.
+- **Retrying recovery:** runs at startup and every TTL/2 on every gateway. Each attempt works in a fresh `attempt-N/` copy.
+- **End of run:**
+  - leftover processes are swept;
+  - the evidence is frozen into a single copy used for the diff, the integrity scan and every check;
+  - usage is summed across attempts, with honest `usage_incomplete` and unknown cost.
+- **Tool guard on every tool path:**
+  - mission allowlist; external or non-idempotent tools can never be enabled;
+  - a write-ahead, fenced receipt for each call, accepted only while `running`;
+  - native-tool providers refused, including behind a fallback chain;
+  - token budget counting cached input;
+  - cost limit applied to the mission total.
+- **Storage:** PG 000100 and SQLite v63. One conformance suite runs on PG, SQLite and the test fake.
+
+### Gate D: deterministic fault tests (`internal/mission`, pass with `-race`)
+
+| Fault | Test | Result |
+|---|---|---|
+| Worker dies before its provider call returns | `TestCrashedWorkerAttemptIsRetried` | A stops itself once it cannot renew. B retries attempt 2 → `succeeded`, `usage_incomplete`, loss recorded in the audit trail |
+| Side effect done, ack never written | `TestSideEffectsOfCrashedAttemptDoNotLeak`, `TestUnacknowledgedCallStaysStarted` | Attempt 1's file is not in the evidence; the receipt stays `started` (unknown) |
+| Expired lease / stale worker after partition | `TestStaleWorkerIsFencedAfterTakeover` | A stops with lease lost; its fence is refused; exactly one verification (by B) |
+| Clock-skewed peer (+2h) | `TestClockSkewedPeerCannotStealLiveLease` | No takeover of a renewing worker |
+| Provider timeout | `TestProviderTimeoutIsFailure` | `failed` ("context deadline exceeded"), never success |
+| Duplicate callback | `TestDuplicateCompletionIsIgnored` + conformance duplicate receipt | No change, no event |
+| Cancel from another gateway, then restart | `TestCancelReachesOtherWorkerAndIsNotRetried` | Remote worker stops in under 2s; recovery leaves it `cancelled` |
+| DB blip / outage | `TestTransientStoreErrorIsRetried`; outage covered by the crash test | Blip retried in place; outage → takeover after lease expiry |
+| Attempts exhausted | `TestAttemptsAreBounded` | `failed`, "no attempts left" |
+| Detached process / late writer | `TestDetachedProcessesDoNotOutliveTheAttempt`, `TestLateWriterCannotForgeEvidence` | Process killed; evidence is the frozen copy. Mutation checks confirm each part (sweep, freeze) is needed |
+| Tool after stop / outside allowlist / without lease or DB | `TestToolGuard*` | Refused before running; nothing written |
+
+**Conformance.** `storetest.MissionLeases` runs against PostgreSQL 18, SQLite and the fake. It covers:
+- claim / TTL / fence;
+- `RequireLeaseExpired` refused on a live lease and accepted after expiry;
+- renewal;
+- receipt idempotence and refusal outside `running`;
+- max_attempts;
+- tenant isolation.
+
+**E2E** (`e2e-mission.sh`, real gateway + PG + agent loop; `UI_CHECK=1`). All pass:
+- missions 1–3 as in §C, plus per-attempt receipts (all `ok`);
+- **mission 4:** cancel stops the running `sleep` tool process within 10s;
+- **mission 5:** the gateway is `kill -9`ed while attempt 1 runs `exec` and then restarted. Recovery about 5s after the kill (lease 4s), attempt 2 `succeeded`, `usage_incomplete=true`, `cost_usd=null`, attempt-1 `exec` receipt `started`, and the audit line "attempt 1/2 was interrupted while running";
+- UI shows attempt, tool calls and a lower-bound cost.
+
+### Independent adversarial review of Phase D
+The review found 2 high, 4 medium and 8 low issues. Fixed issues have a test; each high and M2 fix is mutation-checked.
+
+| Finding | Status |
+|---|---|
+| H1: CLI provider behind a model-fallback wrapper bypassed the mission refusal (and its MCP bridge has no guard) | Fixed: the fallback chain counts as native if any candidate is (`TestFallbackWrapperReportsNativeToolCandidates`, `TestMissionRefusesFallbackChainWithNativeToolProvider`) |
+| H2: detached processes outlive the run; a late writer forged evidence | Fixed: process sweep + frozen evidence copy (tests above). **Residual:** a process that leaves the workspace is not swept → Phase E container per attempt |
+| M1: recovery used local clocks, expiry checked outside the lock (TOCTOU) | Fixed: DB clock plus `RequireLeaseExpired` under the row lock |
+| M2: cost limit per attempt only | Fixed: mission total (`TestCostLimitCountsAllAttempts`) |
+| M3: token budget and usage ignored cached input | Fixed (`TestRunTokenBudgetCountsCachedInput`) |
+| M4: tools could run after the run ended / during verification | Fixed: receipts only while `running`, guard refuses after stop, runner waits up to 30s for the run to stop (`TestToolGuardRefusesCallsAfterTheRunStops`, conformance) |
+| L1: mix of priced and unpriced calls reported as a known cost | Fixed (`TestMissionRunCostIsUnknownUnlessEveryCallIsPriced`) |
+| L4: notes from stale attempts | Fixed: notes carry the attempt and are skipped after a lost lease |
+| L5: heartbeat edges | Fixed: per-renew timeout, stop at 2/3 TTL, minimum TTL 3s |
+| L6: duplicate receipt skipped the fence | Fixed (conformance) |
+| L2, L3, L7, L8 | Documented in MISSIONS.md "Known limits" and RUNBOOK (no mixed versions) |
+
+### Other gates on this state
+- vet and the Lite build are clean.
+- Unit tests: only the known environment failures.
+- `-race`: sqlitestore, mission, agent and providers pass (tools has the known zombie failures).
+- Invariants pass. Integration passes in full, including the timing-sensitive MemoryBomb test this time.
+- Web: lint 0 errors, build OK, vitest 363/363.

@@ -77,22 +77,33 @@ Precedence: `blocked` wins over `failed` when a criterion could not be evaluated
 ## Durability (attempts, leases, recovery)
 
 - **Claim.** A worker claims a planned mission by moving it to `preparing`. This increments `attempt` and sets a lease `(lease_owner, lease_expires_at)`. `max_attempts` (default 2, at most 5) bounds how many attempts may be claimed.
-- **Heartbeat.** The worker renews the lease every TTL/3 (`GOCLAW_MISSIONS_LEASE_SECONDS`, default 60). If the lease is lost (cancelled from any gateway, or taken over after a partition), or cannot be renewed for a full TTL, the worker stops its run immediately.
+- **Heartbeat.** The worker renews the lease every TTL/3 (`GOCLAW_MISSIONS_LEASE_SECONDS`, default 60, minimum 3). Each renewal has a TTL/3 timeout. If the lease is lost (cancelled from any gateway, or taken over after a partition), or has not been renewed for 2/3 of a TTL, the worker stops its run immediately, before anyone else can consider the lease expired.
+- **Clock.** Lease expiry is set and judged by the **database clock** (PostgreSQL `NOW()`), under the row lock. A gateway whose clock is wrong can neither extend nor steal a lease. The Lite edition is a single process and uses its own clock.
 - **Fencing.** Every transition and every tool receipt is conditional on `(lease_owner, attempt)`. A stale worker cannot overwrite a newer attempt and cannot run tools.
 - **Recovery** runs at startup and every TTL/2, on every gateway:
   - planned and unleased: started;
   - active with an expired lease: requeued for a fresh attempt, or `failed` ("no attempts left");
   - a live lease held by another gateway: left alone.
+- **End of run.**
+  - When the agent run returns (or is stopped; a cancelled run gets up to 30s to actually stop), every process whose working directory is inside the attempt directory is killed. That includes detached `nohup`/`setsid` children of `exec`.
+  - The workspace is then **frozen** into `attempt-<n>/evidence-<random>`. The diff, the integrity scan and every check are computed from that one copy, so a late write cannot make the recorded evidence and the verified tree disagree. `workspace_path` points to the evidence copy.
+  - Tool receipts are only accepted while the attempt is `running`, and never after its context is done.
 - **Fresh attempts.** Each attempt works in `attempt-<n>/workspace`, copied from the pinned source. A retried attempt never sees what a crashed attempt did; the old attempt directory is kept for inspection. Retries start a new agent conversation, not a mid-run resume. Only lost attempts are retried; a verification failure is final.
-- **Usage.** Totals are summed across attempts. `usage_incomplete` is set when an attempt ended without reporting usage, and the totals are then a lower bound. Cost stays unknown rather than being summed as zero.
+- **Usage.** Totals are summed across attempts and include cached input tokens. `usage_incomplete` is set when an attempt ended without reporting usage, and the totals are then a lower bound. Cost is unknown (never summed as zero) unless every model call of the run was priced. `max_cost_usd` applies to the mission total across attempts; `max_tokens` applies to each attempt.
 - A graceful shutdown behaves like a crash: the mission continues after the lease expires (crash-only design).
+- **Known limits (stated, not hidden):**
+  - A process that leaves the workspace (`cd /`) before the run ends is not found by the sweep. It can still write to the host and, if it learns the random evidence path, to the evidence copy. The Phase E container per attempt closes this.
+  - A claim whose commit succeeded but whose acknowledgement was lost burns that attempt: it is retried after the lease expires, or failed if it was the last one.
+  - Do not run pre-Phase-D gateways against the same database. Their startup recovery fails every active mission.
+  - Model calls outside the agent loop are not counted against `max_tokens`: history compaction/summarization, memory flush, LLM-type hooks, `read_document`'s internal call, and post-run consolidation. One call can also overshoot the remaining budget.
 
 ## Tools and receipts
 
 - **Allowlist.** A mission's agent may only call tools in `limits.tools` (default: `read_file`, `list_files`, `write_file`, `edit`, `exec`, `datetime`; `web_fetch`/`web_search`/`read_document` can be enabled). Messaging, scheduling, delegation, memory, skills, MCP and every other tool are refused. Their effects leave the workspace and could not be safely repeated on retry.
 - **Receipts.** Every call, allowed or denied, gets a receipt `(attempt, seq, tool, class, status, args digest, duration)`. The receipt is written **before** the call runs and is fenced by the lease. If it cannot be written, the call is refused, so no side effect happens without a durable record. `started` without a later `ok`/`error` means the outcome was never acknowledged (for example, a crash mid-call).
 - **Providers.** Providers that execute their own tools (Claude CLI, ACP) are refused for missions, because the guard cannot see those calls.
-- **Budget.** `limits.max_tokens` stops the run before the model call that would start over budget.
+- **Budget.** `limits.max_tokens` stops the run before the model call that would start over budget (prompt, cached input and completion tokens).
+- **Providers behind a fallback chain** count as running their own tools if any candidate does.
 
 ## Workspace and evidence
 

@@ -12,6 +12,8 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	"github.com/nextlevelbuilder/goclaw/internal/mission"
+	"github.com/nextlevelbuilder/goclaw/internal/pipeline"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -24,6 +26,9 @@ const (
 	envMissionsLease      = "GOCLAW_MISSIONS_LEASE_SECONDS" // default 60; a dead worker's attempt is retried after this
 	envMissionsMax        = "GOCLAW_MISSIONS_MAX_CONCURRENT"
 )
+
+// minLeaseSeconds bounds GOCLAW_MISSIONS_LEASE_SECONDS from below.
+const minLeaseSeconds = 3
 
 // wireMissions registers the missions API. Reads always work; the service
 // (create/cancel/execute) is only built when GOCLAW_MISSIONS=1.
@@ -67,6 +72,11 @@ func (d *gatewayDeps) buildMissionService(sched *scheduler.Scheduler) (*mission.
 	}
 	maxConc, _ := strconv.Atoi(os.Getenv(envMissionsMax))
 	leaseSec, _ := strconv.Atoi(os.Getenv(envMissionsLease))
+	if leaseSec != 0 && leaseSec < minLeaseSeconds {
+		// Shorter leases turn a brief database hiccup into a takeover.
+		slog.Warn("missions: lease too short, using the minimum", "requested", leaseSec, "min", minLeaseSeconds)
+		leaseSec = minLeaseSeconds
+	}
 	runner := &schedulerMissionRunner{sched: sched, tenants: d.pgStores.Tenants}
 	svc, err := mission.NewService(mission.Config{SourceRoot: sourceRoot, DataRoot: dataRoot, MaxConcurrent: maxConc,
 		LeaseTTL: time.Duration(leaseSec) * time.Second},
@@ -107,6 +117,13 @@ func (r *schedulerMissionRunner) RunMission(ctx context.Context, in mission.RunI
 	select {
 	case outcome = <-outCh:
 	case <-ctx.Done():
+		// Wait (bounded) for the run to actually stop, so none of its tool or
+		// model calls overlaps the verification that follows.
+		select {
+		case <-outCh:
+		case <-time.After(runStopGrace):
+			slog.Warn("mission run did not stop within the grace period", "run", in.RunID)
+		}
 		return nil, ctx.Err()
 	}
 	if outcome.Err != nil {
@@ -115,15 +132,29 @@ func (r *schedulerMissionRunner) RunMission(ctx context.Context, in mission.RunI
 	res := outcome.Result
 	out := &mission.RunOutput{Content: res.Content, Iterations: res.Iterations, LoopKilled: res.LoopKilled}
 	if res.Usage != nil {
-		out.InputTokens, out.OutputTokens = int64(res.Usage.PromptTokens), int64(res.Usage.CompletionTokens)
+		// Include cached input (reported separately by some providers).
+		out.InputTokens, out.OutputTokens = int64(pipeline.InputContextTokens(*res.Usage)), int64(res.Usage.CompletionTokens)
 	}
-	// Unpriced calls report 0; a zero total is recorded as unknown, not free.
-	var cost float64
-	for _, c := range res.Calls {
-		cost += c.CostUSD
-	}
-	if cost > 0 {
-		out.CostUSD = &cost
-	}
+	out.CostUSD = missionRunCost(res.Calls)
 	return out, nil
+}
+
+// runStopGrace bounds how long a cancelled mission run may take to stop.
+const runStopGrace = 30 * time.Second
+
+// missionRunCost sums per-call cost only when every call was priced.
+// Unpriced calls report 0, so a single one makes the total unknown (nil)
+// rather than an undercount that could pass a cost limit.
+func missionRunCost(calls []providers.CallUsage) *float64 {
+	if len(calls) == 0 {
+		return nil
+	}
+	var total float64
+	for _, c := range calls {
+		if c.CostUSD <= 0 {
+			return nil
+		}
+		total += c.CostUSD
+	}
+	return &total
 }

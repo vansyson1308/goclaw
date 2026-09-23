@@ -60,11 +60,11 @@ func (p *partitionable) AppendMissionEvent(ctx context.Context, ev store.Mission
 	return p.MissionStore.AppendMissionEvent(ctx, ev)
 }
 
-func (p *partitionable) RenewMissionLease(ctx context.Context, id uuid.UUID, f store.MissionFence, until time.Time) error {
+func (p *partitionable) RenewMissionLease(ctx context.Context, id uuid.UUID, f store.MissionFence, ttl time.Duration) error {
 	if err := p.check(); err != nil {
 		return err
 	}
-	return p.MissionStore.RenewMissionLease(ctx, id, f, until)
+	return p.MissionStore.RenewMissionLease(ctx, id, f, ttl)
 }
 
 func (p *partitionable) ListActiveMissionsAllTenants(ctx context.Context) ([]store.Mission, error) {
@@ -126,8 +126,8 @@ func newCluster(t *testing.T) *cluster {
 	return &cluster{t: t, shared: newMemStore(), root: root, ctx: store.WithTenantID(context.Background(), uuid.New())}
 }
 
-// worker starts a service that shares the cluster's store. skew shifts its
-// clock, so leases held by others look expired to it.
+// worker starts a service that shares the cluster's store. skew shifts the
+// worker's own clock only; lease expiry is always judged by the store.
 func (c *cluster) worker(name string, r AgentRunner, ttl, skew time.Duration) (*Service, *partitionable) {
 	c.t.Helper()
 	p := &partitionable{MissionStore: c.shared}
@@ -163,7 +163,7 @@ func eventMessages(st *memStore, id uuid.UUID) string {
 	return b.String()
 }
 
-const expired = time.Hour // clock skew that makes any lease look expired
+const expired = time.Hour // store clock advance that expires every lease
 
 // A worker dies mid-run (before its provider call returns). Another worker
 // retries the mission in a fresh workspace; the result is honest about the
@@ -184,7 +184,8 @@ func TestCrashedWorkerAttemptIsRetried(t *testing.T) {
 		t.Fatalf("A must not have written anything after losing the store: %s %q", got.Status, got.LeaseOwner)
 	}
 
-	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, expired)
+	c.shared.advance(expired) // every existing lease has now run out
+	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, 0)
 	rep, err := b.Recover(context.Background())
 	must(t, err)
 	if rep.Retried != 1 {
@@ -219,7 +220,8 @@ func TestSideEffectsOfCrashedAttemptDoNotLeak(t *testing.T) {
 	aStore.down.Store(true)
 	waitDone(t, a, 5*time.Second)
 
-	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, expired)
+	c.shared.advance(expired) // every existing lease has now run out
+	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, 0)
 	_, err = b.Recover(context.Background())
 	must(t, err)
 	b.Wait()
@@ -247,7 +249,8 @@ func TestStaleWorkerIsFencedAfterTakeover(t *testing.T) {
 	aStore.down.Store(true) // partition: A still runs, but cannot reach the store
 	gate := make(chan struct{})
 	bRunner := &fakeRunner{reply: "fixed", edit: honestFix, block: gate, started: make(chan struct{})}
-	b, _ := c.worker("worker-b", bRunner, time.Minute, expired) // B sees A's lease as expired
+	c.shared.advance(expired) // every existing lease has now run out
+	b, _ := c.worker("worker-b", bRunner, time.Minute, 0)
 	rep, err := b.Recover(context.Background())
 	must(t, err)
 	if rep.Retried != 1 {
@@ -291,7 +294,8 @@ func TestCancelReachesOtherWorkerAndIsNotRetried(t *testing.T) {
 	m, err := a.Create(c.ctx, contractJSON(), "alice")
 	must(t, err)
 	<-hang.started
-	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, expired)
+	c.shared.advance(expired) // every existing lease has now run out
+	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, 0)
 	start := time.Now()
 	if _, err := b.Cancel(c.ctx, m.ID, "bob", ""); err != nil {
 		t.Fatal(err)
@@ -318,7 +322,8 @@ func TestAttemptsAreBounded(t *testing.T) {
 	<-hang.started
 	aStore.down.Store(true)
 	waitDone(t, a, 5*time.Second)
-	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, expired)
+	c.shared.advance(expired) // every existing lease has now run out
+	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, 0)
 	rep, err := b.Recover(context.Background())
 	must(t, err)
 	b.Wait()
@@ -479,4 +484,23 @@ func TestAggregateUsageNeverTreatsUnknownAsZero(t *testing.T) {
 	if *u.CostUSD != 0.75 || *u.InputTokens != 10 || *u.Iterations != 3 {
 		t.Errorf("totals not summed across attempts: %+v", u)
 	}
+}
+
+// Review D/M1: a peer whose clock runs far ahead must not take over a
+// mission whose worker is still renewing: expiry is the store's decision.
+func TestClockSkewedPeerCannotStealLiveLease(t *testing.T) {
+	c := newCluster(t)
+	hang := newHangRunner(false)
+	a, _ := c.worker("worker-a", hang, 3*time.Second, 0)
+	m, err := a.Create(c.ctx, contractWith(func(ct *Contract) { ct.Limits.MaxAttempts = 1 }), "alice")
+	must(t, err)
+	<-hang.started
+	b, _ := c.worker("worker-b", &fakeRunner{}, time.Minute, 2*time.Hour) // B's clock is 2h ahead
+	rep, err := b.Recover(context.Background())
+	must(t, err)
+	if got := c.get(m.ID); rep != (RecoveryReport{}) || got.Status != StatusRunning || got.Attempt != 1 {
+		t.Fatalf("skewed peer interfered: %+v %s attempt %d", rep, got.Status, got.Attempt)
+	}
+	_, _ = a.Cancel(c.ctx, m.ID, "alice", "")
+	a.Wait()
 }

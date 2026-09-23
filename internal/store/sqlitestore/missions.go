@@ -160,9 +160,10 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 	defer tx.Rollback() //nolint:errcheck
 	var current, leaseOwner string
 	var attempt, maxAttempts int
+	var leaseUntil nullSqliteTime
 	err = tx.QueryRowContext(ctx,
-		`SELECT status, attempt, max_attempts, COALESCE(lease_owner, '') FROM missions WHERE id = ? AND tenant_id = ?`,
-		id.String(), tenantID.String()).Scan(&current, &attempt, &maxAttempts, &leaseOwner)
+		`SELECT status, attempt, max_attempts, COALESCE(lease_owner, ''), lease_expires_at FROM missions WHERE id = ? AND tenant_id = ?`,
+		id.String(), tenantID.String()).Scan(&current, &attempt, &maxAttempts, &leaseOwner, &leaseUntil)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, store.ErrMissionNotFound
 	}
@@ -174,6 +175,10 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 	}
 	if f := u.Fence; f != nil && (leaseOwner != f.Owner || attempt != f.Attempt) {
 		return nil, fmt.Errorf("%w: %w (held by %q attempt %d)", store.ErrMissionStateConflict, store.ErrMissionLeaseLost, leaseOwner, attempt)
+	}
+	// The Lite edition is a single process: its clock is the store clock.
+	if exp := leaseUntil.ptr(); u.RequireLeaseExpired && exp != nil && !exp.Before(time.Now()) {
+		return nil, fmt.Errorf("%w: lease held by %q has not expired", store.ErrMissionStateConflict, leaseOwner)
 	}
 	if u.Claim != nil && attempt >= maxAttempts {
 		return nil, fmt.Errorf("%w: %w (%d/%d)", store.ErrMissionStateConflict, store.ErrMissionNoAttempts, attempt, maxAttempts)
@@ -236,7 +241,7 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 	switch {
 	case u.Claim != nil:
 		add("lease_owner", u.Claim.Owner)
-		add("lease_expires_at", u.Claim.Until.UTC().Format(time.RFC3339Nano))
+		add("lease_expires_at", time.Now().Add(u.Claim.TTL).UTC().Format(time.RFC3339Nano))
 		sets = append(sets, "attempt = attempt + 1")
 	case u.ClearLease:
 		sets = append(sets, "lease_owner = NULL", "lease_expires_at = NULL")
@@ -319,7 +324,8 @@ func (s *SQLiteMissionStore) ListMissionEvents(ctx context.Context, missionID uu
 	return out, rows.Err()
 }
 
-func (s *SQLiteMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID, fence store.MissionFence, until time.Time) error {
+func (s *SQLiteMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID, fence store.MissionFence, ttl time.Duration) error {
+	until := time.Now().Add(ttl)
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE missions SET lease_expires_at = ?
 		 WHERE id = ? AND tenant_id = ? AND lease_owner = ? AND attempt = ?
@@ -336,6 +342,9 @@ func (s *SQLiteMissionStore) RenewMissionLease(ctx context.Context, id uuid.UUID
 
 func (s *SQLiteMissionStore) BeginMissionReceipt(ctx context.Context, r store.MissionReceipt, fence store.MissionFence) error {
 	tenantID := tenantIDForInsert(ctx).String()
+	if r.Attempt != fence.Attempt {
+		return store.ErrMissionLeaseLost
+	}
 	var reason any
 	if r.Reason != "" {
 		reason = r.Reason
@@ -343,8 +352,7 @@ func (s *SQLiteMissionStore) BeginMissionReceipt(ctx context.Context, r store.Mi
 	res, err := s.db.ExecContext(ctx,
 		`INSERT INTO mission_receipts (tenant_id, mission_id, attempt, seq, tool, action_class, status, reason, args_digest, created_at, updated_at)
 		 SELECT tenant_id, id, ?, ?, ?, ?, ?, ?, ?, ?, ? FROM missions
-		 WHERE id = ? AND tenant_id = ? AND lease_owner = ? AND attempt = ?
-		   AND status IN ('preparing','running','verifying')
+		 WHERE id = ? AND tenant_id = ? AND lease_owner = ? AND attempt = ? AND status = 'running'
 		 ON CONFLICT (mission_id, attempt, seq) DO NOTHING`,
 		r.Attempt, r.Seq, r.Tool, r.ActionClass, r.Status, reason, r.ArgsDigest, nowText(), nowText(),
 		r.MissionID.String(), tenantID, fence.Owner, r.Attempt)
@@ -352,10 +360,13 @@ func (s *SQLiteMissionStore) BeginMissionReceipt(ctx context.Context, r store.Mi
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		// A duplicate is idempotent only while the lease is still held.
 		var exists int
 		if err := s.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM mission_receipts WHERE mission_id = ? AND tenant_id = ? AND attempt = ? AND seq = ?`,
-			r.MissionID.String(), tenantID, r.Attempt, r.Seq).Scan(&exists); err != nil {
+			`SELECT (SELECT COUNT(*) FROM mission_receipts WHERE mission_id = ? AND tenant_id = ? AND attempt = ? AND seq = ?)
+			      * (SELECT COUNT(*) FROM missions WHERE id = ? AND tenant_id = ? AND lease_owner = ? AND attempt = ? AND status = 'running')`,
+			r.MissionID.String(), tenantID, r.Attempt, r.Seq,
+			r.MissionID.String(), tenantID, fence.Owner, r.Attempt).Scan(&exists); err != nil {
 			return err
 		}
 		if exists == 0 {

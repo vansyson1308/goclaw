@@ -25,9 +25,21 @@ type memStore struct {
 	// fail, when set, is consulted before every call; a non-nil error is
 	// returned as if the database were unreachable (fault injection).
 	fail func(op string) error
+	// skew shifts the store's clock (lease expiry is judged by it, like the
+	// database clock), so tests can expire leases without waiting.
+	skew time.Duration
 }
 
 func newMemStore() *memStore { return &memStore{missions: map[uuid.UUID]*store.Mission{}} }
+
+func (s *memStore) now() time.Time { return time.Now().Add(s.skew) }
+
+// advance moves the store clock forward.
+func (s *memStore) advance(d time.Duration) {
+	s.mu.Lock()
+	s.skew += d
+	s.mu.Unlock()
+}
 
 func TestMemStoreConformsToMissionStore(t *testing.T) {
 	a, b := uuid.New(), uuid.New()
@@ -117,6 +129,9 @@ func (s *memStore) TransitionMission(ctx context.Context, id uuid.UUID, from []s
 	if f := u.Fence; f != nil && (m.LeaseOwner != f.Owner || m.Attempt != f.Attempt) {
 		return nil, fmt.Errorf("%w: %w", store.ErrMissionStateConflict, store.ErrMissionLeaseLost)
 	}
+	if u.RequireLeaseExpired && m.LeaseExpiresAt != nil && !m.LeaseExpiresAt.Before(s.now()) {
+		return nil, fmt.Errorf("%w: lease has not expired", store.ErrMissionStateConflict)
+	}
 	if u.Claim != nil && m.Attempt >= m.MaxAttempts {
 		return nil, fmt.Errorf("%w: %w", store.ErrMissionStateConflict, store.ErrMissionNoAttempts)
 	}
@@ -166,7 +181,7 @@ func (s *memStore) TransitionMission(ctx context.Context, id uuid.UUID, from []s
 	}
 	switch {
 	case u.Claim != nil:
-		until := u.Claim.Until
+		until := s.now().Add(u.Claim.TTL)
 		m.LeaseOwner, m.LeaseExpiresAt = u.Claim.Owner, &until
 		m.Attempt++
 	case u.ClearLease:
@@ -204,7 +219,7 @@ func (s *memStore) ListMissionEvents(ctx context.Context, id uuid.UUID) ([]store
 	return out, nil
 }
 
-func (s *memStore) RenewMissionLease(ctx context.Context, id uuid.UUID, f store.MissionFence, until time.Time) error {
+func (s *memStore) RenewMissionLease(ctx context.Context, id uuid.UUID, f store.MissionFence, ttl time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.injected("renew"); err != nil {
@@ -214,6 +229,7 @@ func (s *memStore) RenewMissionLease(ctx context.Context, id uuid.UUID, f store.
 	if !ok || m.LeaseOwner != f.Owner || m.Attempt != f.Attempt || !slices.Contains(store.MissionActiveStatuses, m.Status) {
 		return store.ErrMissionLeaseLost
 	}
+	until := s.now().Add(ttl)
 	m.LeaseExpiresAt = &until
 	return nil
 }
@@ -224,15 +240,14 @@ func (s *memStore) BeginMissionReceipt(ctx context.Context, r store.MissionRecei
 	if err := s.injected("receipt"); err != nil {
 		return err
 	}
+	m, ok := s.get(ctx, r.MissionID)
+	if !ok || r.Attempt != f.Attempt || m.LeaseOwner != f.Owner || m.Attempt != r.Attempt || m.Status != store.MissionRunning {
+		return store.ErrMissionLeaseLost
+	}
 	for _, x := range s.receipts {
 		if x.MissionID == r.MissionID && x.Attempt == r.Attempt && x.Seq == r.Seq {
 			return nil
 		}
-	}
-	m, ok := s.get(ctx, r.MissionID)
-	if !ok || m.LeaseOwner != f.Owner || m.Attempt != r.Attempt ||
-		!slices.Contains([]string{store.MissionPreparing, store.MissionRunning, store.MissionVerifying}, m.Status) {
-		return store.ErrMissionLeaseLost
 	}
 	r.CreatedAt = time.Now()
 	s.receipts = append(s.receipts, r)
