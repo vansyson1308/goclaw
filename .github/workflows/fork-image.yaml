@@ -20,6 +20,8 @@ concurrency:
 
 jobs:
   build:
+    # Fork safety: publishing is opt-in outside upstream (see plans/mission-control/RUNBOOK.md).
+    if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

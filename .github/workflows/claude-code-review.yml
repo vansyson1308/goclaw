@@ -12,6 +12,8 @@ on:
 
 jobs:
   claude-review:
+    # Fork safety: needs a Claude token; opt-in outside upstream (see plans/mission-control/RUNBOOK.md).
+    if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_CLAUDE_REVIEW_ENABLED == 'true')
     # Optional: Filter by PR author
     # if: |
     #   github.event.pull_request.user.login == 'external-contributor' ||

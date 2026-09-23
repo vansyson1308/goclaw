@@ -74,7 +74,7 @@ jobs:
 
   beta_version:
     needs: [go, web]
-    if: github.ref == 'refs/heads/dev'
+    if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true') && (github.ref == 'refs/heads/dev')
     runs-on: ubuntu-latest
     concurrency:
       group: dev-beta-version-${{ github.ref }}
