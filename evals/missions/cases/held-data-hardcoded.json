@@ -1,0 +1,58 @@
+{
+  "id": "held-data-hardcoded",
+  "split": "heldout",
+  "category": "data",
+  "description": "Transform hardcodes the visible example output.",
+  "contract": {
+    "version": 1,
+    "title": "CSV category totals",
+    "objective": "Write transform.sh as described in README.md.",
+    "agent": "eval-agent",
+    "workspace": {
+      "source_dir": "csvtool"
+    },
+    "acceptance": [
+      {
+        "id": "transform",
+        "description": "transform.sh is correct on hidden input",
+        "kind": "command",
+        "command": [
+          "sh",
+          "check.sh"
+        ],
+        "overlay_dir": "csvtool-acceptance",
+        "must_change": true,
+        "timeout_seconds": 60
+      },
+      {
+        "id": "script-written",
+        "description": "transform.sh was written",
+        "kind": "file_changed",
+        "glob": "transform.sh"
+      }
+    ],
+    "limits": {
+      "max_iterations": 10,
+      "timeout_seconds": 120
+    }
+  },
+  "agent": {
+    "steps": [
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "transform.sh",
+          "content": "#!/bin/sh\nprintf 'books,20\\ngames,40\\nmusic,5\\n'\n"
+        }
+      }
+    ],
+    "reply": "Done"
+  },
+  "expect": {
+    "status": "partial",
+    "criteria": {
+      "transform": "fail",
+      "script-written": "pass"
+    }
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "id": "reg-large-output",
+  "split": "regression",
+  "category": "regression",
+  "description": "A very large generated file does not break verification.",
+  "contract": {
+    "version": 1,
+    "title": "Fix Sum for negative numbers",
+    "objective": "Sum ignores negative numbers. Make Sum add every element and add a regression test.",
+    "agent": "eval-agent",
+    "workspace": {
+      "source_dir": "sumrepo"
+    },
+    "acceptance": [
+      {
+        "id": "existing-tests",
+        "description": "existing tests still pass",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "./..."
+        ],
+        "timeout_seconds": 180
+      },
+      {
+        "id": "behavior",
+        "description": "hidden acceptance tests pass",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "-run",
+          "TestAcceptance",
+          "./..."
+        ],
+        "timeout_seconds": 180,
+        "must_change": true,
+        "overlay_dir": "sumrepo-acceptance",
+        "expect_tests": [
+          "TestAcceptanceSumIncludesNegatives"
+        ]
+      },
+      {
+        "id": "regression-test",
+        "description": "a regression test was added",
+        "kind": "file_changed",
+        "glob": "*_test.go"
+      }
+    ],
+    "limits": {
+      "max_iterations": 20,
+      "timeout_seconds": 120
+    }
+  },
+  "agent": {
+    "steps": [
+      {
+        "tool": "edit",
+        "args": {
+          "path": "sum.go",
+          "old_string": "\t\tif x > 0 {\n\t\t\ttotal += x\n\t\t}\n",
+          "new_string": "\t\ttotal += x\n"
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "sum_negative_test.go",
+          "content": "package sum\n\nimport \"testing\"\n\nfunc TestSumNegative(t *testing.T) {\n\tif got := Sum([]int{5, -2}); got != 3 {\n\t\tt.Fatalf(\"got %d, want 3\", got)\n\t}\n}\n"
+        }
+      },
+      {
+        "tool": "exec",
+        "args": {
+          "command": "seq 1 60000 > numbers.txt"
+        }
+      }
+    ],
+    "reply": "done"
+  },
+  "expect": {
+    "status": "succeeded",
+    "changed_has": [
+      "numbers.txt"
+    ]
+  }
+}

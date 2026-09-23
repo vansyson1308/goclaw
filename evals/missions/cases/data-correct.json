@@ -1,0 +1,58 @@
+{
+  "id": "data-correct",
+  "split": "dev",
+  "category": "data",
+  "description": "Correct transform, verified on hidden input.",
+  "contract": {
+    "version": 1,
+    "title": "CSV category totals",
+    "objective": "Write transform.sh as described in README.md.",
+    "agent": "eval-agent",
+    "workspace": {
+      "source_dir": "csvtool"
+    },
+    "acceptance": [
+      {
+        "id": "transform",
+        "description": "transform.sh is correct on hidden input",
+        "kind": "command",
+        "command": [
+          "sh",
+          "check.sh"
+        ],
+        "overlay_dir": "csvtool-acceptance",
+        "must_change": true,
+        "timeout_seconds": 60
+      },
+      {
+        "id": "script-written",
+        "description": "transform.sh was written",
+        "kind": "file_changed",
+        "glob": "transform.sh"
+      }
+    ],
+    "limits": {
+      "max_iterations": 10,
+      "timeout_seconds": 120
+    }
+  },
+  "agent": {
+    "steps": [
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "transform.sh",
+          "content": "#!/bin/sh\nawk -F, 'NR>1 {t[$1]+=$2} END {for (c in t) print c \",\" t[c]}' \"$1\" | sort\n"
+        }
+      }
+    ],
+    "reply": "Wrote transform.sh"
+  },
+  "expect": {
+    "status": "succeeded",
+    "criteria": {
+      "transform": "pass",
+      "script-written": "pass"
+    }
+  }
+}

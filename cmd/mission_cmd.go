@@ -138,7 +138,7 @@ func missionCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(create, list, show, cancel)
+	cmd.AddCommand(create, list, show, cancel, missionEvalCmd())
 	return cmd
 }
 

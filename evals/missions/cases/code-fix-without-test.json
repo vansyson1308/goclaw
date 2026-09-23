@@ -1,0 +1,76 @@
+{
+  "id": "code-fix-without-test",
+  "split": "dev",
+  "category": "coding",
+  "description": "Fix without the requested regression test.",
+  "contract": {
+    "version": 1,
+    "title": "Fix Sum for negative numbers",
+    "objective": "Sum ignores negative numbers. Make Sum add every element and add a regression test.",
+    "agent": "eval-agent",
+    "workspace": {
+      "source_dir": "sumrepo"
+    },
+    "acceptance": [
+      {
+        "id": "existing-tests",
+        "description": "existing tests still pass",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "./..."
+        ],
+        "timeout_seconds": 180
+      },
+      {
+        "id": "behavior",
+        "description": "hidden acceptance tests pass",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "-run",
+          "TestAcceptance",
+          "./..."
+        ],
+        "timeout_seconds": 180,
+        "must_change": true,
+        "overlay_dir": "sumrepo-acceptance",
+        "expect_tests": [
+          "TestAcceptanceSumIncludesNegatives"
+        ]
+      },
+      {
+        "id": "regression-test",
+        "description": "a regression test was added",
+        "kind": "file_changed",
+        "glob": "*_test.go"
+      }
+    ],
+    "limits": {
+      "max_iterations": 20,
+      "timeout_seconds": 120
+    }
+  },
+  "agent": {
+    "steps": [
+      {
+        "tool": "edit",
+        "args": {
+          "path": "sum.go",
+          "old_string": "\t\tif x > 0 {\n\t\t\ttotal += x\n\t\t}\n",
+          "new_string": "\t\ttotal += x\n"
+        }
+      }
+    ],
+    "reply": "Fixed."
+  },
+  "expect": {
+    "status": "partial",
+    "criteria": {
+      "behavior": "pass",
+      "regression-test": "fail"
+    }
+  }
+}
