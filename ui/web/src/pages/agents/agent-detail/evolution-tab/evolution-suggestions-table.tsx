@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import { Check, X, RotateCcw } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,30 @@ import {
 import { formatRelativeTime } from "@/lib/format";
 import type { EvolutionSuggestion } from "@/types/evolution";
 
+type Action = "approved" | "rejected" | "rolled_back";
+
+/** Rollback exists only for suggestions that changed agent config. */
+export function canRollback(s: EvolutionSuggestion): boolean {
+  if (s.status !== "applied") return false;
+  if (s.applied_change) return true;
+  // Legacy threshold rows kept their baseline in parameters._baseline.
+  return s.suggestion_type === "threshold" && !!s.parameters && "_baseline" in s.parameters;
+}
+
+/** Human-readable summary of the config change, e.g. "tools_config.deny: + web_fetch". */
+export function changeSummary(s: EvolutionSuggestion): string | null {
+  const c = s.applied_change;
+  if (!c) return null;
+  const path = `${c.column}.${c.path.join(".")}`;
+  const before = Array.isArray(c.before.value) ? (c.before.value as unknown[]) : [];
+  const after = Array.isArray(c.after.value) ? (c.after.value as unknown[]) : null;
+  if (after) {
+    const added = after.filter((v) => !before.includes(v));
+    if (added.length > 0) return `${path}: + ${added.join(", ")}`;
+  }
+  return path;
+}
+
 const TYPE_COLORS: Record<string, string> = {
   threshold: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
   tool_order: "bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-300",
@@ -19,6 +44,7 @@ const TYPE_COLORS: Record<string, string> = {
 const STATUS_COLORS: Record<string, string> = {
   pending: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900 dark:text-yellow-300",
   approved: "bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300",
+  applying: "bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-300",
   applied: "bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300",
   rejected: "bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-300",
   rolled_back: "bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300",
@@ -27,19 +53,19 @@ const STATUS_COLORS: Record<string, string> = {
 interface Props {
   suggestions: EvolutionSuggestion[];
   loading: boolean;
-  onUpdateStatus: (id: string, status: "approved" | "rejected" | "rolled_back") => Promise<void>;
+  onUpdateStatus: (id: string, status: Action) => Promise<void>;
 }
 
 export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus }: Props) {
   const { t } = useTranslation("agents");
-  const [confirm, setConfirm] = useState<{ id: string; action: "approved" | "rejected" | "rolled_back" } | null>(null);
+  const [confirm, setConfirm] = useState<{ s: EvolutionSuggestion; action: Action } | null>(null);
   const [acting, setActing] = useState(false);
 
   const handleConfirm = async () => {
     if (!confirm) return;
     setActing(true);
     try {
-      await onUpdateStatus(confirm.id, confirm.action);
+      await onUpdateStatus(confirm.s.id, confirm.action);
     } finally {
       setActing(false);
       setConfirm(null);
@@ -84,6 +110,16 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
                     <Badge variant="outline" className={STATUS_COLORS[s.status] ?? ""}>
                       {s.status}
                     </Badge>
+                    {s.status === "applied" && changeSummary(s) && (
+                      <p className="mt-1 text-xs text-muted-foreground font-mono break-all">{changeSummary(s)}</p>
+                    )}
+                    {(s.applied_by || s.rolled_back_by) && (
+                      <p className="text-xs text-muted-foreground">
+                        {s.status === "rolled_back"
+                          ? t("detail.evolution.rolledBackBy", { actor: s.rolled_back_by })
+                          : t("detail.evolution.appliedBy", { actor: s.applied_by })}
+                      </p>
+                    )}
                   </td>
                   <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap">
                     {formatRelativeTime(s.created_at)}
@@ -96,7 +132,7 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
                             size="sm" variant="ghost"
                             className="h-7 w-7 p-0 text-green-600 hover:text-green-700"
                             title={t("detail.evolution.approve")}
-                            onClick={() => setConfirm({ id: s.id, action: "approved" })}
+                            onClick={() => setConfirm({ s, action: "approved" })}
                           >
                             <Check className="h-4 w-4" />
                           </Button>
@@ -104,18 +140,18 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
                             size="sm" variant="ghost"
                             className="h-7 w-7 p-0 text-red-600 hover:text-red-700"
                             title={t("detail.evolution.reject")}
-                            onClick={() => setConfirm({ id: s.id, action: "rejected" })}
+                            onClick={() => setConfirm({ s, action: "rejected" })}
                           >
                             <X className="h-4 w-4" />
                           </Button>
                         </>
                       )}
-                      {s.status === "applied" && (
+                      {canRollback(s) && (
                         <Button
                           size="sm" variant="ghost"
                           className="h-7 w-7 p-0 text-orange-600 hover:text-orange-700"
                           title={t("detail.evolution.rollback")}
-                          onClick={() => setConfirm({ id: s.id, action: "rolled_back" })}
+                          onClick={() => setConfirm({ s, action: "rolled_back" })}
                         >
                           <RotateCcw className="h-4 w-4" />
                         </Button>
@@ -139,7 +175,7 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
               {confirm?.action === "rolled_back" && t("detail.evolution.confirmRollback")}
             </DialogTitle>
             <DialogDescription>
-              {t("detail.evolution.confirmDescription")}
+              {confirm && confirmDescription(confirm.s, confirm.action, t)}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -154,4 +190,17 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
       </Dialog>
     </>
   );
+}
+
+function confirmDescription(s: EvolutionSuggestion, action: Action, t: TFunction<"agents">): string {
+  if (action === "rolled_back") return t("detail.evolution.confirmRollbackDescription");
+  if (action === "rejected") return t("detail.evolution.confirmDescription");
+  switch (s.suggestion_type) {
+    case "tool_order":
+      return t("detail.evolution.confirmToolOrderDescription", { tool: String(s.parameters?.tool ?? "") });
+    case "skill_add":
+      return t("detail.evolution.confirmSkillAddDescription");
+    default:
+      return t("detail.evolution.confirmAdvisoryDescription");
+  }
 }

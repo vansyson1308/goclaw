@@ -30,6 +30,15 @@ export interface EvolutionSuggestion {
   reviewed_by: string | null
   reviewed_at: string | null
   created_at: string
+  applied_by?: string | null
+  rolled_back_by?: string | null
+  /** Exact config change made on apply (absent for advisory/legacy rows). */
+  applied_change?: {
+    column: string
+    path: string[]
+    before: { present: boolean; value?: unknown }
+    after: { present: boolean; value?: unknown }
+  } | null
 }
 
 export interface AdaptationGuardrails {

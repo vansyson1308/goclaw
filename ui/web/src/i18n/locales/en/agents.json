@@ -258,7 +258,7 @@
       "retrievalQuality": "Retrieval Quality",
       "feedback": "Feedback",
       "noMetrics": "No metrics recorded yet. Metrics will appear as the agent handles requests.",
-      "noSuggestions": "No suggestions generated yet. Suggestions are created by the daily analysis cron.",
+      "noSuggestions": "No suggestions generated yet. Analysis runs every 6 hours (03:00, 09:00, 15:00, 21:00 server time).",
       "suggestions": "Suggestions",
       "guardrails": "Adaptation Guardrails",
       "maxDelta": "Max delta / cycle",
@@ -286,7 +286,14 @@
       "successRate": "Success Rate",
       "usageRate": "Usage Rate",
       "tooltipCalls": "{{count}} calls, {{ms}}ms avg",
-      "tooltipQueries": "{{count}} queries, score {{score}}"
+      "tooltipQueries": "{{count}} queries, score {{score}}",
+      "appliedBy": "applied by {{actor}}",
+      "rolledBackBy": "rolled back by {{actor}}",
+      "confirmToolOrderDescription": "Adds \"{{tool}}\" to this agent's tool deny list. Other agents are not affected. Requires the minimum data points guardrail. Can be rolled back.",
+      "confirmSkillAddDescription": "Creates a new private skill from the suggestion's draft. Skills are not rolled back here; archive the skill instead.",
+      "confirmAdvisoryDescription": "Advisory only: marks the suggestion as reviewed. No agent configuration is changed.",
+      "confirmRollbackDescription": "Restores the exact configuration from before the change. Refused if the setting was edited since.",
+      "guardrailsHint": "Enforced when applying: minimum data points, and locked parameters (e.g. tools_config.deny)."
     }
   },
   "general": {

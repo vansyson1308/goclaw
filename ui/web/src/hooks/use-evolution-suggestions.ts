@@ -32,8 +32,13 @@ export function useEvolutionSuggestions(agentId: string, status?: string) {
           queryKey: queryKeys.evolution.suggestions(agentId, { status: status ?? "" }),
         });
         toast.success(`Suggestion ${newStatus}`);
-      } catch {
-        toast.error("Failed to update suggestion");
+      } catch (err) {
+        // Server explains conflicts (stale review, rollback over a newer
+        // change) and guardrail refusals; show that instead of a generic line.
+        toast.error(err instanceof Error && err.message ? err.message : "Failed to update suggestion");
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.evolution.suggestions(agentId, { status: status ?? "" }),
+        });
       }
     },
     [http, agentId, status, queryClient],

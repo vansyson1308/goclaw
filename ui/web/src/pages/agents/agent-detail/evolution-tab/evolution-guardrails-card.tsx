@@ -16,6 +16,7 @@ export function EvolutionGuardrailsCard({ guardrails }: Props) {
         <Shield className="h-4 w-4 text-green-600 shrink-0" />
         <h4 className="text-sm font-medium">{t("detail.evolution.guardrails")}</h4>
       </div>
+      <p className="text-xs text-muted-foreground">{t("detail.evolution.guardrailsHint")}</p>
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
         <div className="space-y-0.5">

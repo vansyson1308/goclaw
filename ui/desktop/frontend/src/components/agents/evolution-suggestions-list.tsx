@@ -19,14 +19,30 @@ const TYPE_COLORS: Record<string, string> = {
 const STATUS_COLORS: Record<string, string> = {
   pending: 'bg-yellow-500/10 text-yellow-600',
   approved: 'bg-blue-500/10 text-blue-600',
+  applying: 'bg-purple-500/10 text-purple-600',
   applied: 'bg-green-500/10 text-green-600',
   rejected: 'bg-red-500/10 text-red-600',
   rolled_back: 'bg-surface-tertiary text-text-muted',
 }
 
+/** Rollback exists only for suggestions that changed agent config. */
+function canRollback(s: EvolutionSuggestion): boolean {
+  if (s.status !== 'applied') return false
+  if (s.applied_change) return true
+  return s.suggestion_type === 'threshold' && !!s.parameters && '_baseline' in s.parameters
+}
+
+function confirmDescription(s: EvolutionSuggestion, action: 'approved' | 'rejected' | 'rolled_back'): string {
+  if (action === 'rolled_back') return 'Restores the exact configuration from before the change. Refused if the setting was edited since.'
+  if (action === 'rejected') return 'This action will update the suggestion status.'
+  if (s.suggestion_type === 'tool_order') return `Adds "${String(s.parameters?.tool ?? '')}" to this agent's tool deny list. Other agents are not affected.`
+  if (s.suggestion_type === 'skill_add') return "Creates a new private skill from the suggestion's draft."
+  return 'Advisory only: marks the suggestion as reviewed. No agent configuration is changed.'
+}
+
 export function EvolutionSuggestionsList({ suggestions, loading, onUpdateStatus }: EvolutionSuggestionsListProps) {
   const { t } = useTranslation('agents')
-  const [confirm, setConfirm] = useState<{ id: string; action: 'approved' | 'rejected' | 'rolled_back' } | null>(null)
+  const [confirm, setConfirm] = useState<{ s: EvolutionSuggestion; action: 'approved' | 'rejected' | 'rolled_back' } | null>(null)
 
   if (loading) return <div className="h-24 animate-pulse rounded-lg bg-surface-tertiary" />
   if (suggestions.length === 0) return <p className="text-xs text-text-muted text-center py-6">{t('detail.evolutionTab.noSuggestions')}</p>
@@ -53,12 +69,12 @@ export function EvolutionSuggestionsList({ suggestions, loading, onUpdateStatus 
             <div className="flex justify-end gap-1.5">
               {s.status === 'pending' && (
                 <>
-                  <button onClick={() => setConfirm({ id: s.id, action: 'approved' })} className="px-2 py-1 text-[10px] rounded bg-success/10 text-success hover:bg-success/20 transition-colors">{t('detail.evolutionTab.approve')}</button>
-                  <button onClick={() => setConfirm({ id: s.id, action: 'rejected' })} className="px-2 py-1 text-[10px] rounded bg-error/10 text-error hover:bg-error/20 transition-colors">{t('detail.evolutionTab.reject')}</button>
+                  <button onClick={() => setConfirm({ s, action: 'approved' })} className="px-2 py-1 text-[10px] rounded bg-success/10 text-success hover:bg-success/20 transition-colors">{t('detail.evolutionTab.approve')}</button>
+                  <button onClick={() => setConfirm({ s, action: 'rejected' })} className="px-2 py-1 text-[10px] rounded bg-error/10 text-error hover:bg-error/20 transition-colors">{t('detail.evolutionTab.reject')}</button>
                 </>
               )}
-              {s.status === 'applied' && (
-                <button onClick={() => setConfirm({ id: s.id, action: 'rolled_back' })} className="px-2 py-1 text-[10px] rounded bg-orange-500/10 text-orange-600 hover:bg-orange-500/20 transition-colors">{t('detail.evolutionTab.rollback')}</button>
+              {canRollback(s) && (
+                <button onClick={() => setConfirm({ s, action: 'rolled_back' })} className="px-2 py-1 text-[10px] rounded bg-orange-500/10 text-orange-600 hover:bg-orange-500/20 transition-colors">{t('detail.evolutionTab.rollback')}</button>
               )}
             </div>
           </div>
@@ -69,10 +85,10 @@ export function EvolutionSuggestionsList({ suggestions, loading, onUpdateStatus 
         open={confirm !== null}
         onOpenChange={() => setConfirm(null)}
         title={confirm ? `${confirm.action === 'approved' ? 'Approve' : confirm.action === 'rejected' ? 'Reject' : 'Rollback'} Suggestion` : ''}
-        description="This action will update the suggestion status."
+        description={confirm ? confirmDescription(confirm.s, confirm.action) : ''}
         variant={confirm?.action === 'rejected' ? 'destructive' : 'default'}
         onConfirm={async () => {
-          if (confirm) await onUpdateStatus(confirm.id, confirm.action)
+          if (confirm) await onUpdateStatus(confirm.s.id, confirm.action)
           setConfirm(null)
         }}
       />

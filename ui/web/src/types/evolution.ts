@@ -22,9 +22,42 @@ export interface EvolutionSuggestion {
   suggestion: string;
   rationale: string;
   parameters: Record<string, unknown> | null;
-  status: "pending" | "approved" | "rejected" | "applied" | "rolled_back";
+  status: "pending" | "approved" | "rejected" | "applying" | "applied" | "rolled_back";
   reviewed_by: string | null;
   reviewed_at: string | null;
+  created_at: string;
+  applied_at?: string | null;
+  applied_by?: string | null;
+  rolled_back_at?: string | null;
+  rolled_back_by?: string | null;
+  /** Exact config change made on apply (absent for advisory/legacy rows). */
+  applied_change?: AgentConfigChange | null;
+  state_version?: number;
+}
+
+/** A JSON value plus whether the key existed at all (absence matters for rollback). */
+export interface ConfigValue {
+  present: boolean;
+  value?: unknown;
+}
+
+/** One mutation of an agent JSONB config column at a key path. */
+export interface AgentConfigChange {
+  column: string;
+  path: string[];
+  before: ConfigValue;
+  after: ConfigValue;
+}
+
+/** Append-only audit record of a suggestion transition. */
+export interface EvolutionEvent {
+  id: string;
+  suggestion_id: string;
+  action: string;
+  from_status: string;
+  to_status: string;
+  actor: string;
+  detail?: Record<string, unknown> | null;
   created_at: string;
 }
 
