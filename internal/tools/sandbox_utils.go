@@ -83,6 +83,7 @@ func acquireToolSandbox(
 	manager sandbox.Manager,
 	key, workspace string,
 ) (sandbox.Sandbox, error) {
+	manager = sandboxManagerFor(ctx, manager)
 	cfg := SandboxConfigFromCtx(ctx)
 	inputRoot := DelegationArtifactInputsFromCtx(ctx)
 	if inputRoot == "" {

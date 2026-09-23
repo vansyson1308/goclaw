@@ -10,8 +10,8 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | B. Evolution correctness | verified | EVIDENCE.md §B |
 | C. Mission vertical slice | verified | EVIDENCE.md §C (incl. adversarial review fixes) |
 | D. Durable recovery | verified | EVIDENCE.md §D (incl. adversarial review fixes) |
-| E. Enforced boundaries | in_progress | — |
-| F. Evaluation suite | pending | — |
+| E. Enforced boundaries | verified | EVIDENCE.md §E |
+| F. Evaluation suite | in_progress | 27 cases, harness + CLI |
 | G. Improvement lifecycle | pending | — |
 | H. Product completion | pending | — |
 
@@ -20,7 +20,7 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | Dimension | State |
 |---|---|
 | SOURCE READY | no (in progress) |
-| OFFLINE/INTEGRATION VERIFIED | partial: Phases A–D |
+| OFFLINE/INTEGRATION VERIFIED | partial: Phases A–E |
 | LIVE PROVIDER VERIFIED | BLOCKED: no provider credentials or budget |
 | COMMERCIAL LICENSE READY | BLOCKED: CC BY-NC 4.0 upstream |
 | PRODUCTION RELEASE APPROVED | no: not requested |
@@ -41,4 +41,4 @@ go test -race -tags integration ./tests/invariants/... ./tests/integration/
 ## Handoff
 
 - Branch: `claude/blissful-pascal-jo32ao`.
-- Next action: Phase E: Docker verifier executor, sandboxed mission exec (container per attempt), tenant isolation + adversarial fixtures.
+- Next action: Phase F (run the full offline suite on host and docker, evidence), then Phase G (candidate lifecycle).

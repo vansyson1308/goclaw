@@ -60,3 +60,11 @@
   - The cost limit applies to the mission total; the token budget counts cached input.
   - Fallback chains inherit native-tool refusal.
   - Residual gaps are listed in MISSIONS.md "Known limits" rather than claimed closed.
+- **D21 Containers are the default boundary for missions (Phase E).**
+  - `GOCLAW_MISSIONS_EXECUTOR=docker` is the default and fails closed: no Docker or no suitable image means missions stay disabled. There is no silent host fallback.
+  - **Verifiers:** each check runs in a fresh `--rm` container.
+  - **Agent tools:** the agent's `exec` and file tools use one container per attempt, destroyed at the end of the run.
+  - Both have no network, a read-only root, and no capabilities. Only the relevant copy is mounted.
+  - The host executor remains as an explicit opt-in and is logged as a security warning.
+  - The image must be Debian-based (the file tools need GNU coreutils); this is checked at startup.
+  - Each check gets its own copy and cache, so checks cannot influence one another.

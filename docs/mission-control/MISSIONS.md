@@ -92,7 +92,7 @@ Precedence: `blocked` wins over `failed` when a criterion could not be evaluated
 - **Usage.** Totals are summed across attempts and include cached input tokens. `usage_incomplete` is set when an attempt ended without reporting usage, and the totals are then a lower bound. Cost is unknown (never summed as zero) unless every model call of the run was priced. `max_cost_usd` applies to the mission total across attempts; `max_tokens` applies to each attempt.
 - A graceful shutdown behaves like a crash: the mission continues after the lease expires (crash-only design).
 - **Known limits (stated, not hidden):**
-  - A process that leaves the workspace (`cd /`) before the run ends is not found by the sweep. It can still write to the host and, if it learns the random evidence path, to the evidence copy. The Phase E container per attempt closes this.
+  - With the host executor, a process that leaves the workspace (`cd /`) before the run ends is not found by the sweep. It can still write to the host and, if it learns the random evidence path, to the evidence copy. The docker executor closes this: the attempt's container is destroyed when the run ends.
   - A claim whose commit succeeded but whose acknowledgement was lost burns that attempt: it is retried after the lease expires, or failed if it was the last one.
   - Do not run pre-Phase-D gateways against the same database. Their startup recovery fails every active mission.
   - Model calls outside the agent loop are not counted against `max_tokens`: history compaction/summarization, memory flush, LLM-type hooks, `read_document`'s internal call, and post-run consolidation. One call can also overshoot the remaining budget.
@@ -118,14 +118,22 @@ Precedence: `blocked` wins over `failed` when a criterion could not be evaluated
   - the command;
   - the contract digest.
 
-## Boundaries in v1
+## Boundaries (Phase E)
 
-- The v1 executor runs verifiers on the host with a scrubbed environment: only `PATH` plus `HOME`, `TMPDIR`, `GOCACHE` and `GOPATH` pointing into a per-mission scratch directory outside the workspace; `GOPROXY=off`, `GOTOOLCHAIN=local`. The scratch directory is deleted after verification.
-- Commands run in their own process group, killed on timeout.
-- Agent file tools are confined to the mission workspace only: tool-level, tenant and team allowed paths are ignored for mission runs, and a mission run cannot be a team or delegation run.
-- Creating a mission requires the **master scope** (system owner or master tenant), like shell access, because verifier commands run on the host.
-- With missions enabled the gateway sets `PR_SET_DUMPABLE=0`, so processes running as the same non-root user cannot read its `/proc/<pid>/environ` (secrets). Running the gateway as root defeats this and is logged as a warning.
-- Phase E adds the Docker executor (network off, read-only root) and makes it mandatory for untrusted repositories. Until then the API labels the executor `host`.
+`GOCLAW_MISSIONS_EXECUTOR` selects where code runs:
+
+| | `docker` (default) | `host` (explicit opt-in) |
+|---|---|---|
+| Verifier commands | One throwaway container per check: `--network none`, read-only root, `--cap-drop ALL`, `no-new-privileges`, memory/CPU/pids limits, the gateway's uid (or `GOCLAW_MISSIONS_SANDBOX_USER`), only the check's own copy (`/workspace`) and scratch (`/scratch`) mounted, `--pull never`; removed on timeout | Host process group with a scrubbed environment |
+| Agent `exec` and file tools | One container per attempt (same restrictions, attempt workspace mounted read-write, `/tmp` allows running built binaries). `exec` never falls back to the host. Stored CLI credentials are never injected. The container is destroyed when the run ends, which ends every process it started; a dead worker's containers are removed by recovery (labels `goclaw.mission`, `goclaw.attempt`) | Host (confined to the workspace for file tools only) |
+| Startup | Fails closed: missions stay disabled if Docker is unreachable or `GOCLAW_MISSIONS_IMAGE` (default `golang:1.26-bookworm`, must be pulled) cannot host the sandbox (needs `sh`, `sleep`, `tee`, `cat`, GNU `realpath`; Alpine/busybox is rejected) | Logged as `security.missions_host_executor` |
+
+In both modes:
+- Every command check runs in its own copy of the frozen evidence, with its own `HOME` and build cache. Checks cannot modify the evidence or leave a poisoned cache for the next check.
+- Agent file tools are confined to the mission workspace; tool-level, tenant and team paths are ignored, and a mission run cannot be a team or delegation run.
+- Creating a mission requires the **master scope** (system owner or master tenant).
+- The gateway sets `PR_SET_DUMPABLE=0`, so processes running as the same non-root user cannot read its `/proc/<pid>/environ`. With the docker executor, the containers cannot see host processes at all (separate PID namespace).
+- If the gateway runs in a container with the Docker socket mounted, paths are mapped to host paths (`sandbox.HostPath`).
 
 ## Threat model and residual risk
 
@@ -135,7 +143,10 @@ Verifier commands **execute code the agent wrote** (a `go test` compiles the age
 2. The integrity check blocks the mission when the diff contains constructs that can take over a test binary.
 3. Hidden overlays are pinned and invisible to the agent. `.git`, ignore files and git drivers cannot hide or forge the diff.
 
-**Still possible**, and therefore not claimed as prevented: code that discovers hidden test names at runtime and prints forged `--- PASS` lines, or that tampers with the host through `exec` (the host executor is not a security boundary). A `succeeded` mission means "the pinned checks passed and nothing suspicious was found in the diff", not a proof against a determined adversary. The mitigations are the Phase E sandbox and human review of the diff, which the evidence view is built for.
+**Still possible**, and therefore not claimed as prevented:
+- code that discovers hidden test names at runtime (the overlay is present in the check's copy) and prints forged `--- PASS` lines;
+- with the **host** executor, tampering with the host through `exec`. The host executor is not a security boundary; the docker executor is the default for that reason.
+- Container isolation relies on Docker and the kernel; a container escape is out of scope. A `succeeded` mission means "the pinned checks passed and nothing suspicious was found in the diff", not a proof against a determined adversary. The mitigations are the Phase E sandbox and human review of the diff, which the evidence view is built for.
 
 ## Surfaces
 

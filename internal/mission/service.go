@@ -37,6 +37,8 @@ const ActorSystem = "system:mission"
 
 // RunInput is what the service asks the agent runtime to execute.
 type RunInput struct {
+	MissionID     uuid.UUID
+	Attempt       int
 	TenantID      uuid.UUID
 	AgentKey      string
 	SessionKey    string
@@ -85,6 +87,9 @@ type Config struct {
 	LeaseTTL time.Duration
 	// Now is the clock used for leases (tests).
 	Now func() time.Time
+	// OnAttemptLost, if set, is called when recovery takes over an attempt
+	// whose worker died, to clean up what it left running (containers).
+	OnAttemptLost func(ctx context.Context, missionID uuid.UUID, attempt int)
 }
 
 // Service creates, executes, cancels and recovers missions. Several

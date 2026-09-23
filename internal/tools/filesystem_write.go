@@ -166,7 +166,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 
 	// Sandbox routing (sandboxKey from ctx — thread-safe)
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
-	if t.sandboxMgr != nil && sandboxKey != "" {
+	if sandboxManagerFor(ctx, t.sandboxMgr) != nil && sandboxKey != "" {
 		return t.executeInSandbox(ctx, path, content, sandboxKey, deliver, appendMode)
 	}
 

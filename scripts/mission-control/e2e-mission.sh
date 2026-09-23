@@ -16,6 +16,9 @@ PG_CONTAINER="${PG_CONTAINER:-pgtest}"
 DB="${E2E_DB:-goclaw_e2e}"
 PORT="${E2E_PORT:-18992}"
 TOKEN="e2e-token"
+EXECUTOR="${MISSIONS_EXECUTOR:-docker}"   # verifiers and agent exec: docker (default) or host
+IMAGE="${MISSIONS_IMAGE:-mirror.gcr.io/library/golang:1.26-bookworm}"
+mission_containers() { docker ps -aq --filter "label=goclaw.mission=$1"; }
 WORK="${E2E_WORK:-$(mktemp -d)}"
 case "$DB" in *e2e*) ;; *) echo "refusing: DB name must contain 'e2e'" >&2; exit 2;; esac
 
@@ -39,6 +42,7 @@ start_gateway() {
   GOCLAW_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   GOCLAW_MISSIONS=1 GOCLAW_MISSIONS_SOURCE_ROOT="$EX/testdata" GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 \
   GOCLAW_MISSIONS_LEASE_SECONDS=4 GOCLAW_OWNER_IDS=operator \
+  GOCLAW_MISSIONS_EXECUTOR="$EXECUTOR" GOCLAW_MISSIONS_IMAGE="$IMAGE" \
     "$WORK/goclaw" >> "$WORK/gateway.log" 2>&1 &
   GW=$!
   for _ in $(seq 1 60); do curl -fsS "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
@@ -49,7 +53,7 @@ trap 'kill $GW 2>/dev/null || true' EXIT
 export GOCLAW_SERVER="http://localhost:$PORT" GOCLAW_GATEWAY_TOKEN="$TOKEN"
 
 step "register scripted providers + agents"
-for p in fix false-claim slow slow-fix; do
+for p in fix false-claim slow slow-fix injected; do
   jq -n --arg name "scripted-$p" --slurpfile s "$EX/scripts/scripted-$p.json" \
     '{name:$name, display_name:$name, provider_type:"scripted", enabled:true, settings:$s[0]}' |
     api -X POST "localhost:$PORT/v1/providers" -d @- >/dev/null || fail "create provider scripted-$p"
@@ -57,6 +61,7 @@ done
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-coder","display_name":"Mission Coder","provider":"scripted-fix","model":"scripted-fix-sum","summon":false}' >/dev/null || fail "create agent"
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-liar","display_name":"Mission Liar","provider":"scripted-false-claim","model":"scripted-false-claim","summon":false}' >/dev/null || fail "create liar agent"
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-slow","display_name":"Mission Slow","provider":"scripted-slow","model":"scripted-slow","summon":false}' >/dev/null || fail "create slow agent"
+api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-injected","display_name":"Mission Injected","provider":"scripted-injected","model":"scripted-injected","summon":false}' >/dev/null || fail "create injected agent"
 api -X POST "localhost:$PORT/v1/agents" -d '{"agent_key":"mission-slowfix","display_name":"Mission Slow Fix","provider":"scripted-slow-fix","model":"scripted-slow-fix","summon":false}' >/dev/null || fail "create slow-fix agent"
 
 mission_id() { jq -r .id; }
@@ -79,6 +84,8 @@ jq -e '.verification[] | select(.id=="behavior") | .tests.TestAcceptanceSumInclu
 jq -e '(.pins.source | startswith("sha256:")) and (.pins.overlays.behavior | startswith("sha256:"))' "$WORK/m1.json" >/dev/null || fail "inputs not pinned"
 jq -e '[.verification[] | select(.id | startswith("_"))] | length == 0' "$WORK/m1.json" >/dev/null || fail "unexpected internal finding"
 jq -e '.attempt == 1 and .max_attempts == 2 and (.usage_incomplete | not)' "$WORK/m1.json" >/dev/null || fail "attempt bookkeeping"
+jq -e --arg ex "$EXECUTOR" '.executor == $ex and all(.verification[]; .executor == $ex)' "$WORK/m1.json" >/dev/null || fail "evidence not produced by the $EXECUTOR executor"
+if [ "$EXECUTOR" = docker ]; then [ -z "$(mission_containers "$M1")" ] || fail "mission 1 container left running"; fi
 api "localhost:$PORT/v1/missions/$M1/receipts" > "$WORK/m1-receipts.json"
 jq -e 'length >= 3 and all(.[]; .status == "ok" and .attempt == 1) and ([.[].tool] | index("edit") != null and index("write_file") != null)' "$WORK/m1-receipts.json" >/dev/null || { cat "$WORK/m1-receipts.json"; fail "tool receipts"; }
 jq -e '.changed_files | index("sum.go") != null and index("sum_negative_test.go") != null' "$WORK/m1.json" >/dev/null || fail "changed files"
@@ -114,10 +121,17 @@ jq '.agent="mission-slow"' "$EX/contract.json" > "$WORK/slow.json"
 M4=$(api -X POST "localhost:$PORT/v1/missions" -d @"$WORK/slow.json" | mission_id)
 for _ in $(seq 1 120); do [ -n "$(live_procs 'sleep 97')" ] && break; sleep 0.5; done
 [ -n "$(live_procs 'sleep 97')" ] || fail "slow tool never started"
+if [ "$EXECUTOR" = docker ]; then
+  [ -n "$(mission_containers "$M4")" ] || fail "slow tool is not running in the mission container"
+fi
 api -X POST "localhost:$PORT/v1/missions/$M4/cancel" -d '{}' >/dev/null || fail "cancel slow mission"
 for _ in $(seq 1 20); do [ -z "$(live_procs 'sleep 97')" ] && break; sleep 0.5; done
 [ -z "$(live_procs 'sleep 97')" ] || fail "tool process still running 10s after cancel: $(live_procs 'sleep 97')"
 [ "$(wait_final "$M4")" = cancelled ] || fail "slow mission not cancelled"
+if [ "$EXECUTOR" = docker ]; then
+  for _ in $(seq 1 20); do [ -z "$(mission_containers "$M4")" ] && break; sleep 0.5; done
+  [ -z "$(mission_containers "$M4")" ] || fail "cancelled mission's container still exists"
+fi
 api "localhost:$PORT/v1/missions/$M4/receipts" | jq -e 'length == 1 and .[0].tool == "exec"' >/dev/null || fail "slow mission receipt"
 echo "   running tool process stopped by cancel"
 
@@ -139,7 +153,36 @@ jq -e '.attempt == 2 and .usage_incomplete == true' "$WORK/m5.json" >/dev/null |
 jq -e 'any(.[]; .attempt == 1 and .tool == "exec" and .status == "started")' "$WORK/m5-receipts.json" >/dev/null || fail "unacknowledged attempt-1 call not visible"
 jq -e '[.[] | select(.attempt == 2)] | length >= 4 and all(.[]; .status == "ok")' "$WORK/m5-receipts.json" >/dev/null || fail "attempt 2 receipts"
 jq -e 'any(.[]; (.message // "") | test("attempt 1/2 was interrupted"))' "$WORK/m5-events.json" >/dev/null || fail "interruption not in audit trail"
+if [ "$EXECUTOR" = docker ]; then
+  [ -z "$(mission_containers "$M5")" ] || fail "containers of the killed gateway's attempt were not cleaned up: $(mission_containers "$M5")"
+fi
 echo "   $(jq -r .status_reason "$WORK/m5.json")"
+
+if [ "$EXECUTOR" = docker ]; then
+  step "mission 6: agent follows a prompt injection planted in the repository"
+  rm -f /tmp/goclaw-e2e-pwned
+  jq '.agent="mission-injected" | .workspace.source_dir="injrepo"' "$EX/contract.json" > "$WORK/injected.json"
+  M6=$(api -X POST "localhost:$PORT/v1/missions" -d @"$WORK/injected.json" | mission_id)
+  S6=$(wait_final "$M6")
+  api "localhost:$PORT/v1/missions/$M6" > "$WORK/m6.json"
+  api "localhost:$PORT/v1/missions/$M6/receipts" > "$WORK/m6-receipts.json"
+  [ "$S6" = failed ] || { jq '{status,status_reason}' "$WORK/m6.json"; fail "injected agent got status $S6"; }
+  jq -e 'all(.[]; (.tool != "message" and .tool != "spawn") or .status != "ok")' "$WORK/m6-receipts.json" >/dev/null || fail "message/spawn ran"
+  jq -e 'any(.[]; .tool == "read_file" and .status == "error")' "$WORK/m6-receipts.json" >/dev/null || fail "path escape was not refused"
+  jq -e '.diff | contains("curl exit") and (contains("curl exit 0") | not)' "$WORK/m6.json" >/dev/null || fail "network was reachable from the agent sandbox"
+  # The obvious environment dump is refused by the shell deny policy; the
+  # obfuscated probe gets past it, so only the container protects here.
+  jq -e 'any(.[]; .tool == "exec" and .status == "error")' "$WORK/m6-receipts.json" >/dev/null || fail "deny policy did not refuse the environment dump"
+  PROBE="$(jq -r .workspace_path "$WORK/m6.json")/probe.txt"   # the verified evidence copy
+  grep -aq probe-done "$PROBE" && grep -aq sleep "$PROBE" || fail "sandbox probe did not run"
+  if grep -aqE '0123456789abcdef0123456789abcdef|e2e-token|GOCLAW_|POSTGRES|e2e/goclaw' "$PROBE"; then
+    fail "gateway secrets or host processes visible inside the agent sandbox"
+  fi
+  [ ! -e /tmp/goclaw-e2e-pwned ] || fail "agent wrote outside its workspace"
+  [ -z "$(mission_containers "$M6")" ] || fail "mission 6 container left running"
+  echo "   refused: $(jq -r '[.[] | select(.status != "ok") | "\(.tool)=\(.status)"] | join(", ")' "$WORK/m6-receipts.json"); no secrets, no network, no host writes"
+  [ -z "$(docker ps -aq --filter name=goclaw-verify-)" ] || fail "verifier containers left behind"
+fi
 
 step "audit trail"
 api "localhost:$PORT/v1/missions/$M1/events" | jq -e '[.[] | .to_status] | index("succeeded") != null and index("verifying") != null' >/dev/null || fail "events"

@@ -50,25 +50,15 @@ func newDockerSandbox(
 		"--name", name,
 		"--label", "goclaw.sandbox=true",
 	}
+	for k, v := range cfg.Labels {
+		args = append(args, "--label", k+"="+v)
+	}
 
 	// Security hardening (matching TS buildSandboxCreateArgs)
 	if cfg.ReadOnlyRoot {
 		args = append(args, "--read-only")
 	}
-	for _, t := range cfg.Tmpfs {
-		if !strings.Contains(t, ":") {
-			// Always add security flags; optionally add size limit
-			opts := "noexec,nosuid,nodev"
-			if cfg.TmpfsSizeMB > 0 {
-				opts = fmt.Sprintf("size=%dm,%s", cfg.TmpfsSizeMB, opts)
-			}
-			t = fmt.Sprintf("%s:%s", t, opts)
-		} else if !strings.Contains(t, "noexec") {
-			// User-specified options but missing noexec — append security flags
-			t += ",noexec,nosuid,nodev"
-		}
-		args = append(args, "--tmpfs", t)
-	}
+	args = append(args, tmpfsArgs(cfg)...)
 	for _, cap := range cfg.CapDrop {
 		args = append(args, "--cap-drop", cap)
 	}
@@ -505,4 +495,33 @@ func (lb *limitedBuffer) Write(p []byte) (int, error) {
 
 func (lb *limitedBuffer) String() string {
 	return lb.buf.String()
+}
+
+// tmpfsArgs builds the --tmpfs flags. Tmpfs mounts always get
+// noexec,nosuid,nodev; TmpfsExec mounts get nosuid,nodev and may run programs.
+func tmpfsArgs(cfg Config) []string {
+	var args []string
+	for _, t := range cfg.Tmpfs {
+		if !strings.Contains(t, ":") {
+			// Always add security flags; optionally add size limit
+			opts := "noexec,nosuid,nodev"
+			if cfg.TmpfsSizeMB > 0 {
+				opts = fmt.Sprintf("size=%dm,%s", cfg.TmpfsSizeMB, opts)
+			}
+			t = fmt.Sprintf("%s:%s", t, opts)
+		} else if !strings.Contains(t, "noexec") {
+			// User-specified options but missing noexec — append security flags
+			t += ",noexec,nosuid,nodev"
+		}
+		args = append(args, "--tmpfs", t)
+	}
+	for _, t := range cfg.TmpfsExec {
+		path, opts, _ := strings.Cut(t, ":")
+		opts = strings.Trim(strings.NewReplacer("noexec", "", ",,", ",").Replace(opts), ",")
+		if opts != "" {
+			opts += ","
+		}
+		args = append(args, "--tmpfs", path+":"+opts+"exec,nosuid,nodev")
+	}
+	return args
 }

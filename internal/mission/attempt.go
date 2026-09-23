@@ -224,6 +224,8 @@ func (a *attempt) run(ctx, bctx context.Context, m *store.Mission, c *Contract) 
 
 	runCtx, cancelRun := context.WithTimeout(ctx, time.Duration(c.Limits.TimeoutSeconds)*time.Second)
 	out, runErr := s.runner.RunMission(runCtx, RunInput{
+		MissionID:     id,
+		Attempt:       m.Attempt,
 		TenantID:      m.TenantID,
 		AgentKey:      c.Agent,
 		SessionKey:    fmt.Sprintf("agent:%s:mission:%s:a%d", c.Agent, id, m.Attempt),

@@ -45,6 +45,11 @@ func (s *Service) Recover(ctx context.Context) (RecoveryReport, error) {
 			continue
 		}
 		fence := store.MissionFence{Owner: m.LeaseOwner, Attempt: m.Attempt}
+		cleanup := func() {
+			if s.cfg.OnAttemptLost != nil {
+				s.cfg.OnAttemptLost(tctx, m.ID, m.Attempt)
+			}
+		}
 		// Usage of an attempt that died before verifying was never recorded.
 		incomplete := m.UsageIncomplete || m.Status != StatusVerifying
 		lost := fmt.Sprintf("attempt %d/%d was interrupted while %s (worker %s stopped renewing its lease)",
@@ -57,6 +62,7 @@ func (s *Service) Recover(ctx context.Context) (RecoveryReport, error) {
 				continue // lease still live, someone else recovered it, or it moved on
 			}
 			rep.Retried++
+			cleanup()
 			s.resume(tctx, upd)
 			continue
 		}
@@ -65,6 +71,7 @@ func (s *Service) Recover(ctx context.Context) (RecoveryReport, error) {
 		if _, err := s.store.TransitionMission(tctx, m.ID, []string{m.Status}, StatusFailed, ActorSystem, reason,
 			store.MissionUpdate{Fence: &fence, ClearLease: true, RequireLeaseExpired: true, UsageIncomplete: &incomplete, StatusReason: &reason, FinishedAt: &finished}); err == nil {
 			rep.Failed++
+			cleanup()
 		}
 	}
 	return rep, nil

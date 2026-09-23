@@ -264,6 +264,9 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 		ctx = tools.WithToolWorkspace(ctx, filepath.Clean(req.MissionWorkspace))
 		ctx = tools.WithWorkspaceConfined(ctx)
 		ctx = tools.WithCallGuard(ctx, req.ToolGuard)
+		if req.SandboxManager != nil {
+			ctx = tools.WithRequiredSandbox(ctx, req.SandboxManager, req.SandboxConfig)
+		}
 	}
 
 	// Team workspace: dispatched task overrides default workspace.

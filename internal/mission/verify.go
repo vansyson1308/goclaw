@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -82,11 +83,17 @@ type Executor interface {
 }
 
 // HostExecutor runs commands directly on the gateway host.
-type HostExecutor struct{}
+type HostExecutor struct {
+	// GoCache, if set, is used as GOCACHE for every check instead of a
+	// fresh per-check cache. It gives up the isolation between checks (a
+	// check could leave cache entries for the next one) in exchange for
+	// speed, so it is meant for this package's own tests.
+	GoCache string
+}
 
 func (HostExecutor) Name() string { return "host" }
 
-func (HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
+func (e HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
 	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 	for _, d := range []string{"home", "tmp", "gocache", "gopath"} {
@@ -98,7 +105,7 @@ func (HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + filepath.Join(req.Scratch, "home"),
 		"TMPDIR=" + filepath.Join(req.Scratch, "tmp"),
-		"GOCACHE=" + filepath.Join(req.Scratch, "gocache"),
+		"GOCACHE=" + e.goCache(req.Scratch),
 		"GOPATH=" + filepath.Join(req.Scratch, "gopath"),
 		"GOPROXY=off",
 		"GOFLAGS=-mod=mod",
@@ -135,6 +142,13 @@ func (HostExecutor) Run(ctx context.Context, req ExecRequest) ExecResult {
 		res.ExitCode, res.Err = -1, waitErr
 	}
 	return res
+}
+
+func (e HostExecutor) goCache(scratch string) string {
+	if e.GoCache != "" {
+		return e.GoCache
+	}
+	return filepath.Join(scratch, "gocache")
 }
 
 // VerifyEnv is where and how criteria are evaluated.
@@ -248,43 +262,56 @@ func applyBaseline(r *CriterionResult, baseline map[string]CriterionResult) {
 // never reach the agent's workspace and checks cannot change the diff.
 func runCommand(ctx context.Context, cr Criterion, env VerifyEnv, digest string, baseline bool) CriterionResult {
 	r := CriterionResult{ID: cr.ID, Kind: cr.Kind, Description: cr.Description, Command: cr.Command, Executor: env.Exec.Name(), ContractDigest: digest}
-	dir := env.Workspace
 	overlay := env.Overlays[cr.ID]
 	if cr.OverlayDir != "" && overlay == "" {
 		r.Status, r.Detail = ResultError, "overlay directory not resolved"
 		return r
 	}
-	if overlay != "" || baseline {
-		tag := "final"
-		if baseline {
-			tag = "baseline"
-		}
-		tmp := filepath.Join(env.Scratch, "checks", tag+"-"+cr.ID)
-		_ = os.RemoveAll(tmp)
-		defer os.RemoveAll(tmp)
-		if _, err := copyTree(env.Workspace, tmp); err != nil {
-			r.Status, r.Detail = ResultError, "copy workspace for check: "+err.Error()
+	// Every command runs in its own throwaway copy with its own scratch
+	// (HOME, build cache): checks cannot modify the evidence, hidden files
+	// never reach the agent's workspace, and one check cannot leave a
+	// poisoned build cache or file behind for the next one.
+	tag := "final"
+	if baseline {
+		tag = "baseline"
+	}
+	checksRoot := filepath.Join(env.Scratch, "checks")
+	if err := os.MkdirAll(checksRoot, 0o700); err != nil {
+		r.Status, r.Detail = ResultError, "create check directory: "+err.Error()
+		return r
+	}
+	_ = os.Chmod(checksRoot, 0o700) // private on the host; mounts below are opened up
+	base := filepath.Join(checksRoot, tag+"-"+cr.ID)
+	_ = os.RemoveAll(base)
+	defer os.RemoveAll(base)
+	dir, scratch := filepath.Join(base, "workspace"), filepath.Join(base, "scratch")
+	if _, err := copyTree(env.Workspace, dir); err != nil {
+		r.Status, r.Detail = ResultError, "copy workspace for check: "+err.Error()
+		return r
+	}
+	if overlay != "" {
+		digest, _, err := copyTreeDigest(overlay, dir)
+		if err != nil {
+			r.Status, r.Detail = ResultError, "apply hidden acceptance files: "+err.Error()
 			return r
 		}
-		if overlay != "" {
-			digest, _, err := copyTreeDigest(overlay, tmp)
-			if err != nil {
-				r.Status, r.Detail = ResultError, "apply hidden acceptance files: "+err.Error()
-				return r
-			}
-			if pin := env.OverlayPins[cr.ID]; pin == "" || pin != digest {
-				r.Status, r.Detail = ResultError, "hidden acceptance files changed since the mission was created (or were never pinned)"
-				return r
-			}
+		if pin := env.OverlayPins[cr.ID]; pin == "" || pin != digest {
+			r.Status, r.Detail = ResultError, "hidden acceptance files changed since the mission was created (or were never pinned)"
+			return r
 		}
-		dir = tmp
 	}
+	if err := os.MkdirAll(scratch, 0o777); err != nil {
+		r.Status, r.Detail = ResultError, "create check scratch: "+err.Error()
+		return r
+	}
+	// A container executor may run as another uid than the gateway.
+	openUp(base)
 	argv := cr.Command
 	if len(cr.ExpectTests) > 0 {
 		// go test -json: per-test results instead of trusting the exit code.
 		argv = append([]string{argv[0], argv[1], "-json"}, argv[2:]...)
 	}
-	res := env.Exec.Run(ctx, ExecRequest{Dir: dir, Argv: argv, Timeout: time.Duration(cr.TimeoutSeconds) * time.Second, Scratch: env.Scratch, Capture: len(cr.ExpectTests) > 0})
+	res := env.Exec.Run(ctx, ExecRequest{Dir: dir, Argv: argv, Timeout: time.Duration(cr.TimeoutSeconds) * time.Second, Scratch: scratch, Capture: len(cr.ExpectTests) > 0})
 	r.OutputTail = cleanText(tools.ScrubCredentials(string(res.Output)))
 	switch {
 	case res.Err != nil:
@@ -368,6 +395,23 @@ func parseGoTestJSON(out []byte) map[string]string {
 		}
 	}
 	return seen
+}
+
+// openUp makes a throwaway check tree readable and writable by any uid.
+// Its parent (checks/) is 0700, so other host users still cannot reach it.
+func openUp(root string) {
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.Type()&fs.ModeSymlink == 0 {
+			mode := os.FileMode(0o666)
+			if d.IsDir() {
+				mode = 0o777
+			} else if info, ierr := d.Info(); ierr == nil && info.Mode()&0o111 != 0 {
+				mode = 0o777
+			}
+			_ = os.Chmod(p, mode)
+		}
+		return nil
+	})
 }
 
 // readInside reads rel under root, refusing paths that resolve outside it

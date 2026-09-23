@@ -258,3 +258,55 @@ The review found 2 high, 4 medium and 8 low issues. Fixed issues have a test; ea
 - `-race`: sqlitestore, mission, agent and providers pass (tools has the known zombie failures).
 - Invariants pass. Integration passes in full, including the timing-sensitive MemoryBomb test this time.
 - Web: lint 0 errors, build OK, vitest 363/363.
+
+## §E Enforced boundaries (2026-09-23)
+
+### What was built
+- **Default executor `docker`; fails closed.** There is no host fallback: missions are disabled if Docker or the image is unusable. The image must be pulled first, and a startup probe rejects images that cannot host the sandbox (Alpine/busybox lacks GNU `realpath`).
+- **Verifier checks:** each runs in its own `--rm` container with:
+  - `--network none`, read-only root, `--cap-drop ALL`, `no-new-privileges`;
+  - pids/memory/CPU limits;
+  - only its own copy and scratch mounted.
+
+  The container is removed on timeout.
+- **Agent `exec` and file tools:** one container per attempt with the same restrictions, destroyed when the run ends. `exec` never falls back to the host, and CLI credentials are never injected. Containers of a dead worker are found by label and removed by recovery.
+- **Isolated checks:** every check runs in its own copy with its own cache, so evidence cannot be modified and a poisoned build cache cannot be shared.
+- **Tenant isolation:** tested at the HTTP layer on PostgreSQL.
+
+### Gate E checks
+
+**Unit and integration tests**
+- `TestDockerExecutorBoundaries` covers:
+  - only `lo` inside the container. A bridged container here has eth0 and a default route, so this check is not vacuous even though egress is filtered;
+  - a secret in the host environment is not visible, and host processes are not visible;
+  - the root filesystem is read-only;
+  - a timeout removes the container, leaving no `goclaw-verify-*` behind;
+  - a missing binary is an error;
+  - only `/workspace` and `/scratch` are writable.
+- `TestMissionWithDockerExecutor`: the honest fix reaches `succeeded` with per-test evidence; the false claim is not accepted.
+- `TestCheckSandboxImage`: the Debian image is accepted; Alpine is rejected ("realpath"); a missing image is rejected.
+- `TestRequiredSandbox*`: `exec` and file tools of a mission use the mission container even when the tool was built host-only, and `exec` never runs on the host (disabled or missing manager → refused).
+- `TestTmpfsArgs`: default tmpfs keeps `noexec`; only opt-in `TmpfsExec` mounts allow running binaries.
+- `TestMissionsHTTPTenantIsolation` (PG): another tenant gets 404 on get/events/receipts, cannot see the mission in its list, and gets 404 on cancel without changing anything.
+
+**E2E with `MISSIONS_EXECUTOR=docker`, image `golang:1.26-bookworm`:** all of §C/§D plus:
+- every criterion carries `executor=docker`;
+- the running `sleep` is inside the attempt's container, and after cancel the container is gone;
+- after `kill -9` of the gateway, recovery removed attempt 1's orphaned container and attempt 2 succeeded;
+- **mission 6 (prompt injection in `CONTRIBUTING.md`)**, where the scripted agent follows the injection:
+  - `message` and `spawn` were denied by the guard;
+  - `../../etc/passwd` and a write to `/tmp/...` were clamped to `/workspace` and failed;
+  - `curl` has no network;
+  - the obvious `env`/`/proc/*/environ` dump was refused by the shell deny policy;
+  - an obfuscated probe (`"env""iron"`) that **does** get past the deny list ran inside the container and saw only the container's own `sleep infinity`, with no `GOCLAW_*`, token or gateway process;
+  - the verdict is `failed`, and no mission container remains.
+- **Non-vacuity of the probe:** the same probe run on the host found a planted secret (2 hits). The container is what stops it, not the probe's design.
+
+### Other gates for Phase E
+- vet and the Lite build are clean.
+- Unit tests: only the known environment failures (tokencount, zombie reaping).
+- Integration: everything passes except the inherited timing test `TestHooksB2_MemoryBombBoundedByTimeout`, which failed this time (2.87s > 2.5s), as described in §A.
+- **Test runtime caught a real cost.**
+  - With a fresh build cache per check, the mission package exceeded Go's 10-minute test timeout.
+  - Production keeps the per-check isolation. The package's own tests now share one cache through the explicit `HostExecutor.GoCache` option, and the package runs in about 135s.
+  - The container tests and the E2E still use isolated caches.

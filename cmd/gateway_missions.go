@@ -5,15 +5,20 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	"github.com/nextlevelbuilder/goclaw/internal/mission"
 	"github.com/nextlevelbuilder/goclaw/internal/pipeline"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -25,7 +30,12 @@ const (
 	envMissionsSourceRoot = "GOCLAW_MISSIONS_SOURCE_ROOT"   // default <data>/mission-sources
 	envMissionsLease      = "GOCLAW_MISSIONS_LEASE_SECONDS" // default 60; a dead worker's attempt is retried after this
 	envMissionsMax        = "GOCLAW_MISSIONS_MAX_CONCURRENT"
+	envMissionsExecutor   = "GOCLAW_MISSIONS_EXECUTOR" // "docker" (default) or "host"
+	envMissionsImage      = "GOCLAW_MISSIONS_IMAGE"    // image for verifiers and the agent's exec; must be pulled
+	envMissionsUser       = "GOCLAW_MISSIONS_SANDBOX_USER"
 )
+
+const defaultMissionImage = "golang:1.26-bookworm"
 
 // minLeaseSeconds bounds GOCLAW_MISSIONS_LEASE_SECONDS from below.
 const minLeaseSeconds = 3
@@ -78,15 +88,120 @@ func (d *gatewayDeps) buildMissionService(sched *scheduler.Scheduler) (*mission.
 		leaseSec = minLeaseSeconds
 	}
 	runner := &schedulerMissionRunner{sched: sched, tenants: d.pgStores.Tenants}
-	svc, err := mission.NewService(mission.Config{SourceRoot: sourceRoot, DataRoot: dataRoot, MaxConcurrent: maxConc,
-		LeaseTTL: time.Duration(leaseSec) * time.Second},
-		d.pgStores.Missions, runner, mission.HostExecutor{})
+	executor, err := missionExecutor(runner)
+	if err != nil {
+		return nil, err
+	}
+	mcfg := mission.Config{SourceRoot: sourceRoot, DataRoot: dataRoot, MaxConcurrent: maxConc,
+		LeaseTTL: time.Duration(leaseSec) * time.Second}
+	if runner.sandbox != nil {
+		mcfg.OnAttemptLost = removeAttemptContainers
+	}
+	svc, err := mission.NewService(mcfg,
+		d.pgStores.Missions, runner, executor)
 	if err != nil {
 		return nil, err
 	}
 	hardenProcessForMissions()
-	slog.Warn("missions enabled (verifiers run on the host executor)", "source_root", sourceRoot, "data_root", dataRoot)
+	if executor.Name() == "host" {
+		slog.Warn("security.missions_host_executor",
+			"detail", "verifier commands and the agent's exec run on the gateway host; use the docker executor for anything untrusted",
+			"source_root", sourceRoot, "data_root", dataRoot)
+	} else {
+		slog.Info("missions enabled (verifiers and agent exec run in containers)", "image", runner.sandboxCfg.Image,
+			"source_root", sourceRoot, "data_root", dataRoot)
+	}
 	return svc, nil
+}
+
+// missionExecutor selects where verifier commands and the agent's exec run.
+// "docker" (default) fails closed: missions stay disabled if Docker or the
+// image is unavailable, rather than silently running on the host.
+func missionExecutor(runner *schedulerMissionRunner) (mission.Executor, error) {
+	switch mode := os.Getenv(envMissionsExecutor); mode {
+	case "host":
+		return mission.HostExecutor{}, nil
+	case "", "docker":
+	default:
+		return nil, fmt.Errorf("%s must be docker or host, got %q", envMissionsExecutor, mode)
+	}
+	image := os.Getenv(envMissionsImage)
+	if image == "" {
+		image = defaultMissionImage
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := sandbox.CheckDockerAvailable(ctx); err != nil {
+		return nil, fmt.Errorf("docker executor: %w (set %s=host to run missions on the host)", err, envMissionsExecutor)
+	}
+	if err := mission.CheckSandboxImage(ctx, image); err != nil {
+		return nil, err
+	}
+	user := os.Getenv(envMissionsUser)
+	if user == "" {
+		user = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	}
+	cfg := missionSandboxConfig(image, user)
+	runner.sandboxCfg = &cfg
+	runner.sandbox = sandbox.NewDockerManager(cfg)
+	return mission.DockerExecutor{Image: image, User: user, HostPath: sandbox.HostPath}, nil
+}
+
+// attemptSandboxConfig labels the attempt's container so it can be found
+// and removed if this process dies before releasing it.
+func (r *schedulerMissionRunner) attemptSandboxConfig(in mission.RunInput) *sandbox.Config {
+	if r.sandboxCfg == nil {
+		return nil
+	}
+	cfg := *r.sandboxCfg
+	cfg.Labels = map[string]string{"goclaw.mission": in.MissionID.String(), "goclaw.attempt": strconv.Itoa(in.Attempt)}
+	return &cfg
+}
+
+// removeAttemptContainers removes containers a dead worker left behind for
+// a mission attempt (their processes would otherwise keep running).
+func removeAttemptContainers(ctx context.Context, missionID uuid.UUID, attempt int) {
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(cctx, "docker", "ps", "-aq",
+		"--filter", "label=goclaw.mission="+missionID.String(),
+		"--filter", "label=goclaw.attempt="+strconv.Itoa(attempt)).Output()
+	if err != nil {
+		slog.Warn("mission container lookup failed", "mission", missionID, "attempt", attempt, "error", err)
+		return
+	}
+	for _, id := range strings.Fields(string(out)) {
+		if err := exec.CommandContext(cctx, "docker", "rm", "-f", id).Run(); err != nil {
+			slog.Warn("mission container removal failed", "mission", missionID, "container", id, "error", err)
+		} else {
+			slog.Info("removed container of a lost mission attempt", "mission", missionID, "attempt", attempt, "container", id)
+		}
+	}
+}
+
+// missionSandboxConfig is the container a mission attempt's tools run in:
+// no network, read-only root, no capabilities, only the attempt workspace
+// mounted; /tmp allows running built binaries (go test).
+func missionSandboxConfig(image, user string) sandbox.Config {
+	cfg := sandbox.DefaultConfig()
+	cfg.Mode = sandbox.ModeAll
+	cfg.Image = image
+	cfg.User = user
+	cfg.Scope = sandbox.ScopeSession
+	cfg.WorkspaceAccess = sandbox.AccessRW
+	cfg.NetworkEnabled = false
+	cfg.ReadOnlyRoot = true
+	cfg.CapDrop = []string{"ALL"}
+	cfg.Tmpfs = []string{"/var/tmp", "/run"}
+	cfg.TmpfsExec = []string{"/tmp:size=1024m"}
+	cfg.MemoryMB, cfg.CPUs, cfg.PidsLimit = 2048, 2, 512
+	cfg.TimeoutSec = 600
+	cfg.ContainerPrefix = "goclaw-mission-"
+	cfg.Env = map[string]string{
+		"HOME": "/tmp/home", "TMPDIR": "/tmp", "GOCACHE": "/tmp/gocache", "GOPATH": "/tmp/gopath",
+		"GOFLAGS": "-mod=mod", "GOPROXY": "off", "GOTOOLCHAIN": "local", "LANG": "C.UTF-8",
+	}
+	return cfg
 }
 
 // schedulerMissionRunner runs a mission's agent turn through the scheduler,
@@ -94,10 +209,24 @@ func (d *gatewayDeps) buildMissionService(sched *scheduler.Scheduler) (*mission.
 type schedulerMissionRunner struct {
 	sched   *scheduler.Scheduler
 	tenants store.TenantStore
+	// sandbox/sandboxCfg: the container each attempt's tools run in (docker
+	// executor). nil = host executor.
+	sandbox    sandbox.Manager
+	sandboxCfg *sandbox.Config
 }
 
 func (r *schedulerMissionRunner) RunMission(ctx context.Context, in mission.RunInput) (*mission.RunOutput, error) {
 	ctx = cronTenantContext(ctx, r.tenants, in.TenantID)
+	if r.sandbox != nil {
+		// Destroying the attempt's container ends everything it started.
+		defer func() {
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			if err := r.sandbox.Release(rctx, in.SessionKey); err != nil {
+				slog.Warn("mission sandbox release failed", "run", in.RunID, "error", err)
+			}
+		}()
+	}
 	outCh := r.sched.Schedule(ctx, scheduler.LaneCron, agent.RunRequest{
 		SessionKey:       in.SessionKey,
 		Message:          in.Message,
@@ -108,6 +237,8 @@ func (r *schedulerMissionRunner) RunMission(ctx context.Context, in mission.RunI
 		RunID:            in.RunID,
 		MissionWorkspace: in.Workspace,
 		ToolGuard:        in.Guard,
+		SandboxManager:   r.sandbox,
+		SandboxConfig:    r.attemptSandboxConfig(in),
 		TokenBudget:      in.TokenBudget,
 		MaxIterations:    in.MaxIterations,
 		TraceName:        "Mission " + in.RunID,

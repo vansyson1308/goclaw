@@ -164,7 +164,7 @@ func newTestService(t *testing.T, r AgentRunner) (*Service, *memStore, context.C
 	src := filepath.Join(root, "sources")
 	seedRepo(t, src)
 	st := newMemStore()
-	svc, err := NewService(Config{SourceRoot: src, DataRoot: filepath.Join(root, "data")}, st, r, HostExecutor{})
+	svc, err := NewService(Config{SourceRoot: src, DataRoot: filepath.Join(root, "data")}, st, r, testExecutor())
 	must(t, err)
 	return svc, st, store.WithTenantID(context.Background(), uuid.New())
 }

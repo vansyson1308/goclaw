@@ -164,7 +164,7 @@ func (t *EditTool) Execute(ctx context.Context, args map[string]any) *Result {
 
 	// Sandbox routing
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
-	if t.sandboxMgr != nil && sandboxKey != "" {
+	if sandboxManagerFor(ctx, t.sandboxMgr) != nil && sandboxKey != "" {
 		return t.executeInSandbox(ctx, path, oldStr, newStr, replaceAll, sandboxKey)
 	}
 

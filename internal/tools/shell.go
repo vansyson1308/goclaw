@@ -263,7 +263,9 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]any) *Result {
 	// Credentialed exec is argv-based, not shell-based. Route it before shell
 	// deny scanning so ordinary argument text cannot be mistaken for executable
 	// shell syntax.
-	if cred, binary, cmdArgs := t.lookupCredentialedBinary(ctx, command); cred != nil {
+	// Runs with a required sandbox (missions) never receive stored CLI
+	// credentials: their effects would leave the sandbox.
+	if cred, binary, cmdArgs := t.lookupCredentialedBinary(ctx, command); cred != nil && !SandboxRequiredFromCtx(ctx) {
 		cwd := ToolWorkspaceFromCtx(ctx)
 		if cwd == "" {
 			cwd = t.workspace
@@ -458,8 +460,11 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]any) *Result {
 
 	// Sandbox routing (sandboxKey from ctx — thread-safe)
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
-	if t.sandboxMgr != nil && sandboxKey != "" {
+	if sandboxManagerFor(ctx, t.sandboxMgr) != nil && sandboxKey != "" {
 		return t.executeInSandbox(ctx, command, cwd, sandboxKey)
+	}
+	if SandboxRequiredFromCtx(ctx) {
+		return ErrorResult(sandboxRequiredError)
 	}
 
 	// Host execution
@@ -675,6 +680,9 @@ func (t *ExecTool) executeInSandbox(ctx context.Context, command, cwd, sandboxKe
 		if errors.Is(err, sandbox.ErrSandboxDisabled) {
 			if IsDelegationArtifactRun(ctx) {
 				return ErrorResult(delegatedExecSandboxRequiredError)
+			}
+			if SandboxRequiredFromCtx(ctx) {
+				return ErrorResult(sandboxRequiredError)
 			}
 			return t.executeOnHost(ctx, command, cwd)
 		}

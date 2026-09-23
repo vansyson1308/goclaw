@@ -146,3 +146,10 @@ func detectContainerID() string {
 
 	return ""
 }
+
+// HostPath maps a path on this machine to the path the Docker daemon sees.
+// They differ when the gateway itself runs in a container (Docker-out-of-
+// Docker); callers passing bind mounts to `docker run` must use it.
+func HostPath(ctx context.Context, localPath string) string {
+	return resolveHostWorkspacePath(ctx, localPath)
+}

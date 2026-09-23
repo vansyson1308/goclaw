@@ -63,11 +63,18 @@ type Config struct {
 	NetworkEnabled    bool              `json:"network_enabled"`
 	RestrictedDomains []string          `json:"restricted_domains,omitempty"`
 	Env               map[string]string `json:"env,omitempty"`
+	// Labels are added to the container (e.g. to find it again after the
+	// process that created it died).
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// Security hardening (matching TS buildSandboxCreateArgs)
-	ReadOnlyRoot    bool     `json:"read_only_root"`
-	CapDrop         []string `json:"cap_drop,omitempty"`
-	Tmpfs           []string `json:"tmpfs,omitempty"`         // e.g. "/tmp", "/tmp:size=64m"
+	ReadOnlyRoot bool     `json:"read_only_root"`
+	CapDrop      []string `json:"cap_drop,omitempty"`
+	Tmpfs        []string `json:"tmpfs,omitempty"` // e.g. "/tmp", "/tmp:size=64m"
+	// TmpfsExec are tmpfs mounts where programs may run (nosuid,nodev but no
+	// noexec), e.g. for toolchains that build and run binaries in a temp
+	// dir. Opt-in; Tmpfs entries always get noexec.
+	TmpfsExec       []string `json:"tmpfs_exec,omitempty"`
 	TmpfsSizeMB     int      `json:"tmpfs_size_mb,omitempty"` // default size for tmpfs mounts without explicit :size= (0 = Docker default)
 	PidsLimit       int      `json:"pids_limit,omitempty"`
 	User            string   `json:"user,omitempty"`             // container user (e.g. "1000:1000", "nobody")

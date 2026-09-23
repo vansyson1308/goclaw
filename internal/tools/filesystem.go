@@ -158,7 +158,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	// Sandboxed delegation inputs are addressed by their logical alias. The
 	// acquisition helper mounts only this exchange at /workspace/inputs:ro.
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
-	if t.sandboxMgr != nil && sandboxKey != "" {
+	if sandboxManagerFor(ctx, t.sandboxMgr) != nil && sandboxKey != "" {
 		return t.executeInSandbox(ctx, path, sandboxKey, args)
 	}
 

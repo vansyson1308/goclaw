@@ -687,6 +687,10 @@ type RunRequest struct {
 	// ToolGuard authorizes and records every tool call of the run. Required
 	// when MissionWorkspace is set (fail-closed).
 	ToolGuard tools.CallGuard
+	// SandboxManager/SandboxConfig, when set on a mission run, are the only
+	// place its tools may execute: exec never falls back to the host.
+	SandboxManager sandbox.Manager
+	SandboxConfig  *sandbox.Config
 	// TokenBudget caps prompt+completion tokens across the run's model
 	// calls; the run fails before the call that would start over budget.
 	// 0 = no cap.

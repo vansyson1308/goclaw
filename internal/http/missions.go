@@ -193,3 +193,10 @@ func (h *MissionsHandler) HandleGetForTest(w http.ResponseWriter, r *http.Reques
 func (h *MissionsHandler) HandleCancelForTest(w http.ResponseWriter, r *http.Request) {
 	h.handleCancel(w, r)
 }
+func (h *MissionsHandler) HandleListForTest(w http.ResponseWriter, r *http.Request) { h.handleList(w, r) }
+func (h *MissionsHandler) HandleEventsForTest(w http.ResponseWriter, r *http.Request) {
+	h.handleEvents(w, r)
+}
+func (h *MissionsHandler) HandleReceiptsForTest(w http.ResponseWriter, r *http.Request) {
+	h.handleReceipts(w, r)
+}

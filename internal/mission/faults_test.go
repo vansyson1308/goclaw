@@ -134,7 +134,7 @@ func (c *cluster) worker(name string, r AgentRunner, ttl, skew time.Duration) (*
 	svc, err := NewService(Config{
 		SourceRoot: filepath.Join(c.root, "sources"), DataRoot: filepath.Join(c.root, "data"),
 		WorkerID: name, LeaseTTL: ttl, Now: func() time.Time { return time.Now().Add(skew) },
-	}, p, r, HostExecutor{})
+	}, p, r, testExecutor())
 	must(c.t, err)
 	return svc, p
 }
@@ -186,10 +186,16 @@ func TestCrashedWorkerAttemptIsRetried(t *testing.T) {
 
 	c.shared.advance(expired) // every existing lease has now run out
 	b, _ := c.worker("worker-b", &fakeRunner{reply: "fixed", edit: honestFix}, time.Minute, 0)
+	var lost []int
+	b.cfg.OnAttemptLost = func(_ context.Context, id uuid.UUID, attempt int) {
+		if id == m.ID {
+			lost = append(lost, attempt)
+		}
+	}
 	rep, err := b.Recover(context.Background())
 	must(t, err)
-	if rep.Retried != 1 {
-		t.Fatalf("recovery report %+v", rep)
+	if rep.Retried != 1 || len(lost) != 1 || lost[0] != 1 {
+		t.Fatalf("recovery report %+v, cleanup of lost attempts %v", rep, lost)
 	}
 	b.Wait()
 	got := c.get(m.ID)
