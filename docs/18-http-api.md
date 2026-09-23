@@ -933,7 +933,7 @@ GET /v1/agents/{agentID}/evolution/suggestions
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `status` | string | Filter: `pending`, `approved`, `applied`, `rejected`, `rolled_back`. Omit for all. |
+| `status` | string | Filter: `pending`, `approved`, `applying`, `applied`, `rejected`, `rolled_back`. Omit for all. |
 | `limit` | integer | Max results (default: 50, max: 500). |
 
 **Response:**
@@ -942,27 +942,33 @@ GET /v1/agents/{agentID}/evolution/suggestions
 [
   {
     "id": "uuid",
+    "tenant_id": "uuid",
     "agent_id": "uuid",
-    "suggestion_type": "low_retrieval_usage",
-    "status": "pending",
-    "title": "Improve retrieval threshold",
-    "description": "Recent queries show low recall. Consider lowering retrieval_threshold from 0.5 to 0.4.",
-    "parameters": {
-      "current_threshold": 0.5,
-      "proposed_threshold": 0.4,
-      "confidence": 0.85
+    "suggestion_type": "tool_order",
+    "suggestion": "Consider disabling or fixing tool \"web_fetch\" — 4% success rate",
+    "rationale": "52 calls, 4.0% success, avg 812ms",
+    "parameters": {"tool": "web_fetch", "success_rate": 0.04},
+    "status": "applied",
+    "reviewed_by": "alice",
+    "reviewed_at": "2026-09-23T09:00:00Z",
+    "applied_at": "2026-09-23T09:00:00Z",
+    "applied_by": "alice",
+    "applied_change": {
+      "column": "tools_config",
+      "path": ["deny"],
+      "before": {"present": false},
+      "after": {"present": true, "value": ["web_fetch"]}
     },
-    "created_at": "2026-04-06T09:00:00Z",
-    "reviewed_by": null,
-    "reviewed_at": null
+    "state_version": 1,
+    "created_at": "2026-09-23T03:00:00Z"
   }
 ]
 ```
 
 **Suggestion Types:**
-- `low_retrieval_usage` — Retrieval recall is below threshold for recent queries.
-- `tool_failure` — High failure rate detected for a tool.
-- `repeated_tool` — Tool called repeatedly without context change; candidate for skill.
+- `threshold`: advisory. Approval marks it reviewed and changes no configuration.
+- `tool_order`: approval adds the tool to this agent's `tools_config.deny` (agent-scoped). Reversible.
+- `skill_add`: approval creates a private skill from the draft.
 
 ### Update Suggestion Status
 
@@ -975,17 +981,42 @@ PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}
 ```json
 {
   "status": "approved",
-  "reviewed_by": "optional-user-id"
+  "reason": "optional note for the audit trail",
+  "skill_draft": "optional SKILL.md override (skill_add only)"
 }
 ```
 
-**Valid status transitions:** `pending` → `approved`, `rejected`, `rolled_back`.
+The audit actor is the authenticated caller; a `reviewed_by` field is ignored.
 
-**Response:**
+**Transitions:**
+
+| Request | From | Result |
+|---------|------|--------|
+| `approved` | `pending` (`approved` for `tool_order`/`skill_add`) | `threshold` → `approved`; `tool_order` → `applied`; `skill_add` → `applying` → `applied` |
+| `rejected` | `pending`, `approved` | `rejected` |
+| `rolled_back` | `applied` | Restores the exact prior config → `rolled_back` |
+
+**Response:** `200 {"status": "ok", "action": "...", "suggestion": {...}}`.
+
+**Errors:**
+- `409` when the suggestion is not in an allowed state.
+- `409` when a rollback would overwrite a newer edit.
+- `409` when rolling back `skill_add`.
+- `400` on guardrail refusal (`min_data_points`, `locked_params`).
+
+### Suggestion Audit Trail
+
+```
+GET /v1/agents/{agentID}/evolution/suggestions/{suggestionID}/events
+```
+
+Returns the append-only list of transitions, oldest first:
 
 ```json
-{
-  "status": "ok"
+[{"action": "apply", "from_status": "pending", "to_status": "applied", "actor": "alice", "detail": {"tool": "web_fetch", "change": {"...": "..."}}, "created_at": "..."}]
+```
+
+"ok"
 }
 ```
 

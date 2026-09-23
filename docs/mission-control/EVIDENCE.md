@@ -45,3 +45,74 @@
   - A NULL `display_name` on `llm_providers` failed the whole provider list, so the gateway ran with zero providers.
   - A NULL `display_name`/`status` on `agents` made the row be skipped silently, so upgraded agents vanished from `/v1/agents`.
 - **Also found:** the old fork commit f3ba434 does not build from a clean clone. `.gitignore` has `sandbox`, so `internal/sandbox` was never committed. Git history cannot reproduce the legacy binary.
+
+## §B Evolution correctness (2026-09-23)
+
+### Gate B checks
+
+Normal execution, retry, concurrency and injected failures were each checked for agreement between the API status, the stored state and the visible result.
+
+**PG integration (`-race`, PG18)**
+
+`tests/integration/evolution_apply_rollback_test.go`:
+- `tool_order` apply is agent-scoped: another agent in the tenant and `builtin_tool_tenant_configs` are untouched.
+- Rollback restores absence exactly and restores a pre-existing list.
+- 8 concurrent applies: exactly one wins, the other seven get a conflict, one audit event is written.
+- Repeat apply or repeat rollback returns a conflict.
+- Rollback refuses to overwrite a newer edit, and the status stays `applied`.
+- An injected failure inside the transaction writes nothing: no status change, no config change, no event. A non-allowlisted column is rejected.
+- Cross-tenant apply, read and events are denied.
+- Legacy `_baseline` rollback: an absent key is deleted; an explicit zero is restored as zero.
+- Threshold approval is advisory and changes no config.
+- `ListEvolutionAgents` finds agents while a bare-context `List` fails closed. This is a regression test for the cron bug.
+
+`tests/integration/evolution_http_test.go`:
+- Per-agent guardrail: 3 calls get 400; 6 calls with `min_data_points=5` succeed.
+- A client-supplied `reviewed_by:"mallory"` is ignored; the actor is the authenticated user.
+- REST `rolled_back` really restores config; the audit trail is alice → bob.
+- A repeat approve gets 409. A rollback on a pending suggestion gets 409.
+- `skill_add` with a missing draft releases the claim to `pending` (events: claim, apply_failed). A valid draft reaches `applied` with exactly one skill row. Repeat approve gets 409 with no duplicate skill. Rollback gets 409.
+
+`tests/integration/evolution_reconcile_test.go`: reports a legacy threshold apply, a legacy tenant-wide disable and a stuck claim; ignores a healthy row; modifies no data.
+
+**SQLite (`-tags sqliteonly`, `-race`)**
+- Concurrent apply is exactly-once. Rollback conflict works, then rollback succeeds once the edit is removed.
+- A non-vacuous cross-tenant test.
+- A failed mutate writes nothing.
+- In-place upgrade v60 → v61.
+- The whole `sqlitestore` package passes. That includes the schema-replay tests, which caught a non-idempotent first version of the v60 patch; it is now idempotent.
+
+**Unit tests**
+- `internal/store`: config path presence, explicit zero, pruning, and refusal of non-object intermediates.
+- `internal/agent`: dedup across statuses. The test fails with the old "pending-only" logic.
+- `internal/http`, skill patch:
+  - a version-record failure keeps v1 with no orphan directory;
+  - a mark-applied failure is resumed without minting a new version;
+  - tampered files are refused;
+  - resume never downgrades a newer active version.
+
+  Each of these fails on the pre-change code.
+- Web: vitest for `canRollback` and `changeSummary`; `tsc` clean; lint has 0 errors.
+
+**Independent review** (a fresh reviewer agent)
+- No high-severity findings.
+- Two medium findings were fixed and each now has a test:
+  - resume could downgrade the active version;
+  - `applying` could get stuck on client disconnect (release now uses a detached context, and reject from `applying` is allowed).
+- Low findings fixed:
+  - `FOR NO KEY UPDATE` on the agent row;
+  - a vacuous SQLite tenant test;
+  - `ConfigSetPath` scalar intermediates;
+  - audit table added to the tenant backup registry;
+  - UI change summary shown only while applied;
+  - cooldown for acknowledged advisories.
+- Accepted and documented:
+  - the default `min_data_points=100` can hold `tool_order` suggestions that have 20–99 calls;
+  - for gateway-token callers the actor comes from the `X-GoClaw-User-Id` header, which is the gateway's existing trust model.
+
+**Pre-existing bugs found and fixed along the way**
+- The evolution cron never analyzed any agent on PG (bare-context `List`).
+- Suggestions would have been re-proposed every 6 hours after review.
+- The desktop suggestions list was always empty (it read `.suggestions` from a bare-array response).
+- The desktop showed the requested status instead of the server's resulting status.
+- The applied config was never cache-invalidated.

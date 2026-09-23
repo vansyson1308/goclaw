@@ -189,16 +189,15 @@ Example retry sequence: fail → wait 2s → retry → fail → wait 4s → retr
 
 Retries are transparent to the user; final run status (ok or error) is logged to the `cron_run_logs` table.
 
-### v3 Agent Evolution Cron Jobs
-
-Two background cron jobs manage agent evolution (v3):
+### v3 Agent Evolution Cron Job
 
 | Job | Frequency | Purpose |
 |-----|-----------|---------|
-| **Suggestion Analysis** | Daily (1 min after startup, then every 24h) | Analyzes agents with `evolution_metrics` enabled, generates improvement suggestions |
-| **Evaluation & Rollback** | Weekly (every 7 days) | Checks applied suggestions against quality guardrails, auto-rolls back degraded evolutions |
+| **Suggestion Analysis** | 1 min after startup, then 03:00 / 09:00 / 15:00 / 21:00 server-local time | Iterates active tenants and analyzes agents with `self_evolution_metrics` and `self_evolution_suggestions` enabled |
 
-Both jobs run with 5-minute timeout and tenant-scoped context. Failed analyses log at debug level and continue gracefully.
+There is no automatic evaluation/rollback job; applied changes are rolled back explicitly (see [21 — Agent Evolution](21-agent-evolution-and-skill-management.md)).
+
+The job runs with a 5-minute timeout and a tenant-scoped context per agent. Failed analyses log at debug level and continue gracefully.
 
 ---
 

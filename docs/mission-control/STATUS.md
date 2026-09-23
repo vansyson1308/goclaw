@@ -7,8 +7,8 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | Phase | Status | Gate evidence |
 |---|---|---|
 | A. Upstream integration | verified | EVIDENCE.md §A |
-| B. Evolution correctness | in_progress | — |
-| C. Mission vertical slice | pending | — |
+| B. Evolution correctness | verified | EVIDENCE.md §B |
+| C. Mission vertical slice | in_progress | — |
 | D. Durable recovery | pending | — |
 | E. Enforced boundaries | pending | — |
 | F. Evaluation suite | pending | — |
@@ -20,7 +20,7 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | Dimension | State |
 |---|---|
 | SOURCE READY | no (in progress) |
-| OFFLINE/INTEGRATION VERIFIED | partial: Phase A only |
+| OFFLINE/INTEGRATION VERIFIED | partial: Phases A–B |
 | LIVE PROVIDER VERIFIED | BLOCKED: no provider credentials or budget |
 | COMMERCIAL LICENSE READY | BLOCKED: CC BY-NC 4.0 upstream |
 | PRODUCTION RELEASE APPROVED | no: not requested |
@@ -41,4 +41,4 @@ go test -race -tags integration ./tests/invariants/... ./tests/integration/
 ## Handoff
 
 - Branch: `claude/blissful-pascal-jo32ao`.
-- Next action: Phase B. See DECISIONS.md D5–D9 for the agreed design.
+- Next action: Phase C (mission contract and vertical slice).

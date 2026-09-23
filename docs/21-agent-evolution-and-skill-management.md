@@ -604,7 +604,7 @@ Metrics aggregate over 7-day rolling windows for suggestion analysis.
 ```
 Metrics Aggregation (7-day window)
     ↓
-Rule Evaluation (run daily/weekly)
+Rule Evaluation (every 6 hours)
     ├─ LowRetrievalUsageRule
     ├─ ToolFailureRule
     └─ RepeatedToolRule
@@ -614,95 +614,73 @@ Suggestion Creation (pending status)
 Admin Review → Approve/Reject/Rollback
 ```
 
-**Suggestion Types:**
+**Suggestion Types** (rules in `internal/agent/suggestion_rules.go`):
 
-| Type | Trigger | Recommendation | Parameters |
-|------|---------|-----------------|------------|
-| `low_retrieval_usage` | Avg recall < threshold for 7 days | Lower `retrieval_threshold` parameter | `{current_threshold, proposed_threshold, confidence}` |
-| `tool_failure` | Single tool failure rate > 20% | Review tool config or fallback | `{tool_name, failure_count, success_count}` |
-| `repeated_tool` | Tool called 5+ consecutive times without context change | Consider extracting as skill | `{tool_name, occurrence_count, pattern_score}` |
+| Type | Trigger | On approval |
+|------|---------|-------------|
+| `threshold` | `memory_search` returned results in <20% of 50+ queries | **Advisory**: marked `approved`, no config change. The metric (`used_in_reply = resultCount > 0`) cannot justify raising a threshold; review `memory_config.min_score` manually. |
+| `tool_order` | A tool succeeded in <10% of 20+ calls | Adds the tool to **this agent's** `tools_config.deny` (agent-scoped; other agents and tenant settings untouched). Reversible. |
+| `skill_add` | A tool ran >100 times/week with >50% success | Creates a private skill from the draft (claim → create → commit). Not rolled back here. |
 
-**Duplicate Prevention:** Only one pending suggestion per type per agent. New analyses skip rules that already have pending suggestions.
+**Duplicate Prevention:** a rule does not re-propose the same type + metric key while an existing suggestion is `pending`, `approved`, `applying` or `applied`, or was `rejected`/`rolled_back` within the last 7 days.
 
-### 8.3 Auto-Adapt Guardrails
+### 8.3 Apply, Rollback and Guardrails
 
-Suggestions can be auto-applied with safety constraints (optional admin-enabled). Guardrails prevent runaway adaptation.
+Every transition (approve, reject, claim, apply, rollback) runs in **one database transaction**:
 
-**Constraints:**
+1. Lock the suggestion row and check its current status (compare-and-set; a stale or repeated request gets HTTP 409).
+2. For config changes, lock the agent row, compute the change, and write it.
+3. Record `applied_change` (`{column, path, before, after}`). `before`/`after` carry **presence** (`present: false` means the key did not exist), so rollback deletes keys the apply introduced and keeps explicit zeros.
+4. Append an audit event to `agent_evolution_events` with the **authenticated** actor (a client-supplied `reviewed_by` is ignored).
 
-| Name | Default | Purpose |
-|------|---------|---------|
-| `max_delta_per_cycle` | 0.1 | Max parameter change per apply cycle (prevents aggressive swings) |
-| `min_data_points` | 100 | Minimum metrics before applying (avoid overfitting on small sample) |
-| `rollback_on_drop_pct` | 20.0 | Auto-rollback if quality metric drops >20% after apply |
-| `locked_params` | `[]` | Parameters that cannot be auto-changed (e.g., security settings) |
+**Rollback** restores `before` exactly. It is refused (409) if the current value is no longer the applied `after`: a newer, unrelated edit is never overwritten. Consequently, when two `tool_order` changes were applied to the same agent, roll them back in reverse order. A `skill_add` claim left in `applying` by a crash can be resolved with `{"status":"rejected"}` once the operator has checked whether the skill exists. Legacy rows applied before migration 000098 roll back from `parameters._baseline`.
 
-**Apply Flow:**
+**Guardrails** (`other_config.evolution_guardrails`, per agent, layered over defaults):
 
-1. Admin approves `low_retrieval_usage` suggestion (raises `retrieval_threshold` by +0.05)
-2. System checks: min_data_points met? parameter not locked? delta ≤ 0.1? → OK
-3. Baseline values saved for rollback
-4. Suggestion status → `applied`
-5. Monitor: if recall drops >20%, auto-rollback and set status → `rolled_back`
+| Name | Default | Enforced |
+|------|---------|----------|
+| `min_data_points` | 100 | Yes: `tool_order` needs this many recorded calls of the tool in the last 7 days |
+| `locked_params` | `[]` | Yes: a dotted target such as `tools_config.deny` blocks that change; suggestion parameter keys are also matched |
+| `max_delta_per_cycle` | 0.1 | Stored for compatibility; no current type changes a numeric parameter |
+| `rollback_on_drop_pct` | 20.0 | Stored for compatibility; there is no automatic metric-driven rollback |
 
-**Baseline Storage:**
+There is no automatic rollback job. The previous weekly evaluation compared an unrelated metric and, because of the tenant-scoping bug below, never ran.
 
-Previous parameter values stored in suggestion `parameters._baseline` for rollback:
-
-```json
-{
-  "current_threshold": 0.5,
-  "proposed_threshold": 0.55,
-  "_baseline": {
-    "retrieval_threshold": 0.5
-  }
-}
-```
+**Reconciliation:** `goclaw evolution reconcile [--json]` lists legacy or inconsistent records (legacy threshold applies, tenant-wide tool disables from the old `tool_order`, stuck `applying` claims, half-applied skill patches). It is read-only.
 
 ### 8.4 Cron Scheduling
 
-Evolution analysis runs as a periodic cron job (default: daily).
-
-**Schedule:** Configurable via `evolution_cron_schedule` in agent config. Examples: `every day at 02:00`, `every 7 days at sunday 02:00`.
+Analysis runs 1 minute after startup and then at 03:00, 09:00, 15:00 and 21:00 server-local time (`cmd/gateway_evolution_cron.go`). A PostgreSQL advisory lock keeps it to one instance. There is no per-agent schedule setting.
 
 **Execution:**
-1. Load all agents in tenant
-2. For each agent: `engine.Analyze(ctx, agentID)`
-3. Create pending suggestions (if new findings detected)
-4. Log results: created suggestions count, skipped rules, errors
+1. List active tenants, then each tenant's active agents with `self_evolution_metrics` and `self_evolution_suggestions` enabled. The job previously listed agents with a context that had no tenant; the store fails closed on that and returned nothing, so no agent was ever analyzed.
+2. For each agent: `engine.Analyze(ctx, agentID)` over a 7-day window.
+3. Create `pending` suggestions for new findings (see duplicate prevention).
 
-**Cron Event:** `evolution.analysis.completed` event emitted on completion.
-
-### 8.5 API & WebSocket
+### 8.5 API
 
 **HTTP Endpoints** (see [18 — HTTP REST API](18-http-api.md#14-evolution-metrics--suggestions)):
-- `GET /v1/agents/{agentID}/evolution/metrics` — Query/aggregate metrics
-- `GET /v1/agents/{agentID}/evolution/suggestions` — List suggestions
-- `PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}` — Approve/reject/rollback
+- `GET /v1/agents/{agentID}/evolution/metrics`: query or aggregate metrics
+- `GET /v1/agents/{agentID}/evolution/suggestions`: list suggestions (includes `applied_change`, `applied_by`, `rolled_back_by`, `state_version`)
+- `PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}`: body `{"status": "approved"|"rejected"|"rolled_back", "reason"?: string, "skill_draft"?: string}`. Returns `{status, action, suggestion}`; 409 on state or rollback conflict.
+- `GET /v1/agents/{agentID}/evolution/suggestions/{suggestionID}/events`: audit trail
 
-**WebSocket Methods** (see [19 — WebSocket RPC](19-websocket-rpc.md)):
-- `agent.evolution.metrics` — Get metrics
-- `agent.evolution.suggestions` — List suggestions
-- `agent.evolution.apply` — Apply suggestion
-- `agent.evolution.rollback` — Rollback applied suggestion
+There are no WebSocket methods for evolution.
 
 ### 8.6 Configuration
 
-Per-agent evolution settings stored in `agents.other_config` JSONB:
+Per-agent settings in `agents.other_config` JSONB:
 
 ```json
 {
-  "evolution_enabled": true,
+  "self_evolution_metrics": true,
+  "self_evolution_suggestions": true,
   "evolution_guardrails": {
-    "max_delta_per_cycle": 0.1,
     "min_data_points": 100,
-    "rollback_on_drop_pct": 20.0,
-    "locked_params": ["security_level"]
+    "locked_params": ["tools_config.deny"]
   }
 }
 ```
-
-Defaults used if keys absent. Set `evolution_enabled: false` to disable metrics collection entirely.
 
 ---
 
