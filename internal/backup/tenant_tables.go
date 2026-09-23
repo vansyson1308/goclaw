@@ -61,6 +61,7 @@ func TenantTables() []TableDef {
 		{Name: "vault_documents", Tier: 3, HasTenantID: true},
 		{Name: "agent_evolution_metrics", Tier: 3, HasTenantID: true},
 		{Name: "agent_evolution_suggestions", Tier: 3, HasTenantID: true},
+		{Name: "missions", Tier: 3, HasTenantID: true},
 		{Name: "channel_contacts", Tier: 3, HasTenantID: true},
 		{Name: "subagent_tasks", Tier: 3, HasTenantID: true},
 		{Name: "agent_team_members", Tier: 3, HasTenantID: true, OrderBy: "team_id, agent_id"}, // PK (team_id, agent_id) — no id column
@@ -91,6 +92,7 @@ func TenantTables() []TableDef {
 		// Tier 4: FK to Tier 3
 		{Name: "kg_relations", Tier: 4, HasTenantID: true},
 		{Name: "agent_evolution_events", Tier: 4, HasTenantID: true}, // FK → agent_evolution_suggestions (tier 3)
+		{Name: "mission_events", Tier: 4, HasTenantID: true},         // FK → missions (tier 3)
 		{Name: "team_tasks", Tier: 4, HasTenantID: true},
 		// vault_links has no tenant_id — filter via JOIN vault_documents
 		{

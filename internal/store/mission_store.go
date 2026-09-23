@@ -28,6 +28,9 @@ var MissionActiveStatuses = []string{MissionPlanned, MissionPreparing, MissionRu
 // ErrMissionStateConflict means the mission was not in an allowed status.
 var ErrMissionStateConflict = errors.New("mission state conflict")
 
+// ErrMissionNotFound means no mission with that ID exists in the tenant.
+var ErrMissionNotFound = errors.New("mission not found")
+
 // Mission is a durable, verifiable unit of agent work.
 type Mission struct {
 	ID             uuid.UUID       `json:"id"`

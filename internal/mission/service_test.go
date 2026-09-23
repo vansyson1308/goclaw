@@ -68,7 +68,7 @@ func (s *memStore) TransitionMission(ctx context.Context, id uuid.UUID, from []s
 	defer s.mu.Unlock()
 	m, ok := s.missions[id]
 	if !ok || m.TenantID != store.TenantIDFromContext(ctx) {
-		return nil, fmt.Errorf("mission not found")
+		return nil, store.ErrMissionNotFound
 	}
 	if !slices.Contains(from, m.Status) {
 		return nil, fmt.Errorf("%w: %s", store.ErrMissionStateConflict, m.Status)

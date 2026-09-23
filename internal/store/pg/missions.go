@@ -145,7 +145,7 @@ func (s *PGMissionStore) TransitionMission(ctx context.Context, id uuid.UUID, fr
 	var current string
 	err = tx.QueryRowContext(ctx, `SELECT status FROM missions WHERE id = $1 AND tenant_id = $2 FOR UPDATE`, id, tenantID).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("mission not found")
+		return nil, store.ErrMissionNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -242,7 +242,7 @@ func (s *PGMissionStore) AppendMissionEvent(ctx context.Context, ev store.Missio
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("mission not found")
+		return store.ErrMissionNotFound
 	}
 	return nil
 }

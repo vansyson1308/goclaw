@@ -1033,6 +1033,9 @@ func runGateway() {
 	)
 	defer sched.Stop()
 
+	// Missions API (service only when GOCLAW_MISSIONS=1); needs the scheduler.
+	deps.wireMissions(ctx, sched)
+
 	// Start cron + heartbeat ticker, wire wake functions and adaptive throttle.
 	heartbeatTicker := startCronAndHeartbeat(pgStores, server, sched, msgBus, providerRegistry, channelMgr, cfg, heartbeatTool, heartbeatMethods)
 

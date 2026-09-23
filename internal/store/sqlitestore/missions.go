@@ -151,7 +151,7 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 	var current string
 	err = tx.QueryRowContext(ctx, `SELECT status FROM missions WHERE id = ? AND tenant_id = ?`, id.String(), tenantID.String()).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("mission not found")
+		return nil, store.ErrMissionNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -255,7 +255,7 @@ func (s *SQLiteMissionStore) AppendMissionEvent(ctx context.Context, ev store.Mi
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("mission not found")
+		return store.ErrMissionNotFound
 	}
 	return nil
 }

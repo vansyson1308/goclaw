@@ -787,6 +787,9 @@ func (s *Server) SetKnowledgeGraphHandler(h *httpapi.KnowledgeGraphHandler) {
 	s.handlers = append(s.handlers, h)
 }
 
+// SetMissionsHandler sets the missions API handler.
+func (s *Server) SetMissionsHandler(h *httpapi.MissionsHandler) { s.handlers = append(s.handlers, h) }
+
 // SetEvolutionHandler sets the evolution metrics + suggestions handler.
 func (s *Server) SetEvolutionHandler(h *httpapi.EvolutionHandler) {
 	s.handlers = append(s.handlers, h)
