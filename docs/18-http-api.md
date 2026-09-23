@@ -1022,6 +1022,34 @@ Returns the append-only list of transitions, oldest first:
 
 ---
 
+## 14a. Missions
+
+Verifiable, objective-driven agent work. Design: [mission-control/MISSIONS.md](mission-control/MISSIONS.md).
+
+Missions must be enabled on the gateway with `GOCLAW_MISSIONS=1`. The contract `source_dir` and `overlay_dir` resolve under `GOCLAW_MISSIONS_SOURCE_ROOT` (default `<data>/mission-sources`). While missions are disabled, reads still work and writes return `503`.
+
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| `GET` | `/v1/missions?limit=` | viewer | `{"missions": [...], "enabled": bool}`, newest first. The diff is omitted in the list |
+| `POST` | `/v1/missions` | operator | Body: the contract JSON (≤ 64 KiB). Returns `202` with the mission, or `400` with the validation reason |
+| `GET` | `/v1/missions/{id}` | viewer | Full mission: `verification[]`, `diff`, `changed_files`, usage, `cost_usd` (`null` means unknown) |
+| `GET` | `/v1/missions/{id}/events` | viewer | Append-only timeline (transitions and notes) |
+| `POST` | `/v1/missions/{id}/cancel` | operator | `409` if the mission already finished |
+
+Each `verification[]` element contains:
+
+```json
+{"id": "behavior", "kind": "command", "status": "pass", "baseline_status": "fail", "proves_change": true,
+ "command": ["go", "test", "-run", "TestAcceptance", "./..."], "exit_code": 0, "duration_ms": 812,
+ "output_tail": "ok  example.com/sum 0.004s", "executor": "host", "contract_digest": "…"}
+```
+
+Statuses:
+- `planned`, `preparing`, `running`, `verifying` (in progress);
+- terminal: `succeeded`, `partial`, `failed`, `blocked`, `cancelled`.
+
+---
+
 ## 15. Orchestration Mode
 
 Determines how an agent routes requests (standalone, delegation, team-based).

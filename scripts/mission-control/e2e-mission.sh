@@ -36,7 +36,7 @@ mkdir -p "$WORK/home" "$WORK/data"
 HOME="$WORK/home" GOCLAW_CONFIG="$WORK/config.json" GOCLAW_DATA_DIR="$WORK/data" \
 GOCLAW_GATEWAY_TOKEN="$TOKEN" GOCLAW_PORT="$PORT" \
 GOCLAW_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-GOCLAW_MISSIONS=1 GOCLAW_MISSIONS_SOURCE_ROOT="$EX/sources" GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 \
+GOCLAW_MISSIONS=1 GOCLAW_MISSIONS_SOURCE_ROOT="$EX/testdata" GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 \
 GOCLAW_OWNER_IDS=operator \
   "$WORK/goclaw" > "$WORK/gateway.log" 2>&1 &
 GW=$!
@@ -73,7 +73,7 @@ jq -e '.verification[] | select(.id=="behavior") | .baseline_status == "fail"' "
 jq -e '.changed_files | index("sum.go") != null and index("sum_negative_test.go") != null' "$WORK/m1.json" >/dev/null || fail "changed files"
 jq -e '.diff | contains("-\t\tif x > 0 {")' "$WORK/m1.json" >/dev/null || fail "diff lacks the fix"
 jq -e '(.changed_files | index("zz_acceptance_test.go")) == null' "$WORK/m1.json" >/dev/null || fail "hidden test leaked"
-grep -q 'if x > 0' "$EX/sources/sumrepo/sum.go" || fail "source repository was modified"
+grep -q 'if x > 0' "$EX/testdata/sumrepo/sum.go" || fail "source repository was modified"
 "$WORK/goclaw" mission show "$M1" > "$WORK/m1.txt"
 grep -q 'SUCCEEDED' "$WORK/m1.txt" || fail "CLI show"
 echo "   succeeded: $(jq -r .status_reason "$WORK/m1.json")"

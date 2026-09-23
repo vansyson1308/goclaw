@@ -25,3 +25,16 @@
 - **D10 Skill patch apply order.** Version history is recorded before activation. If recording fails, the skill stays on its current version and the staged directory is removed. If activation or marking the suggestion applied fails, a retry resumes from the recorded version: the immutable files are verified against the recorded hash, then activated, then marked applied. No second version is minted. This replaces upstream's "activate first, keep files" behavior, which could leave an active version with no history row.
 - **D11 No automatic metric-driven rollback.** The weekly evaluation job is removed. It never ran on PG because of the D9 bug, and it compared a metric unrelated to the change. Rollback is explicit via the API. Measured, eval-gated observation arrives with the Phase G candidate lifecycle.
 - **D12 Reconciliation is report-only.** `goclaw evolution reconcile` lists legacy or inconsistent rows and never repairs data. Legacy threshold applies can be rolled back through the API; tenant-wide tool disables are left for an operator to decide.
+- **D13 Missions wrap agent runs; they do not replace team tasks.** A v1 mission is one agent working on one contract, judged by verifiers. It runs through the scheduler, like cron. Multi-agent decomposition can later link `team_tasks.metadata.mission_id`.
+- **D14 Evidence rules.**
+  - Verifiers run outside the agent, against an isolated copy.
+  - `must_change` checks must fail on the baseline.
+  - Hidden overlays hold acceptance tests the agent cannot see or edit.
+  - Only change-proving criteria count as progress.
+  - An error or timeout is never a pass.
+  - A failed or over-budget run cannot succeed.
+  - Unpriced usage is recorded as unknown cost, not $0.
+- **D15 Missions are opt-in (`GOCLAW_MISSIONS=1`).** The v1 verifier executor runs on the host with a scrubbed environment. Phase E adds a sandboxed executor. The `scripted` provider is separately opt-in (`GOCLAW_ENABLE_SCRIPTED_PROVIDER=1`) and is for offline fixtures only.
+- **D16 Surface parity.**
+  - API, CLI and web: done.
+  - Desktop (Lite): the SQLite store and schema v62 exist and compile, but there is no desktop UI for missions in v1. The executor and data-root assumptions target the Standard server edition.

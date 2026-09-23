@@ -36,6 +36,9 @@ func TestHooksTracing_EmitHookSpan(t *testing.T) {
 		ID:        traceID,
 		Status:    store.SpanStatusCompleted,
 		StartTime: time.Now().Add(-5 * time.Second),
+		// Set like the agent loop does: a zero created_at lets the collector's
+		// startup prune delete the trace before the span flushes (FK race).
+		CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("CreateTrace: %v", err)
 	}
@@ -90,6 +93,9 @@ func TestHooksTracing_DispatcherEmitsSpan(t *testing.T) {
 	if err := c.CreateTrace(tenantCtx(tenantID), &store.TraceData{
 		ID: traceID, Status: store.SpanStatusCompleted,
 		StartTime: time.Now().Add(-5 * time.Second),
+		// Set like the agent loop does: a zero created_at lets the collector's
+		// startup prune delete the trace before the span flushes (FK race).
+		CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("CreateTrace: %v", err)
 	}
