@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"slices"
 
 	"github.com/titanous/json5"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -18,23 +22,74 @@ import (
 type ConfigMethods struct {
 	cfg          *config.Config
 	cfgPath      string
-	managedMode  bool
-	secretsStore store.ConfigSecretsStore // nil in standalone mode
+	secretsStore store.ConfigSecretsStore
+	syncFn       func(ctx context.Context, cfg *config.Config) // nil-safe; syncs non-secret settings to system_configs
+	eventBus     bus.EventPublisher                            // nil-safe; broadcasts config change events
 }
 
-func NewConfigMethods(cfg *config.Config, cfgPath string, managedMode bool, secretsStore store.ConfigSecretsStore) *ConfigMethods {
-	return &ConfigMethods{cfg: cfg, cfgPath: cfgPath, managedMode: managedMode, secretsStore: secretsStore}
+func NewConfigMethods(cfg *config.Config, cfgPath string, secretsStore store.ConfigSecretsStore, eventBus bus.EventPublisher) *ConfigMethods {
+	return &ConfigMethods{cfg: cfg, cfgPath: cfgPath, secretsStore: secretsStore, eventBus: eventBus}
+}
+
+// SetSystemConfigSync sets a callback to sync config to system_configs after save.
+// The callback receives the final resolved config (with secrets + env applied).
+func (m *ConfigMethods) SetSystemConfigSync(fn func(ctx context.Context, cfg *config.Config)) {
+	m.syncFn = fn
 }
 
 func (m *ConfigMethods) Register(router *gateway.MethodRouter) {
-	router.Register(protocol.MethodConfigGet, m.handleGet)
-	router.Register(protocol.MethodConfigApply, m.handleApply)
-	router.Register(protocol.MethodConfigPatch, m.handlePatch)
-	router.Register(protocol.MethodConfigSchema, m.handleSchema)
+	router.Register(protocol.MethodConfigGet, m.requireMasterScope(m.requireOwner(m.handleGet)))
+	router.Register(protocol.MethodConfigApply, m.requireMasterScope(m.requireOwner(m.handleApply)))
+	router.Register(protocol.MethodConfigPatch, m.requireMasterScope(m.requireOwner(m.handlePatch)))
+	router.Register(protocol.MethodConfigSchema, m.requireMasterScope(m.requireOwner(m.handleSchema)))
+	// config.defaults is read-only + secret-free (Go consts + agents.defaults overlay),
+	// so it only needs requireMasterScope — owner gating would spam auth errors for
+	// operators viewing agent detail pages.
+	router.Register(protocol.MethodConfigDefaults, m.requireMasterScope(m.handleDefaults))
+}
+
+// requireOwner wraps a handler to only allow owner-role users.
+func (m *ConfigMethods) requireOwner(next gateway.MethodHandler) gateway.MethodHandler {
+	return func(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+		if !client.IsOwner() {
+			locale := store.LocaleFromContext(ctx)
+			client.SendResponse(protocol.NewErrorResponse(
+				req.ID, protocol.ErrUnauthorized,
+				i18n.T(locale, i18n.MsgPermissionDenied, req.Method),
+			))
+			return
+		}
+		next(ctx, client, req)
+	}
+}
+
+// requireMasterScope rejects config.* calls when the caller's ctx is scoped to
+// a non-master tenant. System owner callers (bypass-all) are allowed through.
+//
+// Background: config.* mutates the master in-memory *config.Config and the
+// on-disk config.json. A non-master tenant admin calling config.patch would
+// corrupt master state + leak master config to other tenants. This guard keeps
+// config.* strictly master-scoped until a tenant-aware refactor lands.
+//
+// Shares the predicate with store.IsMasterScope so HTTP and WS layers can't
+// drift — same rule, one source of truth.
+func (m *ConfigMethods) requireMasterScope(next gateway.MethodHandler) gateway.MethodHandler {
+	return func(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+		if !store.IsMasterScope(ctx) {
+			locale := store.LocaleFromContext(ctx)
+			client.SendResponse(protocol.NewErrorResponse(
+				req.ID,
+				protocol.ErrUnauthorized,
+				i18n.T(locale, i18n.MsgConfigMasterScopeOnly),
+			))
+			return
+		}
+		next(ctx, client, req)
+	}
 }
 
 func (m *ConfigMethods) handleGet(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"config": m.cfg.MaskedCopy(),
 		"hash":   m.cfg.Hash(),
 		"path":   m.cfgPath,
@@ -44,6 +99,7 @@ func (m *ConfigMethods) handleGet(_ context.Context, client *gateway.Client, req
 // handleApply replaces the entire config with the provided JSON5 raw content.
 // Matching TS config.apply (src/gateway/server-methods/config.ts:435-486).
 func (m *ConfigMethods) handleApply(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		Raw      string `json:"raw"`
 		BaseHash string `json:"baseHash"`
@@ -53,49 +109,46 @@ func (m *ConfigMethods) handleApply(ctx context.Context, client *gateway.Client,
 	}
 
 	if params.Raw == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "raw config is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRawConfigRequired)))
 		return
 	}
 
 	// Optimistic concurrency: validate hash if provided
 	if params.BaseHash != "" && params.BaseHash != m.cfg.Hash() {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "config has changed (hash mismatch)"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgConfigHashMismatch)))
 		return
 	}
 
 	// Parse the new config
 	newCfg := config.Default()
 	if err := json5.Unmarshal([]byte(params.Raw), newCfg); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid config: "+err.Error()))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, err.Error())))
 		return
 	}
 
-	// Branch on mode for secrets handling
-	if m.managedMode {
-		// Managed mode: extract secrets → save to config_secrets table, strip all from file
-		m.saveSecretsToStore(ctx, newCfg)
-		newCfg.StripSecrets()
-	} else {
-		// Standalone mode: only strip masked values, keep real values
-		newCfg.StripMaskedSecrets()
-	}
+	// Extract secrets → save to config_secrets table, strip all from file
+	m.saveSecretsToStore(ctx, newCfg)
+	newCfg.StripSecrets()
 
 	// Save to disk
 	if err := config.Save(m.cfgPath, newCfg); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to save config: "+err.Error()))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToSave, "config", err.Error())))
 		return
 	}
 
 	// Update in-memory config and restore secrets
 	m.cfg.ReplaceFrom(newCfg)
-	if m.managedMode && m.secretsStore != nil {
+	if m.secretsStore != nil {
 		if secrets, err := m.secretsStore.GetAll(ctx); err == nil {
 			m.cfg.ApplyDBSecrets(secrets)
 		}
 	}
 	m.cfg.ApplyEnvOverrides()
+	m.syncToSystemConfigs(ctx)
+	m.broadcastChanged()
+	emitAudit(m.eventBus, client, "config.applied", "config", "gateway")
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok":      true,
 		"path":    m.cfgPath,
 		"config":  m.cfg.MaskedCopy(),
@@ -107,6 +160,7 @@ func (m *ConfigMethods) handleApply(ctx context.Context, client *gateway.Client,
 // handlePatch merges a partial config update into the current config.
 // Matching TS config.patch (src/gateway/server-methods/config.ts:321-434).
 func (m *ConfigMethods) handlePatch(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		Raw      string `json:"raw"`
 		BaseHash string `json:"baseHash"`
@@ -116,60 +170,48 @@ func (m *ConfigMethods) handlePatch(ctx context.Context, client *gateway.Client,
 	}
 
 	if params.Raw == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "raw patch is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRawPatchRequired)))
 		return
 	}
 
 	// Optimistic concurrency
 	if params.BaseHash != "" && params.BaseHash != m.cfg.Hash() {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "config has changed (hash mismatch)"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgConfigHashMismatch)))
 		return
 	}
 
-	// Merge strategy: serialize current -> deserialize patch on top -> save
-	currentJSON, err := json.Marshal(m.cfg)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to serialize current config"))
-		return
-	}
-
-	// Start from current config as base
-	merged := config.Default()
-	if err := json.Unmarshal(currentJSON, merged); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to clone config"))
-		return
-	}
+	// Start from a locked current-config snapshot as base.
+	merged := m.cfg.Clone()
 
 	// Apply patch on top
 	if err := json5.Unmarshal([]byte(params.Raw), merged); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid patch: "+err.Error()))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, err.Error())))
 		return
 	}
 
-	// Branch on mode for secrets handling
-	if m.managedMode {
-		m.saveSecretsToStore(ctx, merged)
-		merged.StripSecrets()
-	} else {
-		merged.StripMaskedSecrets()
-	}
+	// Extract secrets → save to config_secrets table, strip all from file
+	m.saveSecretsToStore(ctx, merged)
+	merged.StripSecrets()
 
 	// Save to disk
 	if err := config.Save(m.cfgPath, merged); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, "failed to save config: "+err.Error()))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToSave, "config", err.Error())))
 		return
 	}
 
 	// Update in-memory config and restore secrets
 	m.cfg.ReplaceFrom(merged)
-	if m.managedMode && m.secretsStore != nil {
+	if m.secretsStore != nil {
 		if secrets, err := m.secretsStore.GetAll(ctx); err == nil {
 			m.cfg.ApplyDBSecrets(secrets)
 		}
 	}
 	m.cfg.ApplyEnvOverrides()
+	m.syncToSystemConfigs(ctx)
+	m.broadcastChanged()
+	emitAudit(m.eventBus, client, "config.patched", "config", "gateway")
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok":      true,
 		"path":    m.cfgPath,
 		"config":  m.cfg.MaskedCopy(),
@@ -178,46 +220,184 @@ func (m *ConfigMethods) handlePatch(ctx context.Context, client *gateway.Client,
 	}))
 }
 
+// syncToSystemConfigs syncs the resolved config to system_configs table for the given tenant.
+func (m *ConfigMethods) syncToSystemConfigs(ctx context.Context) {
+	if m.syncFn != nil {
+		m.syncFn(ctx, m.cfg)
+	}
+}
+
+// broadcastChanged notifies subscribers that config has been updated.
+func (m *ConfigMethods) broadcastChanged() {
+	if m.eventBus != nil {
+		m.eventBus.Broadcast(bus.Event{Name: bus.TopicConfigChanged, Payload: m.cfg})
+	}
+}
+
 // handleSchema returns the config JSON schema for UI form generation.
 // Matching TS config.schema (src/gateway/server-methods/config.ts:276-289).
 func (m *ConfigMethods) handleSchema(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	schema := map[string]interface{}{
+	schema := map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"agents": map[string]interface{}{
+		"properties": map[string]any{
+			"agents": map[string]any{
 				"type":        "object",
 				"description": "Agent configuration (defaults + per-agent overrides)",
 			},
-			"channels": map[string]interface{}{
+			"channels": map[string]any{
 				"type":        "object",
 				"description": "Channel configuration (telegram, discord, slack, etc.)",
 			},
-			"providers": map[string]interface{}{
+			"providers": map[string]any{
 				"type":        "object",
 				"description": "AI provider API keys and settings",
 			},
-			"gateway": map[string]interface{}{
+			"gateway": map[string]any{
 				"type":        "object",
 				"description": "Gateway server settings (host, port, token)",
 			},
-			"tools": map[string]interface{}{
+			"branding": map[string]any{
+				"type":        "object",
+				"description": "Public app branding and SEO metadata",
+				"properties": map[string]any{
+					"app_name": map[string]any{
+						"type":        "string",
+						"description": "Application name shown in browser metadata and UI chrome",
+					},
+					"app_short_name": map[string]any{
+						"type":        "string",
+						"description": "Short application name for compact surfaces",
+					},
+					"meta_title": map[string]any{
+						"type":        "string",
+						"description": "HTML document title override",
+					},
+					"meta_description": map[string]any{
+						"type":        "string",
+						"description": "HTML meta description override",
+					},
+					"meta_keywords": map[string]any{
+						"type":        "string",
+						"description": "HTML meta keywords override",
+					},
+					"logo_url": map[string]any{
+						"type":        "string",
+						"description": "Logo URL or uploaded /branding-assets/* path",
+					},
+					"favicon_url": map[string]any{
+						"type":        "string",
+						"description": "Favicon URL or uploaded /branding-assets/* path",
+					},
+					"apple_touch_icon_url": map[string]any{
+						"type":        "string",
+						"description": "Apple touch icon URL or uploaded /branding-assets/* path",
+					},
+					"og_title": map[string]any{
+						"type":        "string",
+						"description": "Open Graph title override",
+					},
+					"og_description": map[string]any{
+						"type":        "string",
+						"description": "Open Graph description override",
+					},
+					"og_image_url": map[string]any{
+						"type":        "string",
+						"description": "Open Graph image URL or uploaded /branding-assets/* path",
+					},
+					"theme_color": map[string]any{
+						"type":        "string",
+						"description": "Browser theme-color value",
+					},
+				},
+			},
+			"tools": map[string]any{
 				"type":        "object",
 				"description": "Tool configuration (browser, exec, web search)",
 			},
-			"sessions": map[string]interface{}{
+			"skills": map[string]any{
+				"type":        "object",
+				"description": "Skill storage and upload settings",
+				"properties": map[string]any{
+					"max_upload_size_mb": map[string]any{
+						"type":        "integer",
+						"minimum":     config.MinSkillMaxUploadSizeMB,
+						"maximum":     config.MaxSkillMaxUploadSizeMB,
+						"default":     config.DefaultSkillMaxUploadSizeMB,
+						"description": "Maximum skill ZIP upload size in MB",
+					},
+					"slash_commands": map[string]any{
+						"type":        "object",
+						"description": "Explicit slash command skill activation settings",
+						"properties": map[string]any{
+							"enabled": map[string]any{
+								"type":        "boolean",
+								"default":     true,
+								"description": "Enable slash command detection in user prompts",
+							},
+							"suggest_not_found": map[string]any{
+								"type":        "boolean",
+								"default":     true,
+								"description": "Suggest similar skills when a requested skill is not found",
+							},
+							"partial_matching": map[string]any{
+								"type":        "boolean",
+								"default":     false,
+								"description": "Allow unique skill slug/name prefixes",
+							},
+							"prefix": map[string]any{
+								"type":        "string",
+								"default":     config.DefaultSkillSlashCommandPrefix,
+								"description": "Single-character slash command prefix",
+							},
+						},
+					},
+				},
+			},
+			"sessions": map[string]any{
 				"type":        "object",
 				"description": "Session storage configuration",
+			},
+			"system_messages": map[string]any{
+				"type":        "object",
+				"description": "Custom operator-facing system messages sent outside normal LLM replies",
+				"properties": map[string]any{
+					"default_locale": map[string]any{
+						"type":        "string",
+						"enum":        []string{"en", "vi", "zh", "ko", "ru"},
+						"description": "Default locale used when a channel caller does not provide a locale",
+					},
+					"messages": map[string]any{
+						"type":        "object",
+						"description": "Message template overrides keyed by message key and locale",
+					},
+				},
+				"definitions": systemMessageSchemaDefinitions(),
 			},
 		},
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"json": schema,
 	}))
 }
 
+func systemMessageSchemaDefinitions() []systemmessages.Definition {
+	defaults := systemmessages.Defaults()
+	keys := make([]string, 0, len(defaults))
+	for key := range defaults {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
+	defs := make([]systemmessages.Definition, 0, len(keys))
+	for _, key := range keys {
+		defs = append(defs, defaults[key])
+	}
+	return defs
+}
+
 // saveSecretsToStore extracts non-LLM/non-channel secrets from the config
-// and persists them to the config_secrets table (managed mode only).
+// and persists them to the config_secrets table.
 func (m *ConfigMethods) saveSecretsToStore(ctx context.Context, cfg *config.Config) {
 	if m.secretsStore == nil {
 		return

@@ -2,23 +2,163 @@ package telegram
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mymmrac/telego"
+	"github.com/mymmrac/telego/telegoapi"
 	tu "github.com/mymmrac/telego/telegoutil"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 )
 
 // Error patterns for graceful handling (matching TS error constants in send.ts).
 var (
 	parseErrRe           = regexp.MustCompile(`(?i)can't parse entities|parse entities|find end of the entity`)
 	messageNotModifiedRe = regexp.MustCompile(`(?i)message is not modified`)
+	noTextToEditRe       = regexp.MustCompile(`(?i)no text in the message to edit`)
+	threadNotFoundRe     = regexp.MustCompile(`(?i)message thread not found`)
+	messageTooLongRe     = regexp.MustCompile(`(?i)message is too long|entities too long`)
+	htmlTagRe            = regexp.MustCompile(`<[^>]*>`)
 )
+
+// extractMigrateChatID checks if a Telegram API error contains a group→supergroup
+// migration indicator and returns the new chat ID, or 0 if not a migration error.
+func extractMigrateChatID(err error) int64 {
+	var apiErr *telegoapi.Error
+	if errors.As(err, &apiErr) && apiErr.Parameters != nil && apiErr.Parameters.MigrateToChatID != 0 {
+		return apiErr.Parameters.MigrateToChatID
+	}
+	return 0
+}
+
+const (
+	sendMaxRetries     = 3
+	sendRetryDelay     = 2 * time.Second
+	maxSplitDepth      = 5               // max recursion depth for "message too long" splitting
+	photoSizeThreshold = 5 * 1024 * 1024 // 5 MB — images larger than this are sent as documents to avoid Telegram compression
+)
+
+// stripHTML removes HTML tags and unescapes HTML entities for plain-text fallback.
+func stripHTML(s string) string {
+	return html.UnescapeString(htmlTagRe.ReplaceAllString(s, ""))
+}
+
+// isRetryableNetworkErr checks if a Telegram API error is a transient error
+// worth retrying. Covers 429 rate limits, 5xx server errors, and transport failures.
+func isRetryableNetworkErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for Telegram API errors via typed error.
+	var apiErr *telegoapi.Error
+	if errors.As(err, &apiErr) {
+		// 429 = rate limited (transient), 5xx = server error (transient)
+		if apiErr.ErrorCode == 429 || apiErr.ErrorCode >= 500 {
+			return true
+		}
+	}
+	// Transport-level errors (timeout, reset, DNS, etc.)
+	s := err.Error()
+	return strings.Contains(s, "timeout") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "lookup") // DNS resolution failure
+}
+
+// isPostConnectNetworkErr checks if the error likely occurred AFTER reaching the server
+// (timeout, connection reset, EOF) vs before (DNS lookup failure, connection refused).
+// Used to decide if a request may have landed despite the error.
+func isPostConnectNetworkErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Telegram 5xx means the server received the request.
+	var apiErr *telegoapi.Error
+	if errors.As(err, &apiErr) && apiErr.ErrorCode >= 500 {
+		return true
+	}
+	s := err.Error()
+	return (strings.Contains(s, "timeout") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "EOF")) && !strings.Contains(s, "lookup")
+}
+
+// mediaSendMethods lists sendX calls that upload a file body and therefore
+// need the longer sendMediaOverallTimeout budget. Keyed by the `name` argument
+// passed to retrySend so no call site has to change when we bump the budget.
+var mediaSendMethods = map[string]struct{}{
+	"sendPhoto":      {},
+	"sendVideo":      {},
+	"sendAudio":      {},
+	"sendVoice":      {},
+	"sendDocument":   {},
+	"sendMediaGroup": {},
+}
+
+// retrySend wraps a Telegram send call with retry logic for transient network errors.
+// Parse errors are NOT retried (handled by caller's HTML fallback).
+// resetFn is called before each retry (e.g. to seek file handles back to start). Can be nil.
+func (c *Channel) retrySend(ctx context.Context, name string, resetFn func(), fn func(context.Context) error) error {
+	overall := sendOverallTimeout
+	if _, isMedia := mediaSendMethods[name]; isMedia {
+		overall = sendMediaOverallTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, overall)
+	defer cancel()
+
+	var err error
+	for attempt := 1; attempt <= sendMaxRetries; attempt++ {
+		err = fn(ctx)
+		if err == nil {
+			return nil
+		}
+		// Don't retry parse errors — caller handles HTML fallback
+		if parseErrRe.MatchString(err.Error()) {
+			return err
+		}
+		if !isRetryableNetworkErr(err) || attempt == sendMaxRetries {
+			return err
+		}
+
+		// If we hit a network-level connectivity issue (likely IPv6 routing),
+		// arm sticky IPv4 fallback. Only triggers on "unreachable" — not timeouts
+		// (which can be rate-limiting) or DNS errors (unrelated to IPv6).
+		if strings.Contains(err.Error(), "unreachable") {
+			c.enableIPv4Only()
+		}
+
+		// Honor Telegram's retry_after for 429 rate limit errors.
+		delay := sendRetryDelay * time.Duration(attempt)
+		var retryAPIErr *telegoapi.Error
+		if errors.As(err, &retryAPIErr) && retryAPIErr.ErrorCode == 429 &&
+			retryAPIErr.Parameters != nil && retryAPIErr.Parameters.RetryAfter > 0 {
+			delay = time.Duration(retryAPIErr.Parameters.RetryAfter+1) * time.Second // +1s safety margin
+		}
+
+		slog.Warn("telegram send retry",
+			"func", name, "attempt", attempt, "max", sendMaxRetries, "delay", delay, "error", err)
+		if resetFn != nil {
+			resetFn()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return err
+}
 
 // Send delivers an outbound message to a Telegram chat.
 // Supports text-only messages and messages with media attachments.
@@ -49,12 +189,52 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		fmt.Sscanf(v, "%d", &threadID)
 	}
 
+	// Fallback: extract threadID from localKey suffix (e.g. "-100123:topic:42").
+	// This covers cases where metadata is absent, such as pairing approval notifications
+	// routed via SendToChannel which only has a chatID string.
+	if threadID == 0 {
+		if idx := strings.Index(localKey, ":topic:"); idx > 0 {
+			fmt.Sscanf(localKey[idx+7:], "%d", &threadID)
+		} else if idx := strings.Index(localKey, ":thread:"); idx > 0 {
+			fmt.Sscanf(localKey[idx+8:], "%d", &threadID)
+		}
+	}
+
+	// Captured draft cleanup: if this message follows a DM stream that used the
+	// draft transport, we must clear the stale draft as soon as this bubble is sent.
+	if pID, ok := c.pendingDraftID.LoadAndDelete(localKey); ok {
+		draftID := pID.(int)
+		go func() {
+			params := &telego.SendMessageDraftParams{
+				ChatID:          chatID,
+				DraftID:         draftID,
+				Text:            "",
+				MessageThreadID: resolveThreadIDForSend(threadID),
+			}
+			// Best-effort with Background ctx — caller ctx may already be cancelled.
+			if err := c.bot.SendMessageDraft(context.Background(), params); err != nil {
+				slog.Debug("telegram: draft clear failed (cosmetic)", "chat_id", chatID, "draft_id", draftID, "error", err)
+			}
+		}()
+	}
+
+	// Placeholder update (e.g. LLM retry notification): edit the placeholder
+	// but keep it alive for the final response. Don't stop typing or cleanup.
+	if msg.Metadata["placeholder_update"] == "true" {
+		return c.updatePlaceholder(ctx, localKey, chatID, msg.Content, replyToMsgID, threadID)
+	}
+
 	// Stop thinking animation
 	if stop, ok := c.stopThinking.Load(localKey); ok {
 		if cf, ok := stop.(*thinkingCancel); ok {
 			cf.Cancel()
 		}
 		c.stopThinking.Delete(localKey)
+	}
+
+	// Stop typing indicator controller (TTL keepalive)
+	if ctrl, ok := c.typingCtrls.LoadAndDelete(localKey); ok {
+		ctrl.(*typing.Controller).Stop()
 	}
 
 	// NO_REPLY cleanup: content is empty when agent suppresses reply (prompt injection, etc.).
@@ -74,35 +254,106 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 			c.placeholders.Delete(localKey)
 			_ = c.deleteMessage(ctx, chatID, pID.(int))
 		}
-		return c.sendMediaMessage(ctx, chatID, msg, replyToMsgID, threadID)
+		err := c.sendMediaMessage(ctx, chatID, msg, replyToMsgID, threadID)
+		// Migration fallback: group upgraded to supergroup — retry with new chat ID.
+		if err != nil {
+			if newChatID := extractMigrateChatID(err); newChatID != 0 {
+				slog.Info("telegram: group migrated to supergroup (media send-path)",
+					"old_chat_id", chatID, "new_chat_id", newChatID)
+				c.migrateGroupChat(ctx, chatID, newChatID)
+				return c.sendMediaMessage(ctx, newChatID, msg, replyToMsgID, threadID)
+			}
+		}
+		return err
+	}
+
+	// TTS auto-apply: convert [[tts]] tagged responses to voice
+	if c.audioMgr != nil && msg.Content != "" {
+		isVoiceInbound := msg.Metadata["is_voice_inbound"] == "true"
+		ttsResult, ttsErr := c.audioMgr.AutoApplyToText(ctx, msg.Content, "telegram", isVoiceInbound, "")
+		if ttsErr != nil {
+			slog.Debug("telegram: tts auto-apply error", "error", ttsErr)
+		}
+		if ttsResult != nil && ttsResult.AudioPath != "" {
+			// Send voice message instead of text
+			if err := c.sendVoice(ctx, tu.ID(chatID), ttsResult.AudioPath, "", replyToMsgID, threadID); err != nil {
+				slog.Warn("telegram: tts auto-apply voice send failed, falling back to text", "error", err)
+			} else {
+				// Voice sent successfully
+				strippedText := strings.TrimSpace(ttsResult.Text)
+				if strippedText == "" {
+					// Voice-only: delete placeholder (no text to show)
+					if pID, ok := c.placeholders.LoadAndDelete(localKey); ok {
+						if msgID, ok := pID.(int); ok && msgID > 0 {
+							_ = c.deleteMessage(ctx, chatID, msgID)
+						}
+					}
+					return nil
+				}
+				// Has remaining text: let normal flow handle placeholder edit
+				msg.Content = strippedText
+			}
+		}
+		// Update content with directives stripped (even if TTS not applied)
+		if ttsResult != nil {
+			msg.Content = ttsResult.Text
+		}
 	}
 
 	// Text-only message
 	htmlContent := markdownToTelegramHTML(msg.Content)
+	chunks := chunkHTML(htmlContent, telegramMaxMessageLen)
 
-	// Try to edit the placeholder message (either "Thinking..." or a DraftStream message).
-	// If edit succeeds, we're done. If content is too long or edit fails, delete the
-	// placeholder and fall through to send new chunked messages.
+	// If a stream message exists (stored by FinalizeStream), edit the first chunk
+	// into it instead of deleting. This prevents the message from vanishing
+	// when HTML conversion makes content exceed the size limit.
+	startChunk := 0
 	if pID, ok := c.placeholders.Load(localKey); ok {
 		c.placeholders.Delete(localKey)
-		if len(htmlContent) <= telegramMaxMessageLen {
-			if err := c.editMessage(ctx, chatID, pID.(int), htmlContent); err == nil {
+		msgID := pID.(int)
+
+		if msgID == -1 {
+			// SIGNAL from stream: A message transport send likely landed but ID was never retrieved.
+			// Swallow the first chunk ONLY if there are more chunks to come (minimizes visible duplicate).
+			// If it is the ONLY chunk, we deliver it anyway to guarantee the user sees the answer.
+			if len(chunks) > 1 {
+				slog.Warn("telegram: ghost message detected, skipping first chunk of multi-chunk response", "chat_id", chatID)
+				startChunk = 1
+			}
+		} else {
+			err := c.editMessage(ctx, chatID, msgID, chunks[0])
+			if err == nil {
+				startChunk = 1 // first chunk edited into stream message
+			} else if isPostConnectNetworkErr(err) && len(chunks) > 1 {
+				// Mid-stream timeout/lost connection: the edit likely reached Telegram
+				// but the response was lost. Swallow and skip chunk 0 ONLY for multi-chunk
+				// messages where the rest of the answer is still coming.
+				slog.Warn("telegram: final edit timed out or lost, skipping chunk 0 of multi-chunk response",
+					"chat_id", chatID, "message_id", msgID, "error", err)
+				startChunk = 1
+			} else if isRetryableNetworkErr(err) {
+				// Retryable error (429 rate limit, 5xx, network). The stream message
+				// still exists with valid streamed content — don't delete it.
+				// Sending fresh would also fail, so keep the stream message as-is.
+				slog.Warn("telegram: final edit failed with retryable error, keeping stream message",
+					"chat_id", chatID, "message_id", msgID, "error", err)
 				return nil
+			} else {
+				// Edit failed definitely (400 rejection), or a single-chunk edit timed out.
+				// For single-chunk answers, we delete (best-effort) and send fresh to
+				// guarantee the user gets the content.
+				_ = c.deleteMessage(ctx, chatID, msgID)
 			}
 		}
-		// Delete the placeholder since we'll send new message(s) instead
-		_ = c.deleteMessage(ctx, chatID, pID.(int))
 	}
 
-	// Chunk long messages to respect Telegram's limit.
-	// TS ref: only reply to the first chunk (src/channels/plugins/outbound/telegram.ts).
-	chunks := chunkHTML(htmlContent, telegramMaxMessageLen)
-	for i, chunk := range chunks {
+	// Send remaining chunks (or all chunks if no stream message was edited).
+	for i := startChunk; i < len(chunks); i++ {
 		replyTo := 0
 		if i == 0 {
 			replyTo = replyToMsgID // only first chunk replies to user's message
 		}
-		if err := c.sendHTML(ctx, chatID, chunk, replyTo, threadID); err != nil {
+		if err := c.sendHTML(ctx, chatID, chunks[i], replyTo, threadID); err != nil {
 			return err
 		}
 	}
@@ -113,63 +364,119 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 // Ref: TS src/telegram/send.ts → sendMessageTelegram with mediaUrl
 func (c *Channel) sendMediaMessage(ctx context.Context, chatID int64, msg bus.OutboundMessage, replyTo, threadID int) error {
 	chatIDObj := tu.ID(chatID)
+	items, err := c.prepareTelegramMediaItems(msg)
+	if err != nil {
+		return err
+	}
 
-	for _, media := range msg.Media {
-		// Determine caption (use message content for first media, or media caption)
-		caption := media.Caption
-		if caption == "" && msg.Content != "" {
-			caption = msg.Content
-			msg.Content = "" // only use for first media
-		}
-
-		// Split caption if too long (Telegram limit: 1024 chars)
-		var followUpText string
-		if len(caption) > telegramCaptionMaxLen {
-			followUpText = caption[telegramCaptionMaxLen:]
-			caption = caption[:telegramCaptionMaxLen]
-		}
-
-		// Send based on content type
-		ct := strings.ToLower(media.ContentType)
-		switch {
-		case strings.HasPrefix(ct, "image/"):
-			if err := c.sendPhoto(ctx, chatIDObj, media.URL, caption, replyTo, threadID); err != nil {
+	for _, chunk := range chunkTelegramMediaItems(items) {
+		if chunk.grouped {
+			if err := c.sendTelegramMediaGroup(ctx, chatIDObj, chunk.items, replyTo, threadID); err != nil {
 				return err
 			}
-		case strings.HasPrefix(ct, "video/"):
-			if err := c.sendVideo(ctx, chatIDObj, media.URL, caption, replyTo, threadID); err != nil {
-				return err
-			}
-		case strings.HasPrefix(ct, "audio/"):
-			if err := c.sendAudio(ctx, chatIDObj, media.URL, caption, replyTo, threadID); err != nil {
-				return err
-			}
-		default:
-			if err := c.sendDocument(ctx, chatIDObj, media.URL, caption, replyTo, threadID); err != nil {
-				return err
-			}
-		}
-		// Only reply to the first media item
-		replyTo = 0
-
-		// Send follow-up text if caption was split
-		if followUpText != "" {
-			htmlContent := markdownToTelegramHTML(followUpText)
-			chunks := chunkHTML(htmlContent, telegramMaxMessageLen)
-			for _, chunk := range chunks {
-				if err := c.sendHTML(ctx, chatID, chunk, 0, threadID); err != nil {
+			replyTo = 0
+			for _, item := range chunk.items {
+				if err := c.sendTelegramMediaFollowUp(ctx, chatID, item.followUpText, threadID); err != nil {
 					return err
 				}
+			}
+			continue
+		}
+
+		for _, item := range chunk.items {
+			if err := c.sendSingleTelegramMediaItem(ctx, chatIDObj, item, replyTo, threadID); err != nil {
+				return err
+			}
+			replyTo = 0
+			if err := c.sendTelegramMediaFollowUp(ctx, chatID, item.followUpText, threadID); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
+func (c *Channel) validateOutboundMediaSize(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+
+	maxBytes := c.outboundMediaMaxBytes()
+	if info.Size() > maxBytes {
+		return fmt.Errorf("outbound media too large for Telegram upload: %d bytes (limit %d)", info.Size(), maxBytes)
+	}
+	return nil
+}
+
+func (c *Channel) outboundMediaMaxBytes() int64 {
+	if c.config.APIServer == "" {
+		return officialAPIOutboundMaxBytes
+	}
+	if c.config.MediaMaxBytes > localAPIDefaultMaxBytes {
+		return c.config.MediaMaxBytes
+	}
+	return localAPIDefaultMaxBytes
+}
+
 // sendHTML sends a single HTML message, falling back to plain text if Telegram rejects the HTML.
 // replyTo and threadID are optional (0 = omit). General topic (1) is handled by resolveThreadIDForSend.
-func (c *Channel) sendHTML(ctx context.Context, chatID int64, html string, replyTo, threadID int) error {
-	tgMsg := tu.Message(tu.ID(chatID), html)
+func (c *Channel) sendHTML(ctx context.Context, chatID int64, htmlContent string, replyTo, threadID int) error {
+	return c.sendHTMLWithDepth(ctx, chatID, htmlContent, replyTo, threadID, 0)
+}
+
+func (c *Channel) updatePlaceholder(ctx context.Context, localKey string, chatID int64, content string, replyTo, threadID int) error {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	htmlContent := html.EscapeString(content)
+	if pID, ok := c.placeholders.Load(localKey); ok {
+		_ = c.editMessage(ctx, chatID, pID.(int), htmlContent)
+		return nil
+	}
+
+	msg, err := c.sendPlaceholder(ctx, chatID, htmlContent, replyTo, threadID)
+	if err != nil {
+		if newChatID := extractMigrateChatID(err); newChatID != 0 {
+			slog.Info("telegram: group migrated to supergroup (placeholder update)",
+				"old_chat_id", chatID, "new_chat_id", newChatID)
+			c.migrateGroupChat(ctx, chatID, newChatID)
+			msg, err = c.sendPlaceholder(ctx, newChatID, htmlContent, replyTo, threadID)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if msg != nil && msg.MessageID > 0 {
+		c.placeholders.Store(localKey, msg.MessageID)
+	}
+	return nil
+}
+
+func (c *Channel) sendPlaceholder(ctx context.Context, chatID int64, htmlContent string, replyTo, threadID int) (*telego.Message, error) {
+	tgMsg := tu.Message(tu.ID(chatID), htmlContent)
+	tgMsg.ParseMode = telego.ModeHTML
+	if sendThreadID := resolveThreadIDForSend(threadID); sendThreadID > 0 {
+		tgMsg.MessageThreadID = sendThreadID
+	}
+	if replyTo > 0 {
+		tgMsg.ReplyParameters = &telego.ReplyParameters{
+			MessageID:                replyTo,
+			AllowSendingWithoutReply: true,
+		}
+	}
+
+	var sent *telego.Message
+	err := c.retrySend(ctx, "sendMessage", nil, func(ctx context.Context) error {
+		var sendErr error
+		sent, sendErr = c.bot.SendMessage(ctx, tgMsg)
+		return sendErr
+	})
+	return sent, err
+}
+
+func (c *Channel) sendHTMLWithDepth(ctx context.Context, chatID int64, htmlContent string, replyTo, threadID, depth int) error {
+	tgMsg := tu.Message(tu.ID(chatID), htmlContent)
 	tgMsg.ParseMode = telego.ModeHTML
 
 	// TS ref: buildTelegramThreadParams() — General topic (1) must be omitted.
@@ -177,19 +484,90 @@ func (c *Channel) sendHTML(ctx context.Context, chatID int64, html string, reply
 		tgMsg.MessageThreadID = sendThreadID
 	}
 	if replyTo > 0 {
-		tgMsg.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo}
+		tgMsg.ReplyParameters = &telego.ReplyParameters{
+			MessageID:                replyTo,
+			AllowSendingWithoutReply: true, // don't fail if replied-to message was deleted
+		}
 	}
 
-	if _, err := c.bot.SendMessage(ctx, tgMsg); err != nil {
-		if parseErrRe.MatchString(err.Error()) {
+	err := c.retrySend(ctx, "sendMessage", nil, func(ctx context.Context) error {
+		_, e := c.bot.SendMessage(ctx, tgMsg)
+		return e
+	})
+
+	if err != nil {
+		// Case 0: Group migrated to supergroup — update DB and retry with new chat ID.
+		if newChatID := extractMigrateChatID(err); newChatID != 0 {
+			slog.Info("telegram: group migrated to supergroup (send-path)",
+				"old_chat_id", chatID, "new_chat_id", newChatID)
+			c.migrateGroupChat(ctx, chatID, newChatID)
+			if depth < maxSplitDepth {
+				return c.sendHTMLWithDepth(ctx, newChatID, htmlContent, replyTo, threadID, depth+1)
+			}
+			return fmt.Errorf("migration retry depth exceeded: %w", err)
+		}
+
+		errStr := err.Error()
+
+		// Case 1: Message too long. Split into smaller chunks and send individually.
+		if messageTooLongRe.MatchString(errStr) {
+			if depth >= maxSplitDepth {
+				return fmt.Errorf("max split depth (%d) exceeded: %w", maxSplitDepth, err)
+			}
+			slog.Warn("Telegram rejected message as too long, splitting further", "len", len(htmlContent), "depth", depth)
+			newMaxLen := len(htmlContent) / 2
+			if newMaxLen < 100 {
+				return err // too small to split meaningfully
+			}
+
+			innerChunks := chunkHTML(htmlContent, newMaxLen)
+			for i, chunk := range innerChunks {
+				r := 0
+				if i == 0 {
+					r = replyTo
+				}
+				if sendErr := c.sendHTMLWithDepth(ctx, chatID, chunk, r, threadID, depth+1); sendErr != nil {
+					return sendErr
+				}
+			}
+			return nil
+		}
+
+		// Case 2: Parse error. Fallback to plain text.
+		if parseErrRe.MatchString(errStr) {
 			slog.Warn("HTML parse failed, falling back to plain text", "error", err)
 			tgMsg.ParseMode = ""
+			tgMsg.Text = stripHTML(htmlContent)
 			_, err = c.bot.SendMessage(ctx, tgMsg)
-			return err
+
+			// If plain text is STILL too long, split it.
+			if err != nil && messageTooLongRe.MatchString(err.Error()) {
+				slog.Warn("Plain text fallback too long, splitting further", "len", len(tgMsg.Text))
+				innerChunks := chunkPlainText(tgMsg.Text, 4000) // use default safe limit
+				for i, chunk := range innerChunks {
+					msg := tu.Message(tu.ID(chatID), chunk)
+					msg.ReplyParameters = tgMsg.ReplyParameters
+					if i > 0 {
+						msg.ReplyParameters = nil
+					}
+					msg.MessageThreadID = tgMsg.MessageThreadID
+					_, err = c.bot.SendMessage(ctx, msg)
+					if err != nil {
+						return err
+					}
+				}
+				return nil
+			}
 		}
-		return err
+
+		// Case 3: Thread not found. Re-check err (may have changed after Case 2 fallback).
+		if err != nil && tgMsg.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
+			slog.Warn("thread not found, retrying without message_thread_id", "thread_id", tgMsg.MessageThreadID)
+			tgMsg.MessageThreadID = 0
+			_, err = c.bot.SendMessage(ctx, tgMsg)
+		}
 	}
-	return nil
+	return err
 }
 
 // sendPhoto sends a photo message.
@@ -212,10 +590,26 @@ func (c *Channel) sendPhoto(ctx context.Context, chatID telego.ChatID, filePath,
 		params.MessageThreadID = sendThreadID
 	}
 	if replyTo > 0 {
-		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo}
+		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo, AllowSendingWithoutReply: true}
 	}
 
-	_, err = c.bot.SendPhoto(ctx, params)
+	err = c.retrySend(ctx, "sendPhoto", func() { file.Seek(0, 0) }, func(ctx context.Context) error {
+		_, e := c.bot.SendPhoto(ctx, params)
+		return e
+	})
+	if err != nil && parseErrRe.MatchString(err.Error()) {
+		slog.Warn("sendPhoto: HTML parse failed, retrying with plain text caption", "error", err)
+		file.Seek(0, 0)
+		params.ParseMode = ""
+		params.Caption = stripHTML(params.Caption)
+		_, err = c.bot.SendPhoto(ctx, params)
+	}
+	if err != nil && params.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
+		slog.Warn("sendPhoto: thread not found, retrying without thread", "thread_id", params.MessageThreadID)
+		file.Seek(0, 0)
+		params.MessageThreadID = 0
+		_, err = c.bot.SendPhoto(ctx, params)
+	}
 	return err
 }
 
@@ -239,10 +633,26 @@ func (c *Channel) sendVideo(ctx context.Context, chatID telego.ChatID, filePath,
 		params.MessageThreadID = sendThreadID
 	}
 	if replyTo > 0 {
-		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo}
+		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo, AllowSendingWithoutReply: true}
 	}
 
-	_, err = c.bot.SendVideo(ctx, params)
+	err = c.retrySend(ctx, "sendVideo", func() { file.Seek(0, 0) }, func(ctx context.Context) error {
+		_, e := c.bot.SendVideo(ctx, params)
+		return e
+	})
+	if err != nil && parseErrRe.MatchString(err.Error()) {
+		slog.Warn("sendVideo: HTML parse failed, retrying with plain text caption", "error", err)
+		file.Seek(0, 0)
+		params.ParseMode = ""
+		params.Caption = stripHTML(params.Caption)
+		_, err = c.bot.SendVideo(ctx, params)
+	}
+	if err != nil && params.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
+		slog.Warn("sendVideo: thread not found, retrying without thread", "thread_id", params.MessageThreadID)
+		file.Seek(0, 0)
+		params.MessageThreadID = 0
+		_, err = c.bot.SendVideo(ctx, params)
+	}
 	return err
 }
 
@@ -266,11 +676,78 @@ func (c *Channel) sendAudio(ctx context.Context, chatID telego.ChatID, filePath,
 		params.MessageThreadID = sendThreadID
 	}
 	if replyTo > 0 {
-		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo}
+		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo, AllowSendingWithoutReply: true}
 	}
 
-	_, err = c.bot.SendAudio(ctx, params)
+	err = c.retrySend(ctx, "sendAudio", func() { file.Seek(0, 0) }, func(ctx context.Context) error {
+		_, e := c.bot.SendAudio(ctx, params)
+		return e
+	})
+	if err != nil && parseErrRe.MatchString(err.Error()) {
+		slog.Warn("sendAudio: HTML parse failed, retrying with plain text caption", "error", err)
+		file.Seek(0, 0)
+		params.ParseMode = ""
+		params.Caption = stripHTML(params.Caption)
+		_, err = c.bot.SendAudio(ctx, params)
+	}
+	if err != nil && params.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
+		slog.Warn("sendAudio: thread not found, retrying without thread", "thread_id", params.MessageThreadID)
+		file.Seek(0, 0)
+		params.MessageThreadID = 0
+		_, err = c.bot.SendAudio(ctx, params)
+	}
 	return err
+}
+
+// sendVoice sends an audio file as a voice message (inline playable bubble).
+// Telegram supports OGG (Opus), MP3, and M4A for voice messages.
+func (c *Channel) sendVoice(ctx context.Context, chatID telego.ChatID, filePath, caption string, replyTo, threadID int) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open voice %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	params := &telego.SendVoiceParams{
+		ChatID:  chatID,
+		Voice:   telego.InputFile{File: file},
+		Caption: caption,
+	}
+	if caption != "" {
+		params.ParseMode = telego.ModeHTML
+	}
+	if sendThreadID := resolveThreadIDForSend(threadID); sendThreadID > 0 {
+		params.MessageThreadID = sendThreadID
+	}
+	if replyTo > 0 {
+		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo, AllowSendingWithoutReply: true}
+	}
+
+	err = c.retrySend(ctx, "sendVoice", func() { file.Seek(0, 0) }, func(ctx context.Context) error {
+		_, e := c.bot.SendVoice(ctx, params)
+		return e
+	})
+	if err != nil && parseErrRe.MatchString(err.Error()) {
+		slog.Warn("sendVoice: HTML parse failed, retrying with plain text caption", "error", err)
+		file.Seek(0, 0)
+		params.ParseMode = ""
+		params.Caption = stripHTML(params.Caption)
+		_, err = c.bot.SendVoice(ctx, params)
+	}
+	if err != nil && params.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
+		slog.Warn("sendVoice: thread not found, retrying without thread", "thread_id", params.MessageThreadID)
+		file.Seek(0, 0)
+		params.MessageThreadID = 0
+		_, err = c.bot.SendVoice(ctx, params)
+	}
+	return err
+}
+
+// isVoiceCompatible returns true if content-type is supported by Telegram SendVoice.
+// Supported: OGG (Opus), MP3, M4A per Telegram Bot API docs.
+func isVoiceCompatible(ct string) bool {
+	return ct == "audio/ogg" || ct == "audio/mpeg" || ct == "audio/mp3" ||
+		ct == "audio/m4a" || ct == "audio/x-m4a"
 }
 
 // sendDocument sends a document/file message.
@@ -293,27 +770,132 @@ func (c *Channel) sendDocument(ctx context.Context, chatID telego.ChatID, filePa
 		params.MessageThreadID = sendThreadID
 	}
 	if replyTo > 0 {
-		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo}
+		params.ReplyParameters = &telego.ReplyParameters{MessageID: replyTo, AllowSendingWithoutReply: true}
 	}
 
-	_, err = c.bot.SendDocument(ctx, params)
+	err = c.retrySend(ctx, "sendDocument", func() { file.Seek(0, 0) }, func(ctx context.Context) error {
+		_, e := c.bot.SendDocument(ctx, params)
+		return e
+	})
+	if err != nil && parseErrRe.MatchString(err.Error()) {
+		slog.Warn("sendDocument: HTML parse failed, retrying with plain text caption", "error", err)
+		file.Seek(0, 0)
+		params.ParseMode = ""
+		params.Caption = stripHTML(params.Caption)
+		_, err = c.bot.SendDocument(ctx, params)
+	}
+	if err != nil && params.MessageThreadID != 0 && threadNotFoundRe.MatchString(err.Error()) {
+		slog.Warn("sendDocument: thread not found, retrying without thread", "thread_id", params.MessageThreadID)
+		file.Seek(0, 0)
+		params.MessageThreadID = 0
+		_, err = c.bot.SendDocument(ctx, params)
+	}
 	return err
 }
 
+// EditMessage edits an existing message's text by chat id string, applying the
+// same markdown→HTML rendering as outbound sends. Implements channels.MessageEditor
+// so the agent's `message` tool (action=edit) can flip status markers in place.
+// The bot must be an admin with edit rights in the target chat/channel.
+func (c *Channel) EditMessage(ctx context.Context, chatID string, messageID int, content string) error {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid telegram chat id %q: %w", chatID, err)
+	}
+	html := markdownToTelegramHTML(content)
+	err = c.editMessage(ctx, id, messageID, html)
+	// Media messages (photo/document with a caption, e.g. a receipt image with a
+	// status line) have no text — editMessageText returns "there is no text in the
+	// message to edit". Fall back to editing the caption instead.
+	if err != nil && noTextToEditRe.MatchString(err.Error()) {
+		return c.editMessageCaption(ctx, id, messageID, html)
+	}
+	return err
+}
+
+// ReactToMessage sets a single emoji reaction on a message (implements
+// channels.MessageReactor). Only Telegram-supported reaction emojis are allowed
+// — ✅/❌ are not among them, so callers must pass e.g. 👍. Reacting to the bot's
+// own status post is allowed.
+func (c *Channel) ReactToMessage(ctx context.Context, chatID string, messageID int, emoji string) error {
+	if !telegramSupportedEmojis[emoji] {
+		return fmt.Errorf("emoji %q is not a supported Telegram reaction", emoji)
+	}
+	id, err := parseRawChatID(chatID)
+	if err != nil {
+		return fmt.Errorf("invalid telegram chat id %q: %w", chatID, err)
+	}
+	return c.bot.SetMessageReaction(ctx, &telego.SetMessageReactionParams{
+		ChatID:    tu.ID(id),
+		MessageID: messageID,
+		Reaction: []telego.ReactionType{
+			&telego.ReactionTypeEmoji{Type: telego.ReactionEmoji, Emoji: emoji},
+		},
+	})
+}
+
+// editMessageCaption edits the caption of a media message (photo/document).
+func (c *Channel) editMessageCaption(ctx context.Context, chatID int64, messageID int, htmlCaption string) error {
+	editCap := &telego.EditMessageCaptionParams{
+		ChatID:    tu.ID(chatID),
+		MessageID: messageID,
+		Caption:   htmlCaption,
+		ParseMode: telego.ModeHTML,
+	}
+	return c.retrySend(ctx, "editMessageCaption", nil, func(ctx context.Context) error {
+		_, err := c.bot.EditMessageCaption(ctx, editCap)
+		if err != nil && messageNotModifiedRe.MatchString(err.Error()) {
+			return nil
+		}
+		return err
+	})
+}
+
+// PostToTopic posts a message into a forum topic (thread) and returns the sent
+// message id, so the agent can remember it and edit that exact post later.
+// Implements channels.TopicMessagePoster. Applies the same markdown→HTML render
+// as regular sends. threadID <= 0 posts to the group's General topic.
+func (c *Channel) PostToTopic(ctx context.Context, chatID string, threadID int, content string) (int, error) {
+	id, err := strconv.ParseInt(chatID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid telegram chat id %q: %w", chatID, err)
+	}
+	msg := tu.Message(tu.ID(id), markdownToTelegramHTML(content))
+	msg.ParseMode = telego.ModeHTML
+	if threadID > 0 {
+		msg.MessageThreadID = threadID
+	}
+	var sentID int
+	err = c.retrySend(ctx, "sendMessage", nil, func(ctx context.Context) error {
+		sent, e := c.bot.SendMessage(ctx, msg)
+		if e != nil {
+			return e
+		}
+		if sent != nil {
+			sentID = sent.MessageID
+		}
+		return nil
+	})
+	return sentID, err
+}
+
 // editMessage edits an existing message's text.
+// Uses retrySend since edits are idempotent and may fail on transient network issues.
 func (c *Channel) editMessage(ctx context.Context, chatID int64, messageID int, htmlText string) error {
 	editMsg := tu.EditMessageText(tu.ID(chatID), messageID, htmlText)
 	editMsg.ParseMode = telego.ModeHTML
 
-	_, err := c.bot.EditMessageText(ctx, editMsg)
-	if err != nil {
-		// Ignore "message is not modified" errors (idempotent edit)
-		if messageNotModifiedRe.MatchString(err.Error()) {
-			return nil
+	return c.retrySend(ctx, "editMessage", nil, func(ctx context.Context) error {
+		_, err := c.bot.EditMessageText(ctx, editMsg)
+		if err != nil {
+			// Ignore "message is not modified" errors (idempotent edit)
+			if messageNotModifiedRe.MatchString(err.Error()) {
+				return nil
+			}
+			return err
 		}
-		return err
-	}
-	return nil
+		return nil
+	})
 }
 
 // deleteMessage deletes a message from the chat.

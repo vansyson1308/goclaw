@@ -13,35 +13,42 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 const (
-	apiBase            = "https://bot-api.zaloplatforms.com"
-	defaultPollTimeout = 30
-	maxTextLength      = 2000
-	defaultMediaMaxMB  = 5
-	pollErrorBackoff   = 5 * time.Second
-	pairingDebounce    = 60 * time.Second
+	defaultPollTimeout  = 30
+	maxTextLength       = 2000
+	defaultMediaMaxMB   = 5
+	pollErrorBackoff    = 5 * time.Second
+	pairingDebounce     = 60 * time.Second
+	pollTimeoutHeadroom = 7 * time.Second
 )
+
+// apiBase is the Zalo Bot API root. Declared as a variable so tests can
+// override it with an httptest.NewServer URL.
+var apiBase = "https://bot-api.zaloplatforms.com"
 
 // Channel connects to the Zalo OA Bot API.
 type Channel struct {
 	*channels.BaseChannel
-	token          string
-	dmPolicy       string
-	mediaMaxMB     int
-	pairingService store.PairingStore
-	pairingDebounce sync.Map // senderID → time.Time
-	stopCh         chan struct{}
-	client         *http.Client
+	token        string
+	dmPolicy     string
+	mediaMaxMB   int
+	blockReply   *bool
+	chatBehavior *config.ChatBehaviorConfig
+	stopCh       chan struct{}
+	client       *http.Client
+	pollClient   *http.Client
+	// pairingService, pairingDebounce are inherited from channels.BaseChannel.
 }
 
 // New creates a new Zalo channel.
@@ -51,6 +58,7 @@ func New(cfg config.ZaloConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 	}
 
 	base := channels.NewBaseChannel("zalo", msgBus, cfg.AllowFrom)
+	base.ValidatePolicy(cfg.DMPolicy, "")
 
 	dmPolicy := cfg.DMPolicy
 	if dmPolicy == "" {
@@ -62,16 +70,26 @@ func New(cfg config.ZaloConfig, msgBus *bus.MessageBus, pairingSvc store.Pairing
 		mediaMax = defaultMediaMaxMB
 	}
 
-	return &Channel{
-		BaseChannel:    base,
-		token:          cfg.Token,
-		dmPolicy:       dmPolicy,
-		mediaMaxMB:     mediaMax,
-		pairingService: pairingSvc,
-		stopCh:         make(chan struct{}),
-		client:         &http.Client{Timeout: 60 * time.Second},
-	}, nil
+	ch := &Channel{
+		BaseChannel:  base,
+		token:        cfg.Token,
+		dmPolicy:     dmPolicy,
+		mediaMaxMB:   mediaMax,
+		blockReply:   cfg.BlockReply,
+		chatBehavior: cfg.ChatBehavior,
+		stopCh:       make(chan struct{}),
+		client:       &http.Client{Timeout: 60 * time.Second},
+		pollClient:   &http.Client{Timeout: 0},
+	}
+	ch.SetPairingService(pairingSvc)
+	return ch, nil
 }
+
+// BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
+func (c *Channel) BlockReplyEnabled() *bool { return c.blockReply }
+
+// ChatBehaviorConfig returns the per-channel chat_behavior override.
+func (c *Channel) ChatBehaviorConfig() *config.ChatBehaviorConfig { return c.chatBehavior }
 
 // Start begins polling for Zalo updates.
 func (c *Channel) Start(ctx context.Context) error {
@@ -104,6 +122,9 @@ func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
 	if !c.IsRunning() {
 		return fmt.Errorf("zalo bot not running")
 	}
+
+	// Strip markdown — Zalo does not support any markup rendering.
+	msg.Content = StripMarkdown(msg.Content)
 
 	// Check for media in content (URL-based photo sending)
 	if strings.Contains(msg.Content, "[photo:") {
@@ -176,14 +197,20 @@ func (c *Channel) processUpdate(update zaloUpdate) {
 }
 
 func (c *Channel) handleTextMessage(msg *zaloMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.From.ID
+	if senderID == "" {
+		slog.Warn("zalo: dropping text message with empty sender ID", "message_id", msg.MessageID)
+		return
+	}
 	chatID := msg.Chat.ID
 	if chatID == "" {
 		chatID = senderID
 	}
 
 	// DM policy enforcement (Zalo is DM-only)
-	if !c.checkDMPolicy(senderID, chatID) {
+	if !c.checkDMPolicy(ctx, senderID, chatID) {
 		return
 	}
 
@@ -203,17 +230,23 @@ func (c *Channel) handleTextMessage(msg *zaloMessage) {
 		"platform":   "zalo",
 	}
 
-	c.HandleMessage(senderID, chatID, content, nil, metadata, "direct")
+	c.HandleAuthorizedMessage(senderID, chatID, content, nil, metadata, "direct")
 }
 
 func (c *Channel) handleImageMessage(msg *zaloMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.From.ID
+	if senderID == "" {
+		slog.Warn("zalo: dropping image message with empty sender ID", "message_id", msg.MessageID)
+		return
+	}
 	chatID := msg.Chat.ID
 	if chatID == "" {
 		chatID = senderID
 	}
 
-	if !c.checkDMPolicy(senderID, chatID) {
+	if !c.checkDMPolicy(ctx, senderID, chatID) {
 		return
 	}
 
@@ -222,14 +255,32 @@ func (c *Channel) handleImageMessage(msg *zaloMessage) {
 		content = "[image]"
 	}
 
+	// Download photo from Zalo CDN to local temp file (CDN URLs are auth-restricted/expiring)
 	var media []string
-	if msg.Photo != "" {
-		media = []string{msg.Photo}
+	var photoURL string
+	switch {
+	case msg.PhotoURL != "":
+		photoURL = msg.PhotoURL
+	case msg.Photo != "":
+		photoURL = msg.Photo
 	}
 
-	slog.Debug("zalo image message received",
+	if photoURL != "" {
+		localPath, err := c.downloadMedia(photoURL)
+		if err != nil {
+			slog.Warn("zalo photo download failed, passing URL as fallback",
+				"photo_url", photoURL, "error", err)
+			media = []string{photoURL}
+		} else {
+			media = []string{localPath}
+		}
+	}
+
+	slog.Info("zalo image message received",
 		"sender_id", senderID,
 		"chat_id", chatID,
+		"photo_url", photoURL,
+		"has_media", len(media) > 0,
 	)
 
 	metadata := map[string]string{
@@ -237,93 +288,108 @@ func (c *Channel) handleImageMessage(msg *zaloMessage) {
 		"platform":   "zalo",
 	}
 
-	c.HandleMessage(senderID, chatID, content, media, metadata, "direct")
+	c.HandleAuthorizedMessage(senderID, chatID, content, media, metadata, "direct")
 }
 
 // --- DM Policy ---
 
-func (c *Channel) checkDMPolicy(senderID, chatID string) bool {
-	switch c.dmPolicy {
-	case "disabled":
-		slog.Debug("zalo message rejected: DMs disabled", "sender_id", senderID)
+func (c *Channel) checkDMPolicy(ctx context.Context, senderID, chatID string) bool {
+	result := c.CheckDMPolicy(ctx, senderID, c.dmPolicy)
+	switch result {
+	case channels.PolicyAllow:
+		return true
+	case channels.PolicyNeedsPairing:
+		c.sendPairingReply(ctx, senderID, chatID)
 		return false
-
-	case "open":
-		return true
-
-	case "allowlist":
-		if !c.IsAllowed(senderID) {
-			slog.Debug("zalo message rejected by allowlist", "sender_id", senderID)
-			return false
-		}
-		return true
-
-	default: // "pairing"
-		// Check if already paired or in allowlist
-		paired := false
-		if c.pairingService != nil {
-			paired = c.pairingService.IsPaired(senderID, c.Name())
-		}
-		inAllowList := c.HasAllowList() && c.IsAllowed(senderID)
-
-		if paired || inAllowList {
-			return true
-		}
-
-		// Send pairing reply (debounced)
-		c.sendPairingReply(senderID, chatID)
+	default:
+		slog.Debug("zalo message rejected by policy", "sender_id", senderID, "policy", c.dmPolicy)
 		return false
 	}
 }
 
-func (c *Channel) sendPairingReply(senderID, chatID string) {
-	if c.pairingService == nil {
+func (c *Channel) sendPairingReply(ctx context.Context, senderID, chatID string) {
+	ps := c.PairingService()
+	if ps == nil {
 		return
 	}
 
-	// Debounce
-	if lastSent, ok := c.pairingDebounce.Load(senderID); ok {
-		if time.Since(lastSent.(time.Time)) < pairingDebounce {
-			return
-		}
+	if !c.CanSendPairingNotif(senderID, pairingDebounce) {
+		return
 	}
 
-	code, err := c.pairingService.RequestPairing(senderID, c.Name(), chatID, "default")
+	code, err := ps.RequestPairing(ctx, senderID, c.Name(), chatID, "default", nil)
 	if err != nil {
 		slog.Debug("zalo pairing request failed", "sender_id", senderID, "error", err)
 		return
 	}
 
-	replyText := fmt.Sprintf(
-		"GoClaw: access not configured.\n\nYour Zalo user id: %s\n\nPairing code: %s\n\nAsk the bot owner to approve with:\n  goclaw pairing approve %s",
-		senderID, code, code,
-	)
+	replyText := c.SystemMessage("", systemmessages.KeyPairingAccountRequired, systemmessages.Vars{
+		"platform":  "Zalo",
+		"sender_id": senderID,
+		"code":      code,
+	})
 
 	if err := c.sendMessage(chatID, replyText); err != nil {
 		slog.Warn("failed to send zalo pairing reply", "error", err)
 	} else {
-		c.pairingDebounce.Store(senderID, time.Now())
+		c.MarkPairingNotifSent(senderID)
 		slog.Info("zalo pairing reply sent", "sender_id", senderID, "code", code)
 	}
+}
+
+// --- Media download ---
+
+const maxMediaBytes = 10 * 1024 * 1024 // 10MB
+
+// downloadMedia fetches a photo from a Zalo CDN URL and saves it as a local temp file.
+// Zalo CDN URLs are auth-restricted and expire, so we must download immediately.
+func (c *Channel) downloadMedia(url string) (string, error) {
+	resp, err := c.client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	// Detect extension from Content-Type
+	ext := ".jpg"
+	ct := resp.Header.Get("Content-Type")
+	switch {
+	case strings.Contains(ct, "png"):
+		ext = ".png"
+	case strings.Contains(ct, "gif"):
+		ext = ".gif"
+	case strings.Contains(ct, "webp"):
+		ext = ".webp"
+	}
+
+	f, err := os.CreateTemp("", "goclaw_zalo_*"+ext)
+	if err != nil {
+		return "", fmt.Errorf("create temp: %w", err)
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxMediaBytes))
+	if err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("write: %w", err)
+	}
+	if n == 0 {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("empty response")
+	}
+
+	slog.Debug("zalo media downloaded", "path", f.Name(), "size", n)
+	return f.Name(), nil
 }
 
 // --- Chunked text sending ---
 
 func (c *Channel) sendChunkedText(chatID, text string) error {
-	for len(text) > 0 {
-		chunk := text
-		if len(chunk) > maxTextLength {
-			// Try to break at newline
-			cutAt := maxTextLength
-			if idx := strings.LastIndex(text[:maxTextLength], "\n"); idx > maxTextLength/2 {
-				cutAt = idx + 1
-			}
-			chunk = text[:cutAt]
-			text = text[cutAt:]
-		} else {
-			text = ""
-		}
-
+	for _, chunk := range channels.ChunkMarkdown(text, maxTextLength) {
 		if err := c.sendMessage(chatID, chunk); err != nil {
 			return err
 		}
@@ -342,13 +408,14 @@ type zaloAPIResponse struct {
 
 type zaloBotInfo struct {
 	ID   string `json:"id"`
-	Name string `json:"name"`
+	Name string `json:"display_name"`
 }
 
 type zaloMessage struct {
 	MessageID string   `json:"message_id"`
 	Text      string   `json:"text"`
 	Photo     string   `json:"photo"`
+	PhotoURL  string   `json:"photo_url"`
 	Caption   string   `json:"caption"`
 	From      zaloFrom `json:"from"`
 	Chat      zaloChat `json:"chat"`
@@ -357,12 +424,12 @@ type zaloMessage struct {
 
 type zaloFrom struct {
 	ID       string `json:"id"`
-	Username string `json:"username"`
+	Username string `json:"display_name"`
 }
 
 type zaloChat struct {
 	ID   string `json:"id"`
-	Type string `json:"type"`
+	Type string `json:"chat_type"`
 }
 
 type zaloUpdate struct {
@@ -370,7 +437,11 @@ type zaloUpdate struct {
 	Message   *zaloMessage `json:"message,omitempty"`
 }
 
-func (c *Channel) callAPI(method string, body interface{}) (json.RawMessage, error) {
+func (c *Channel) callAPI(method string, body any) (json.RawMessage, error) {
+	return c.callAPIWith(context.Background(), c.client, method, body)
+}
+
+func (c *Channel) callAPIWith(ctx context.Context, client *http.Client, method string, body any) (json.RawMessage, error) {
 	url := fmt.Sprintf("%s/bot%s/%s", apiBase, c.token, method)
 
 	var reqBody io.Reader
@@ -382,7 +453,7 @@ func (c *Channel) callAPI(method string, body interface{}) (json.RawMessage, err
 		reqBody = bytes.NewReader(data)
 	}
 
-	req, err := http.NewRequest("POST", url, reqBody)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -390,7 +461,7 @@ func (c *Channel) callAPI(method string, body interface{}) (json.RawMessage, err
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("api call %s: %w", method, err)
 	}
@@ -427,24 +498,30 @@ func (c *Channel) getMe() (*zaloBotInfo, error) {
 }
 
 func (c *Channel) getUpdates(timeout int) ([]zaloUpdate, error) {
-	params := map[string]interface{}{
+	params := map[string]any{
 		"timeout": timeout,
 	}
 
-	result, err := c.callAPI("getUpdates", params)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second+pollTimeoutHeadroom)
+	defer cancel()
+
+	result, err := c.callAPIWith(ctx, c.pollClient, "getUpdates", params)
 	if err != nil {
 		return nil, err
 	}
 
-	var updates []zaloUpdate
-	if err := json.Unmarshal(result, &updates); err != nil {
+	var update zaloUpdate
+	if err := json.Unmarshal(result, &update); err != nil {
 		return nil, fmt.Errorf("unmarshal updates: %w", err)
 	}
-	return updates, nil
+	if update.EventName == "" {
+		return nil, nil
+	}
+	return []zaloUpdate{update}, nil
 }
 
 func (c *Channel) sendMessage(chatID, text string) error {
-	params := map[string]interface{}{
+	params := map[string]any{
 		"chat_id": chatID,
 		"text":    text,
 	}
@@ -454,7 +531,7 @@ func (c *Channel) sendMessage(chatID, text string) error {
 }
 
 func (c *Channel) sendPhoto(chatID, photoURL, caption string) error {
-	params := map[string]interface{}{
+	params := map[string]any{
 		"chat_id": chatID,
 		"photo":   photoURL,
 	}

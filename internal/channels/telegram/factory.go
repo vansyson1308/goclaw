@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
@@ -12,40 +13,64 @@ import (
 
 // telegramCreds maps the credentials JSON from the channel_instances table.
 type telegramCreds struct {
-	Token string `json:"token"`
-	Proxy string `json:"proxy,omitempty"`
+	Token     string `json:"token"`
+	Proxy     string `json:"proxy,omitempty"`
+	APIServer string `json:"api_server,omitempty"`
 }
 
 // telegramInstanceConfig maps the non-secret config JSONB from the channel_instances table.
 type telegramInstanceConfig struct {
-	DMPolicy       string   `json:"dm_policy,omitempty"`
-	GroupPolicy    string   `json:"group_policy,omitempty"`
-	RequireMention *bool    `json:"require_mention,omitempty"`
-	HistoryLimit   int      `json:"history_limit,omitempty"`
-	StreamMode     string   `json:"stream_mode,omitempty"`
-	ReactionLevel  string   `json:"reaction_level,omitempty"`
-	MediaMaxBytes  int64    `json:"media_max_bytes,omitempty"`
-	LinkPreview    *bool    `json:"link_preview,omitempty"`
-	AllowFrom      []string `json:"allow_from,omitempty"`
+	APIServer         string                                 `json:"api_server,omitempty"`
+	Proxy             string                                 `json:"proxy,omitempty"`
+	DMPolicy          string                                 `json:"dm_policy,omitempty"`
+	GroupPolicy       string                                 `json:"group_policy,omitempty"`
+	RequireMention    *bool                                  `json:"require_mention,omitempty"`
+	MentionMode       string                                 `json:"mention_mode,omitempty"`
+	HistoryLimit      int                                    `json:"history_limit,omitempty"`
+	DMStream          *bool                                  `json:"dm_stream,omitempty"`
+	GroupStream       *bool                                  `json:"group_stream,omitempty"`
+	DraftTransport    *bool                                  `json:"draft_transport,omitempty"` // sendMessageDraft for DM streaming (default true)
+	ReasoningDelivery string                                 `json:"reasoning_delivery,omitempty"`
+	ReasoningStream   *bool                                  `json:"reasoning_stream,omitempty"` // show reasoning as separate message (default true)
+	ReactionLevel     string                                 `json:"reaction_level,omitempty"`
+	MediaMaxMB        int64                                  `json:"media_max_mb,omitempty"`
+	MediaMaxBytes     int64                                  `json:"media_max_bytes,omitempty"` // deprecated: use media_max_mb
+	LinkPreview       *bool                                  `json:"link_preview,omitempty"`
+	BlockReply        *bool                                  `json:"block_reply,omitempty"`
+	ChatBehavior      *config.ChatBehaviorConfig             `json:"chat_behavior,omitempty"`
+	ForceIPv4         bool                                   `json:"force_ipv4,omitempty"`
+	AllowFrom         []string                               `json:"allow_from,omitempty"`
+	Groups            map[string]*config.TelegramGroupConfig `json:"groups,omitempty"`
+	TelegramManager   *config.TelegramManagerConfig          `json:"telegram_manager,omitempty"`
 }
 
-// Factory creates a Telegram channel from DB instance data (no agent/team store).
+// Factory creates a Telegram channel from DB instance data (no extra stores).
 func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-	return buildChannel(name, creds, cfg, msgBus, pairingSvc, nil, nil)
+	return buildChannel(name, creds, cfg, msgBus, pairingSvc, nil)
 }
 
-// FactoryWithStores returns a ChannelFactory that includes agent and team stores
-// for group file writer management and /tasks, /task_detail commands.
-func FactoryWithStores(agentStore store.AgentStore, teamStore store.TeamStore) channels.ChannelFactory {
+// FactoryWithStores returns a ChannelFactory that includes optional stores via functional options.
+func FactoryWithStores(agentStore store.AgentStore, configPermStore store.ConfigPermissionStore, teamStore store.TeamStore, subagentTaskStore store.SubagentTaskStore, pendingStore store.PendingMessageStore) channels.ChannelFactory {
+	return FactoryWithStoresAndAudio(agentStore, configPermStore, teamStore, subagentTaskStore, pendingStore, nil)
+}
+
+// FactoryWithStoresAndAudio returns a ChannelFactory with all stores and STT support.
+func FactoryWithStoresAndAudio(agentStore store.AgentStore, configPermStore store.ConfigPermissionStore, teamStore store.TeamStore, subagentTaskStore store.SubagentTaskStore, pendingStore store.PendingMessageStore, audioMgr *audio.Manager) channels.ChannelFactory {
 	return func(name string, creds json.RawMessage, cfg json.RawMessage,
 		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
-		return buildChannel(name, creds, cfg, msgBus, pairingSvc, agentStore, teamStore)
+		return buildChannel(name, creds, cfg, msgBus, pairingSvc, audioMgr,
+			WithAgentStore(agentStore),
+			WithConfigPermStore(configPermStore),
+			WithTeamStore(teamStore),
+			WithSubagentTaskStore(subagentTaskStore),
+			WithPendingMessageStore(pendingStore),
+		)
 	}
 }
 
 func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
-	msgBus *bus.MessageBus, pairingSvc store.PairingStore, agentStore store.AgentStore, teamStore store.TeamStore) (channels.Channel, error) {
+	msgBus *bus.MessageBus, pairingSvc store.PairingStore, audioMgr *audio.Manager, opts ...Option) (channels.Channel, error) {
 
 	var c telegramCreds
 	if len(creds) > 0 {
@@ -64,19 +89,40 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 		}
 	}
 
+	// Prefer config values; fall back to credentials for backward compat.
+	proxy := ic.Proxy
+	if proxy == "" {
+		proxy = c.Proxy
+	}
+	apiServer := ic.APIServer
+	if apiServer == "" {
+		apiServer = c.APIServer
+	}
+
 	tgCfg := config.TelegramConfig{
-		Enabled:        true,
-		Token:          c.Token,
-		Proxy:          c.Proxy,
-		AllowFrom:      ic.AllowFrom,
-		DMPolicy:       ic.DMPolicy,
-		GroupPolicy:    ic.GroupPolicy,
-		RequireMention: ic.RequireMention,
-		HistoryLimit:   ic.HistoryLimit,
-		StreamMode:     ic.StreamMode,
-		ReactionLevel:  ic.ReactionLevel,
-		MediaMaxBytes:  ic.MediaMaxBytes,
-		LinkPreview:    ic.LinkPreview,
+		Enabled:           true,
+		Token:             c.Token,
+		Proxy:             proxy,
+		APIServer:         apiServer,
+		AllowFrom:         ic.AllowFrom,
+		DMPolicy:          ic.DMPolicy,
+		GroupPolicy:       ic.GroupPolicy,
+		RequireMention:    ic.RequireMention,
+		MentionMode:       ic.MentionMode,
+		HistoryLimit:      ic.HistoryLimit,
+		DMStream:          ic.DMStream,
+		GroupStream:       ic.GroupStream,
+		DraftTransport:    ic.DraftTransport,
+		ReasoningDelivery: ic.ReasoningDelivery,
+		ReasoningStream:   ic.ReasoningStream,
+		ReactionLevel:     ic.ReactionLevel,
+		MediaMaxBytes:     resolveMediaMaxBytes(ic),
+		LinkPreview:       ic.LinkPreview,
+		BlockReply:        ic.BlockReply,
+		ChatBehavior:      ic.ChatBehavior,
+		ForceIPv4:         ic.ForceIPv4,
+		TelegramManager:   ic.TelegramManager,
+		Groups:            ic.Groups,
 	}
 
 	// DB instances default to "pairing" for groups (secure by default).
@@ -85,7 +131,7 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 		tgCfg.GroupPolicy = "pairing"
 	}
 
-	ch, err := New(tgCfg, msgBus, pairingSvc, agentStore, teamStore)
+	ch, err := New(tgCfg, msgBus, pairingSvc, audioMgr, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -93,4 +139,13 @@ func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
 	// Override the channel name from DB instance.
 	ch.SetName(name)
 	return ch, nil
+}
+
+// resolveMediaMaxBytes converts media_max_mb (preferred) to bytes,
+// falling back to the deprecated media_max_bytes for backward compat.
+func resolveMediaMaxBytes(ic telegramInstanceConfig) int64 {
+	if ic.MediaMaxMB > 0 {
+		return ic.MediaMaxMB * 1024 * 1024
+	}
+	return ic.MediaMaxBytes
 }

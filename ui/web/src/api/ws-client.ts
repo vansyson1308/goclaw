@@ -21,7 +21,22 @@ export class WsClient {
   private reconnectAttempts = 0;
   private authenticated = false;
   private intentionalClose = false;
+  private pairingInProgress = false;
   private connectGeneration = 0;
+
+  /** Server-assigned role from connect response. */
+  role: "owner" | "admin" | "operator" | "viewer" | "" = "";
+
+  /** Tenant fields from connect response. */
+  tenantId = "";
+  tenantName = "";
+  tenantSlug = "";
+  isOwner = false;
+  /** Server-derived: caller qualifies for master-only actions (owner OR on master tenant). Advisory UI hint only — backend still enforces. */
+  isMasterScope = false;
+  /** Server edition, drives UI feature gating. */
+  edition: "standard" | "lite" = "standard";
+  serverVersion = "";
 
   private readonly maxReconnectDelay = 30_000;
   private readonly baseReconnectDelay = 1_000;
@@ -80,6 +95,7 @@ export class WsClient {
 
   disconnect(): void {
     this.intentionalClose = true;
+    this.pairingInProgress = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -99,13 +115,27 @@ export class WsClient {
   }
 
   /**
-   * Send an RPC call and wait for the response.
+   * Reset the timeout for a pending RPC call (e.g. when stream events arrive).
    */
-  async call<T = unknown>(
+  resetTimeout(requestId: string, timeoutMs: number): void {
+    const pending = this.pending.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    pending.timeout = setTimeout(() => {
+      this.pending.delete(requestId);
+      pending.reject(new ApiError("AGENT_TIMEOUT", `timed out after ${timeoutMs}ms of inactivity`));
+    }, timeoutMs);
+  }
+
+  /**
+   * Send an RPC call and wait for the response.
+   * Returns { promise, requestId } so callers can reset the timeout on activity.
+   */
+  callWithId<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
     timeoutMs?: number,
-  ): Promise<T> {
+  ): { promise: Promise<T>; requestId: string } {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new ApiError("UNAVAILABLE", "WebSocket not connected");
     }
@@ -113,7 +143,7 @@ export class WsClient {
     const id = generateId();
     const timeout = timeoutMs ?? this.defaultTimeout;
 
-    return new Promise<T>((resolve, reject) => {
+    const promise = new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new ApiError("AGENT_TIMEOUT", `${method} timed out after ${timeout}ms`));
@@ -129,6 +159,19 @@ export class WsClient {
         JSON.stringify({ type: "req", id, method, params }),
       );
     });
+
+    return { promise, requestId: id };
+  }
+
+  /**
+   * Send an RPC call and wait for the response.
+   */
+  async call<T = unknown>(
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<T> {
+    return this.callWithId<T>(method, params, timeoutMs).promise;
   }
 
   /**
@@ -166,20 +209,34 @@ export class WsClient {
         status?: string;
         pairing_code?: string;
         sender_id?: string;
+        tenant_id?: string;
+        tenant_name?: string;
+        tenant_slug?: string;
+        is_owner?: boolean;
+        is_master_scope?: boolean;
+        edition?: "standard" | "lite";
+        server?: { name?: string; version?: string };
       }>("connect", {
         token: this.getToken(),
         user_id: this.getUserId(),
         sender_id: this.getSenderID(),
+        locale: localStorage.getItem("goclaw:language") || "en",
+        tenant_hint: localStorage.getItem("goclaw:tenant_hint") || "",
+        tenant_id: localStorage.getItem("goclaw:tenant_id") || "",
         protocolVersion: PROTOCOL_VERSION,
       });
       if (this.connectGeneration !== generation) return;
 
       // Browser pairing: server requires approval
       if (res?.status === "pending_pairing" && res.pairing_code && res.sender_id) {
-        this.onPairingRequired?.(res.pairing_code, res.sender_id);
+        if (!this.pairingInProgress) {
+          this.pairingInProgress = true;
+          this.onPairingRequired?.(res.pairing_code, res.sender_id);
+        }
         // Keep connection alive for polling browser.pairing.status
         return;
       }
+      this.pairingInProgress = false;
 
       // Server accepted connection but assigned viewer role → token is invalid
       if (this.getToken() && res?.role === "viewer") {
@@ -190,9 +247,25 @@ export class WsClient {
       }
 
       this.authenticated = true;
+      this.role = (res?.role as "owner" | "admin" | "operator" | "viewer") ?? "";
+      this.tenantId = res?.tenant_id ?? "";
+      this.tenantName = res?.tenant_name ?? "";
+      this.tenantSlug = res?.tenant_slug ?? "";
+      this.isOwner = res?.is_owner ?? false;
+      this.isMasterScope = res?.is_master_scope ?? false;
+      this.edition = res?.edition ?? "standard";
+      this.serverVersion = res?.server?.version ?? "";
       this.onStateChange("connected");
-    } catch {
+    } catch (e) {
       if (this.connectGeneration === generation) {
+        // Tenant access revoked → force logout instead of reconnect
+        if (e instanceof ApiError && e.code === "TENANT_ACCESS_REVOKED") {
+          this.intentionalClose = true;
+          this.ws?.close();
+          this.onAuthFailure?.();
+          return;
+        }
+        this.intentionalClose = true;
         this.ws?.close();
       }
     }
@@ -224,7 +297,10 @@ export class WsClient {
       pending.resolve(frame.payload);
     } else {
       const err = frame.error as ErrorShape;
-      if (err.code === "UNAUTHORIZED") {
+      // Only force logout on tenant revocation (session-level invalidation).
+      // UNAUTHORIZED from a method call means "insufficient permission for this action",
+      // not "session expired" — let the caller handle it via the rejected promise.
+      if (err.code === "TENANT_ACCESS_REVOKED") {
         this.onAuthFailure?.();
       }
       pending.reject(
@@ -268,11 +344,11 @@ export class WsClient {
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
 
+    this.reconnectAttempts++;
     const delay = Math.min(
       this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts),
       this.maxReconnectDelay,
     );
-    this.reconnectAttempts++;
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;

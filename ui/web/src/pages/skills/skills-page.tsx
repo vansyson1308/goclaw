@@ -1,92 +1,374 @@
-import { useState, useEffect } from "react";
-import { Zap, Eye, RefreshCw, Upload, Trash2 } from "lucide-react";
+import { useState, useEffect, lazy, Suspense, useMemo } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router";
+import { useTranslation } from "react-i18next";
+import { Zap, RefreshCw, Upload, ScanSearch, Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
-import { SearchInput } from "@/components/shared/search-input";
 import { Pagination } from "@/components/shared/pagination";
 import { TableSkeleton } from "@/components/shared/loading-skeleton";
-import { ConfirmDialog } from "@/components/shared/confirm-dialog";
+import { ConfirmDeleteDialog } from "@/components/shared/confirm-delete-dialog";
+import { cn } from "@/lib/utils";
+import { toast } from "@/stores/use-toast-store";
 import { useSkills, type SkillInfo } from "./hooks/use-skills";
 import { SkillDetailDialog } from "./skill-detail-dialog";
-import { SkillUploadDialog } from "./skill-upload-dialog";
+import { SkillEditDialog } from "./skill-edit-dialog";
+import { SkillAgentGrantsDialog } from "./skill-agent-grants-dialog";
+import { SkillBulkActionsToolbar } from "./skill-bulk-actions-toolbar";
+import { SkillHealthSummary } from "./skill-health-summary";
+import { SkillsFilterBar } from "./skills-filter-bar";
+
+const SkillUploadDialog = lazy(() =>
+  import("./skill-upload-dialog").then((m) => ({ default: m.SkillUploadDialog }))
+);
+import { MissingDepsPanel } from "./missing-deps-panel";
+import { SkillTableRow } from "./skill-table-row";
+import { useRuntimes } from "./hooks/use-runtimes";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
 import { usePagination } from "@/hooks/use-pagination";
+import { useTenants } from "@/hooks/use-tenants";
+import { useAgents } from "@/pages/agents/hooks/use-agents";
+import { deriveSkillStats, filterSkills, sortSkills } from "./lib/skills-filtering";
+import {
+  parseSkillsPageState,
+  serializeSkillsPageState,
+  type SkillsPageState,
+} from "./lib/skills-page-state";
+import { getNextSkillAccessMode } from "./lib/skill-access-mode";
+import type { SkillExportFormat } from "./lib/skill-export-download";
+
+const MASTER_TENANT_ID = "0193a5b0-7000-7000-8000-000000000001";
+
+type Tab = "core" | "custom";
 
 export function SkillsPage() {
-  const { skills, loading, refresh, getSkill, uploadSkill, deleteSkill } = useSkills();
+  const { t } = useTranslation("skills");
+  const {
+    skills, loading, refresh, getSkill, uploadSkill, updateSkill, deleteSkill,
+    listAgentGrants, grantSkillToAgent, grantSkillToAgents, revokeSkillFromAgent,
+    deleteSkills, toggleSkills, downloadSkills,
+    getSkillVersions, getSkillFiles, getSkillFileContent, updateSkillFileContent, rescanDeps, installDeps, installSingleDep, toggleSkill,
+    setTenantConfig, deleteTenantConfig,
+  } = useSkills();
+  const [params, setParams] = useSearchParams();
+  const routeParams = useParams<{ id?: string }>();
+  const navigate = useNavigate();
+  const { runtimes } = useRuntimes();
+  const { currentTenantId } = useTenants();
+  const { agents } = useAgents();
+  const hasTenantScope = !!currentTenantId && currentTenantId !== MASTER_TENANT_ID;
   const spinning = useMinLoading(loading);
   const showSkeleton = useDeferredLoading(loading && skills.length === 0);
-  const [search, setSearch] = useState("");
+  const pageState = useMemo(() => parseSkillsPageState(params), [params]);
+  const tab: Tab = pageState.tab;
+  const skillRef = params.get("skill");
   const [selectedSkill, setSelectedSkill] = useState<(SkillInfo & { content: string }) | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<SkillInfo | null>(null);
+  const [grantsTarget, setGrantsTarget] = useState<SkillInfo | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SkillInfo | null>(null);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteLoading, setDeleteLoading] = useState(false);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [downloadLoading, setDownloadLoading] = useState(false);
+  const [exportFormat, setExportFormat] = useState<SkillExportFormat>("zip");
+  const [rescanning, setRescanning] = useState(false);
+  const [installingDeps, setInstallingDeps] = useState(false);
+  const [toggling, setToggling] = useState<string | null>(null);
 
-  const filtered = skills.filter(
-    (s: SkillInfo) =>
-      s.name.toLowerCase().includes(search.toLowerCase()) ||
-      s.description.toLowerCase().includes(search.toLowerCase()),
+  const coreSkills = useMemo(() => skills.filter((s: SkillInfo) => s.is_system), [skills]);
+  const customSkills = useMemo(() => skills.filter((s: SkillInfo) => !s.is_system), [skills]);
+  const tabSkills = tab === "core" ? coreSkills : customSkills;
+  const healthStats = useMemo(() => deriveSkillStats(tabSkills), [tabSkills]);
+  const allMissing = useMemo(
+    () => [...new Set(tabSkills.flatMap((s: SkillInfo) => s.missing_deps ?? []))],
+    [tabSkills],
   );
-
+  const filtered = useMemo(
+    () => sortSkills(filterSkills(tabSkills, pageState), pageState.sort),
+    [pageState, tabSkills],
+  );
   const { pageItems, pagination, setPage, setPageSize, resetPage } = usePagination(filtered);
+  const selectedSkills = filtered.filter((skill) => skill.id && selectedIds.has(skill.id));
+  const selectedCustomSkills = selectedSkills.filter((skill) => !skill.is_system);
+  const skippedSystemCount = selectedSkills.length - selectedCustomSkills.length;
+  const pageSelectableIds = pageItems.map((skill) => skill.id).filter((id): id is string => !!id);
+  const allPageSelected = pageSelectableIds.length > 0 && pageSelectableIds.every((id) => selectedIds.has(id));
+  const somePageSelected = pageSelectableIds.some((id) => selectedIds.has(id)) && !allPageSelected;
 
-  useEffect(() => { resetPage(); }, [search, resetPage]);
+  useEffect(() => {
+    const routeSkillId = routeParams.id;
+    if (!routeSkillId) return;
+    const next = new URLSearchParams(params);
+    next.set("skill", routeSkillId);
+    navigate({ pathname: "/skills", search: toSearchString(next) }, { replace: true });
+  }, [navigate, params, routeParams.id]);
 
-  const handleViewSkill = async (name: string) => {
-    setDetailLoading(true);
-    try {
-      const detail = await getSkill(name);
-      if (detail) setSelectedSkill(detail);
-    } finally {
-      setDetailLoading(false);
-    }
+  useEffect(() => { resetPage(); }, [pageState.q, pageState.filter, pageState.sort, pageState.agent, tab, resetPage]);
+  useEffect(() => { setSelectedIds(new Set()); }, [pageState.q, pageState.filter, pageState.sort, pageState.agent, tab]);
+  useEffect(() => {
+    setSelectedIds((current) => {
+      const valid = new Set(filtered.map((skill) => skill.id).filter(Boolean));
+      const next = new Set(Array.from(current).filter((id) => valid.has(id)));
+      return next.size === current.size ? current : next;
+    });
+  }, [filtered]);
+
+  const setPageState = (updates: Partial<SkillsPageState>) => {
+    setParams(serializeSkillsPageState(params, updates), { replace: true });
   };
 
-  const handleUpload = async (file: File) => {
-    await uploadSkill(file);
-    refresh();
+  const setParamValues = (updates: Record<string, string | null>) => {
+    const next = new URLSearchParams(params);
+    for (const [key, value] of Object.entries(updates)) {
+      if (value) next.set(key, value);
+      else next.delete(key);
+    }
+    setParams(next, { replace: true });
+  };
+
+  const setTab = (nextTab: Tab) => {
+    const next = new URLSearchParams(params);
+    if (nextTab === "core") next.delete("tab");
+    else next.set("tab", nextTab);
+    next.delete("skill");
+    next.delete("detailTab");
+    next.delete("version");
+    next.delete("file");
+    setParams(next, { replace: true });
+  };
+
+  const closeDetail = () => {
+    const next = new URLSearchParams(params);
+    next.delete("skill");
+    next.delete("detailTab");
+    next.delete("version");
+    next.delete("file");
+    navigate({ pathname: "/skills", search: toSearchString(next) }, { replace: true });
+    setSelectedSkill(null);
+  };
+
+  const handleViewSkill = async (skill: SkillInfo) => {
+    const next = new URLSearchParams(params);
+    if (skill.is_system) next.delete("tab");
+    else next.set("tab", "custom");
+    next.set("skill", skill.id || skill.slug || skill.name);
+    next.set("detailTab", "content");
+    next.delete("version");
+    next.delete("file");
+    setParams(next, { replace: true });
+  };
+
+  useEffect(() => {
+    if (!skillRef) {
+      setSelectedSkill(null);
+      return;
+    }
+    let cancelled = false;
+    getSkill(skillRef).then((detail) => {
+      if (!cancelled) setSelectedSkill(detail);
+    });
+    return () => { cancelled = true; };
+  }, [skillRef, getSkill]);
+
+  const handleCycleAccessMode = async (skill: SkillInfo) => {
+    if (!skill.id) return;
+    await updateSkill(skill.id, { visibility: getNextSkillAccessMode(skill.visibility) });
   };
 
   const handleDelete = async () => {
     if (!deleteTarget?.id) return;
     setDeleteLoading(true);
+    try { await deleteSkill(deleteTarget.id); setDeleteTarget(null); refresh(); }
+    finally { setDeleteLoading(false); }
+  };
+
+  const toggleSelectSkill = (skill: SkillInfo) => {
+    if (!skill.id) return;
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(skill.id!)) next.delete(skill.id!);
+      else next.add(skill.id!);
+      return next;
+    });
+  };
+
+  const toggleSelectPage = () => {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (allPageSelected) {
+        for (const id of pageSelectableIds) next.delete(id);
+      } else {
+        for (const id of pageSelectableIds) next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const runBulkAction = async (action: () => Promise<void>, successKey: string, count: number) => {
+    setBulkLoading(true);
     try {
-      await deleteSkill(deleteTarget.id);
-      setDeleteTarget(null);
-      refresh();
+      await action();
+      setSelectedIds(new Set());
+      toast.success(t(successKey, { count }));
+    } catch (err) {
+      toast.error(t("bulk.failed"), err instanceof Error ? err.message : String(err));
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
+  const handleBulkToggle = (enabled: boolean) => {
+    const ids = selectedSkills.map((skill) => skill.id).filter((id): id is string => !!id);
+    runBulkAction(async () => {
+      if (hasTenantScope) {
+        for (const id of ids) await setTenantConfig(id, enabled);
+      } else {
+        await toggleSkills(ids, enabled);
+      }
+    }, enabled ? "bulk.enabled" : "bulk.disabled", ids.length);
+  };
+
+  const handleBulkGrantAllAgents = () => {
+    const agentIds = agents.map((agent) => agent.id).filter(Boolean);
+    runBulkAction(async () => {
+      for (const skill of selectedCustomSkills) {
+        if (skill.id) await grantSkillToAgents(skill.id, agentIds, skill.version ?? 1, true);
+      }
+    }, "bulk.grantedAllAgents", selectedCustomSkills.length);
+  };
+
+  const handleBulkDelete = async () => {
+    const ids = selectedCustomSkills.map((skill) => skill.id).filter((id): id is string => !!id);
+    setDeleteLoading(true);
+    try {
+      await deleteSkills(ids);
+      setBulkDeleteOpen(false);
+      setSelectedIds(new Set());
+      toast.success(t("bulk.deleted", { count: ids.length }));
+    } catch (err) {
+      toast.error(t("bulk.failed"), err instanceof Error ? err.message : String(err));
     } finally {
       setDeleteLoading(false);
     }
   };
 
+  const handleDownloadSkills = async (targetSkills: SkillInfo[]) => {
+    setDownloadLoading(true);
+    try {
+      await downloadSkills(targetSkills, exportFormat);
+      toast.success(t("export.downloadSuccess"));
+    } catch (err) {
+      toast.error(t("export.downloadFailed"), err instanceof Error ? err.message : String(err));
+    } finally {
+      setDownloadLoading(false);
+    }
+  };
+
+  const handleRescanDeps = async () => {
+    setRescanning(true);
+    try { await rescanDeps(); } finally { setRescanning(false); }
+  };
+
+  const handleInstallDeps = async () => {
+    setInstallingDeps(true);
+    try { await installDeps(); } finally { setInstallingDeps(false); }
+  };
+
+  const handleToggle = async (skill: SkillInfo, enabled: boolean) => {
+    if (!skill.id) return;
+    setToggling(skill.id);
+    try { await toggleSkill(skill.id, enabled); } finally { setToggling(null); }
+  };
+
+  const handleSetTenantConfig = async (id: string, enabled: boolean) => {
+    setToggling(id);
+    try { await setTenantConfig(id, enabled); } finally { setToggling(null); }
+  };
+
+  const handleSaveSkillContent = async (id: string, content: string) => {
+    await updateSkillFileContent(id, "SKILL.md", content);
+    const detail = await getSkill(id);
+    if (detail) setSelectedSkill(detail);
+  };
+
+  const handleDeleteTenantConfig = async (id: string) => {
+    setToggling(id);
+    try { await deleteTenantConfig(id); } finally { setToggling(null); }
+  };
+
   return (
-    <div className="p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
-        title="Skills"
-        description="Manage agent skills and capabilities"
+        title={t("title")}
+        description={t("description")}
         actions={
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={() => setUploadOpen(true)} className="gap-1">
-              <Upload className="h-3.5 w-3.5" /> Upload
+            {tab === "custom" && (
+              <Button variant="outline" size="sm" onClick={() => setUploadOpen(true)} className="gap-1">
+                <Upload className="h-3.5 w-3.5" /> {t("upload.button")}
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={handleRescanDeps} disabled={rescanning} className="gap-1">
+              <ScanSearch className="h-3.5 w-3.5" /> {t("deps.rescan")}
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleInstallDeps} disabled={installingDeps || allMissing.length === 0} className="gap-1">
+              <Download className="h-3.5 w-3.5" /> {installingDeps ? t("deps.installing") : t("deps.installAll")}
             </Button>
             <Button variant="outline" size="sm" onClick={refresh} disabled={spinning} className="gap-1">
-              <RefreshCw className={"h-3.5 w-3.5" + (spinning ? " animate-spin" : "")} /> Refresh
+              <RefreshCw className={"h-3.5 w-3.5" + (spinning ? " animate-spin" : "")} /> {t("refresh", { ns: "common" })}
             </Button>
           </div>
         }
       />
 
+      <div className="flex gap-1 border-b mt-4">
+        {(["core", "custom"] as Tab[]).map((tabKey) => (
+          <button
+            key={tabKey}
+            type="button"
+            className={cn(
+              "px-3 py-1.5 text-sm font-medium border-b-2 -mb-px",
+              tab === tabKey
+                ? "border-primary text-primary"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+            onClick={() => setTab(tabKey)}
+          >
+            {t(`tabs.${tabKey}`)} ({tabKey === "core" ? coreSkills.length : customSkills.length})
+          </button>
+        ))}
+      </div>
+
+      <SkillBulkActionsToolbar
+        selectedCount={selectedSkills.length}
+        customSelectedCount={selectedCustomSkills.length}
+        skippedSystemCount={skippedSystemCount}
+        agentCount={agents.length}
+        loading={bulkLoading || deleteLoading}
+        downloadLoading={downloadLoading}
+        exportFormat={exportFormat}
+        onExportFormatChange={setExportFormat}
+        onDownload={() => handleDownloadSkills(selectedSkills)}
+        onEnable={() => handleBulkToggle(true)}
+        onDisable={() => handleBulkToggle(false)}
+        onGrantAllAgents={handleBulkGrantAllAgents}
+        onDelete={() => setBulkDeleteOpen(true)}
+        onClear={() => setSelectedIds(new Set())}
+      />
+
       <div className="mt-4">
-        <SearchInput
-          value={search}
-          onChange={setSearch}
-          placeholder="Search skills..."
-          className="max-w-sm"
-        />
+        <MissingDepsPanel missing={allMissing} onInstallItem={installSingleDep} runtimes={tab === "core" ? runtimes : undefined} />
+        <div className="space-y-3">
+          <SkillHealthSummary
+            stats={healthStats}
+            activeFilter={pageState.filter}
+            onFilterChange={(filter) => setPageState({ filter })}
+          />
+          <SkillsFilterBar state={pageState} onChange={setPageState} />
+        </div>
       </div>
 
       <div className="mt-4">
@@ -95,59 +377,51 @@ export function SkillsPage() {
         ) : filtered.length === 0 ? (
           <EmptyState
             icon={Zap}
-            title={search ? "No matching skills" : "No skills"}
-            description={search ? "Try a different search term." : "No skills have been registered yet."}
+            title={pageState.q || pageState.filter !== "all" ? t("noMatchTitle") : t("emptyTitle")}
+            description={pageState.q || pageState.filter !== "all" ? t("noMatchDescription") : t("emptyDescription")}
           />
         ) : (
-          <div className="rounded-md border">
-            <table className="w-full text-sm">
+          <div className="overflow-x-auto rounded-md border">
+            <table className="w-full min-w-[600px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/50">
-                  <th className="px-4 py-3 text-left font-medium">Name</th>
-                  <th className="px-4 py-3 text-left font-medium">Description</th>
-                  <th className="px-4 py-3 text-left font-medium">Source</th>
-                  <th className="px-4 py-3 text-right font-medium">Actions</th>
+                  <th className="w-10 px-4 py-3">
+                    <input
+                      type="checkbox"
+                      checked={allPageSelected}
+                      ref={(el) => { if (el) el.indeterminate = somePageSelected; }}
+                      onChange={toggleSelectPage}
+                      aria-label={t("bulk.selectPage")}
+                      className="h-4 w-4 cursor-pointer accent-primary"
+                    />
+                  </th>
+                  <th className="px-4 py-3 text-left font-medium">{t("columns.name")}</th>
+                  <th className="px-4 py-3 text-left font-medium">{t("columns.description")}</th>
+                  {tab === "custom" && <th className="px-4 py-3 text-left font-medium">{t("columns.agents")}</th>}
+                  <th className="px-4 py-3 text-left font-medium">{t("columns.status")}</th>
+                  {tab === "custom" && <th className="px-4 py-3 text-left font-medium">{t("columns.accessMode")}</th>}
+                  <th className="px-4 py-3 text-right font-medium">{t("columns.actions")}</th>
                 </tr>
               </thead>
               <tbody>
                 {pageItems.map((skill: SkillInfo) => (
-                  <tr key={skill.name} className="border-b last:border-0 hover:bg-muted/30">
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <Zap className="h-4 w-4 text-muted-foreground" />
-                        <span className="font-medium">{skill.name}</span>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-muted-foreground">
-                      {skill.description || "No description"}
-                    </td>
-                    <td className="px-4 py-3">
-                      <Badge variant="outline">{skill.source || "file"}</Badge>
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleViewSkill(skill.name)}
-                          disabled={detailLoading}
-                          className="gap-1"
-                        >
-                          <Eye className="h-3.5 w-3.5" /> View
-                        </Button>
-                        {skill.id && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => setDeleteTarget(skill)}
-                            className="gap-1 text-destructive hover:text-destructive"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
+                  <SkillTableRow
+                    key={skill.name}
+                    skill={skill}
+                    tab={tab}
+                    hasTenantScope={hasTenantScope}
+                    toggling={toggling}
+                    selected={!!skill.id && selectedIds.has(skill.id)}
+                    onToggleSelect={toggleSelectSkill}
+                    onView={handleViewSkill}
+                    onEdit={setEditTarget}
+                    onManageGrants={setGrantsTarget}
+                    onDelete={setDeleteTarget}
+                    onToggle={handleToggle}
+                    onCycleAccessMode={handleCycleAccessMode}
+                    onSetTenantConfig={handleSetTenantConfig}
+                    onDeleteTenantConfig={handleDeleteTenantConfig}
+                  />
                 ))}
               </tbody>
             </table>
@@ -166,26 +440,70 @@ export function SkillsPage() {
       {selectedSkill && (
         <SkillDetailDialog
           skill={selectedSkill}
-          onClose={() => setSelectedSkill(null)}
+          detailTab={params.get("detailTab") || "content"}
+          selectedVersionParam={params.get("version")}
+          selectedFilePath={params.get("file")}
+          onStateChange={setParamValues}
+          onClose={closeDetail}
+          exportFormat={exportFormat}
+          downloadLoading={downloadLoading}
+          onExportFormatChange={setExportFormat}
+          onDownloadSkill={() => handleDownloadSkills([selectedSkill])}
+          getSkillVersions={getSkillVersions}
+          getSkillFiles={getSkillFiles}
+          getSkillFileContent={getSkillFileContent}
+          onSaveContent={handleSaveSkillContent}
         />
       )}
 
-      <SkillUploadDialog
-        open={uploadOpen}
-        onOpenChange={setUploadOpen}
-        onUpload={handleUpload}
-      />
+      {editTarget && (
+        <SkillEditDialog
+          skill={editTarget}
+          onClose={() => setEditTarget(null)}
+          onSave={async (id, updates) => { await updateSkill(id, updates); setEditTarget(null); }}
+        />
+      )}
 
-      <ConfirmDialog
+      {grantsTarget && (
+        <SkillAgentGrantsDialog
+          skill={grantsTarget}
+          onClose={() => setGrantsTarget(null)}
+          onLoad={listAgentGrants}
+          onGrant={grantSkillToAgent}
+          onGrantAll={grantSkillToAgents}
+          onRevoke={revokeSkillFromAgent}
+        />
+      )}
+
+      <Suspense fallback={null}>
+        <SkillUploadDialog open={uploadOpen} onOpenChange={setUploadOpen} onUpload={uploadSkill} />
+      </Suspense>
+
+      <ConfirmDeleteDialog
         open={!!deleteTarget}
         onOpenChange={(open) => !open && setDeleteTarget(null)}
-        title="Delete Skill"
-        description={`Are you sure you want to delete "${deleteTarget?.name}"? This action cannot be undone.`}
-        confirmLabel="Delete"
-        variant="destructive"
+        title={t("delete.title")}
+        description={t("delete.description", { name: deleteTarget?.name })}
+        confirmValue={deleteTarget?.name || ""}
+        confirmLabel={t("delete.confirmLabel")}
         onConfirm={handleDelete}
+        loading={deleteLoading}
+      />
+      <ConfirmDeleteDialog
+        open={bulkDeleteOpen}
+        onOpenChange={(open) => !open && setBulkDeleteOpen(false)}
+        title={t("bulk.deleteTitle")}
+        description={t("bulk.deleteDescription", { count: selectedCustomSkills.length })}
+        confirmValue="DELETE"
+        confirmLabel={t("delete.confirmLabel")}
+        onConfirm={handleBulkDelete}
         loading={deleteLoading}
       />
     </div>
   );
+}
+
+function toSearchString(params: URLSearchParams): string {
+  const serialized = params.toString();
+  return serialized ? `?${serialized}` : "";
 }

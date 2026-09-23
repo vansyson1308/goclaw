@@ -3,6 +3,7 @@ package feishu
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -83,7 +84,7 @@ func unmarshalFrame(data []byte) (*wsFrame, error) {
 	for r.Len() > 0 {
 		tag, err := binary.ReadUvarint(r)
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return nil, fmt.Errorf("read tag: %w", err)
@@ -181,7 +182,7 @@ func unmarshalHeader(data []byte) (wsHeader, error) {
 // --- Protobuf encoding helpers ---
 
 func pbWriteVarintField(w *bytes.Buffer, fieldNum int, val uint64) {
-	tag := uint64(fieldNum<<3 | 0) // wire type 0 = varint
+	tag := uint64(fieldNum << 3) // wire type 0 = varint
 	pbWriteUvarint(w, tag)
 	pbWriteUvarint(w, val)
 }

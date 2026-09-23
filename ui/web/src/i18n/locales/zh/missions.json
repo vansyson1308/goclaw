@@ -1,0 +1,89 @@
+{
+  "title": "任务",
+  "description": "为智能体指定目标和验收检查。成功与否由检查结果判定，而不是智能体的自述。",
+  "newMission": "新建任务",
+  "disabledTitle": "此网关未启用任务功能",
+  "disabledHint": "设置 GOCLAW_MISSIONS=1（以及 GOCLAW_MISSIONS_SOURCE_ROOT）后重启网关。验证命令在主机执行器上运行。",
+  "emptyTitle": "暂无任务",
+  "emptyDescription": "根据任务契约创建任务，即可在此查看经过验证的结果。",
+  "col": {
+    "status": "状态",
+    "title": "任务",
+    "agent": "智能体",
+    "created": "创建时间",
+    "cost": "成本"
+  },
+  "costUnknown": "未知",
+  "status": {
+    "planned": "已计划",
+    "preparing": "准备中",
+    "running": "运行中",
+    "verifying": "验证中",
+    "succeeded": "成功",
+    "partial": "部分完成",
+    "failed": "失败",
+    "blocked": "受阻",
+    "cancelled": "已取消"
+  },
+  "result": {
+    "pass": "通过",
+    "fail": "未通过",
+    "error": "错误"
+  },
+  "create": {
+    "title": "新建任务",
+    "hint": "粘贴或编辑任务契约（JSON）。路径相对于网关的任务源目录。",
+    "contractLabel": "任务契约 JSON",
+    "invalidJson": "JSON 无效：{{error}}",
+    "created": "任务已启动",
+    "creating": "启动中…",
+    "submit": "启动任务"
+  },
+  "common": {
+    "cancel": "取消",
+    "back": "返回"
+  },
+  "detail": {
+    "back": "全部任务",
+    "notFound": "未找到任务",
+    "inProgress": "进行中",
+    "cancel": "取消任务",
+    "tokens": "Token（输入 / 输出）",
+    "cost": "成本",
+    "executor": "验证执行器",
+    "finished": "完成时间",
+    "criteria": "验收标准",
+    "criteriaPending": "检查将在智能体完成后运行。",
+    "criteriaNone": "未评估任何检查。",
+    "changedFiles": "变更文件",
+    "noChanges": "没有文件变更。",
+    "diff": "差异",
+    "diffTruncated": "差异已截断（256 KiB 上限）。",
+    "summary": "智能体摘要",
+    "summaryHint": "这是智能体的自述，不是证据；上方的检查才是证据。",
+    "events": "时间线",
+    "confirmCancel": "取消此任务？",
+    "confirmCancelHint": "智能体运行将停止，任务标记为已取消。",
+    "cancelled": "任务已取消",
+    "provesChange": "证明变更",
+    "baseline": "基线：{{status}}",
+    "expectedTest": "必需测试 {{name}}：{{status}}",
+    "attempt": "尝试",
+    "usageIncomplete": "某次尝试结束时未上报用量（例如网关重启），因此 token 与费用合计只是下限。",
+    "toolCalls": "工具调用",
+    "toolCallsHint": "每次调用执行前记录。“已开始”但没有结果表示结果从未被确认。",
+    "noToolCalls": "没有记录到工具调用。",
+    "receiptAttempt": "#",
+    "receiptTool": "工具",
+    "receiptClass": "类别",
+    "receiptStatus": "结果",
+    "receiptDuration": "耗时"
+  },
+  "costAtLeast": "至少 {{value}}",
+  "receipt": {
+    "denied": "已拒绝",
+    "started": "已开始（无结果）",
+    "ok": "成功",
+    "error": "错误"
+  }
+}

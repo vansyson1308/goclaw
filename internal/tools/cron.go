@@ -6,94 +6,154 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // CronTool lets agents manage Gateway cron jobs.
 // Matching OpenClaw src/agents/tools/cron-tool.ts.
 type CronTool struct {
-	cronStore store.CronStore
+	cronStore      store.CronStore
+	permStore      store.ConfigPermissionStore // nil = no group restriction
+	providerStore  store.ProviderStore         // nil = provider override by name unavailable
+	commandEnabled bool                        // allow deterministic command payloads (mirrors cron.command_enabled)
 }
 
 func NewCronTool(cronStore store.CronStore) *CronTool {
 	return &CronTool{cronStore: cronStore}
 }
 
+// SetConfigPermStore enables group cron mutation restriction.
+func (t *CronTool) SetConfigPermStore(s store.ConfigPermissionStore) {
+	t.permStore = s
+}
+
+// SetProviderStore enables resolving per-job LLM provider overrides by name.
+func (t *CronTool) SetProviderStore(s store.ProviderStore) {
+	t.providerStore = s
+}
+
+// SetCommandEnabled allows this tool to create deterministic command-payload
+// cron jobs (kind="command", no LLM). Mirrors the gateway's cron.command_enabled.
+func (t *CronTool) SetCommandEnabled(enabled bool) {
+	t.commandEnabled = enabled
+}
+
 func (t *CronTool) Name() string { return "cron" }
 
 func (t *CronTool) Description() string {
-	return `Manage Gateway cron jobs (status/list/add/update/remove/run/runs).
+	return `Manage Gateway cron jobs.
+Always send a JSON object with an "action" field.
 
-ACTIONS:
-- status: Check cron scheduler status
-- list: List jobs (use includeDisabled:true to include disabled)
-- add: Create job (requires job object, see schema below)
-- update: Modify job (requires jobId + patch object)
-- remove: Delete job (requires jobId)
-- run: Trigger job immediately (requires jobId)
-- runs: Get job run history (requires jobId)
+VALID ACTIONS AND EXACT PAYLOAD SHAPES:
+1) status
+{ "action": "status" }
 
-JOB SCHEMA (for add action):
+2) list
+{ "action": "list", "includeDisabled": true|false }
+
+3) add
 {
-  "name": "string (required, lowercase slug)",
-  "schedule": { ... },      // Required: when to run
-  "message": "string",      // Required: what message to send to the agent
-  "deliver": true|false,    // Optional: deliver result to channel (default false)
-  "channel": "telegram",    // Optional: target channel for delivery
-  "to": "chat-id",          // Optional: target chat/recipient ID
-  "agentId": "agent-uuid",  // Optional: which agent handles the job (default: current)
-  "deleteAfterRun": true    // Optional: auto-delete after execution (default true for "at" schedule)
+  "action": "add",
+  "job": {
+    "name": "string",             // required, lowercase slug: [a-z0-9-]+
+    "schedule": { ... },          // required
+    "message": "string",          // required
+    "deliver": true|false,        // optional, default false
+    "channel": "string",          // optional, auto-filled from current channel context
+    "to": "string",               // optional
+    "agentId": "string",          // optional, defaults to current agent
+    "provider": "string",         // optional, LLM provider NAME (e.g. "groq") to run this job on a cheaper model; unset → agent default
+    "model": "string",            // optional, model id for the override provider
+    "deleteAfterRun": true|false  // optional, default true for schedule.kind="at"
+  }
 }
 
-SCHEDULE TYPES (schedule.kind):
-- "at": One-shot at absolute time
-  { "kind": "at", "atMs": <unix-milliseconds> }
-- "every": Recurring interval
-  { "kind": "every", "everyMs": <interval-ms> }
-- "cron": Cron expression
-  { "kind": "cron", "expr": "<5-field cron expression>", "tz": "<optional-timezone>" }
-
-CRITICAL CONSTRAINTS:
-- name must be a valid slug (lowercase letters, numbers, hyphens only)
-- message is required for add action
-- schedule is required for add action
-- Default: jobs run as isolated agent turns with the specified message
-
-Use jobId as the canonical identifier; id is accepted for compatibility.`
+4) update
+{
+  "action": "update",
+  "jobId": "string",
+  "patch": {
+    "name": "string",
+    "schedule": { ... },
+    "message": "string",
+    "deliver": true|false,
+    "channel": "string",
+    "to": "string",
+    "agentId": "string",
+    "provider": "string",
+    "model": "string",
+    "deleteAfterRun": true|false,
+    "disabled": true|false
+  }
 }
 
-func (t *CronTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+5) remove
+{ "action": "remove", "jobId": "string" }
+
+6) run
+{ "action": "run", "jobId": "string" }
+
+7) runs
+{ "action": "runs", "jobId": "string" }
+
+SCHEDULE SCHEMA:
+- at: { "kind": "at", "atMs": <unix-milliseconds> }
+- every: { "kind": "every", "everyMs": <interval-ms> }
+- cron: { "kind": "cron", "expr": "<5-field cron>", "tz": "<IANA timezone, e.g. Asia/Ho_Chi_Minh; omit for gateway default>" }
+
+RULES:
+- For action="add", send the job inside "job". Do not place job fields at the root level.
+- For action="update", send changes inside "patch". Do not place patch fields at the root level.
+- Always use "jobId". Do not use "id".
+- "name", "schedule", and "message" are required for add.
+- "name" must match: lowercase letters, numbers, hyphens only.
+- Before creating or updating a scheduled job, call the datetime tool first to get the precise current time and unix_ms timestamp. Never guess timestamps.
+- Omit optional fields when unknown; do not invent placeholder values like "", 0, or null unless required.
+- Jobs run as isolated agent turns using the provided "message".
+
+DETERMINISTIC COMMAND JOBS (no LLM, zero tokens):
+- Instead of "message", set "command" to a shell string (run as sh -c) OR
+  "commandArgv" to an explicit argv array (no shell parsing).
+- Optional: "commandCwd", "commandEnv" {"KEY":"VAL"}, "commandTimeoutSeconds".
+- The command runs inside the gateway process. Only available when the gateway
+  has cron.command_enabled=true; otherwise add returns an error.
+- Use for scheduled probes/scripts that don't need the model. Output is delivered
+  like a normal job when "deliver" is set; a non-zero exit records the run as an error.`
+}
+
+func (t *CronTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"action": map[string]interface{}{
+		"properties": map[string]any{
+			"action": map[string]any{
 				"type":        "string",
 				"description": "The cron action to perform",
 				"enum":        []string{"status", "list", "add", "update", "remove", "run", "runs"},
 			},
-			"includeDisabled": map[string]interface{}{
+			"includeDisabled": map[string]any{
 				"type":        "boolean",
 				"description": "Include disabled jobs in list (default false)",
 			},
-			"job": map[string]interface{}{
-				"type":        "object",
-				"description": "Job definition for add action (name, schedule, message, deliver, channel, to, agentId, deleteAfterRun)",
+			"job": map[string]any{
+				"type":                 "object",
+				"description":          "Job definition for add action (name, schedule, message, deliver, channel, to, agentId, provider, model, deleteAfterRun)",
 				"additionalProperties": true,
 			},
-			"jobId": map[string]interface{}{
+			"jobId": map[string]any{
 				"type":        "string",
 				"description": "Job ID for update/remove/run/runs actions",
 			},
-			"id": map[string]interface{}{
+			"id": map[string]any{
 				"type":        "string",
 				"description": "Backward compatibility alias for jobId",
 			},
-			"patch": map[string]interface{}{
-				"type":        "object",
-				"description": "Patch object for update action",
+			"patch": map[string]any{
+				"type":                 "object",
+				"description":          "Patch object for update action",
 				"additionalProperties": true,
 			},
-			"runMode": map[string]interface{}{
+			"runMode": map[string]any{
 				"type":        "string",
 				"description": "Run mode: 'due' (only if due) or 'force' (immediate)",
 				"enum":        []string{"due", "force"},
@@ -103,30 +163,41 @@ func (t *CronTool) Parameters() map[string]interface{} {
 	}
 }
 
-func (t *CronTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *CronTool) Execute(ctx context.Context, args map[string]any) *Result {
 	action, _ := args["action"].(string)
 	if action == "" {
 		return ErrorResult("action parameter is required")
 	}
 
+	// Group cron permission check for mutation actions
+	if t.permStore != nil && (action == "add" || action == "update" || action == "remove") {
+		if err := store.CheckCronPermission(ctx, t.permStore); err != nil {
+			return ErrorResult("permission denied: only users with cron or file_writer permission can manage cron jobs in group chats")
+		}
+	}
+
 	agentID := resolveAgentIDString(ctx)
+	// SCOPE-intentional (#915 audit 2026-04-16): cron jobs follow the per-group
+	// memory model — all group members share the same cron_jobs rows via the
+	// group-scope user_id. Migrating to ActorIDFromContext would split jobs
+	// per-individual and break collaborative /cron list/add/remove UX.
 	userID := store.UserIDFromContext(ctx)
 
 	switch action {
 	case "status":
 		return t.handleStatus()
 	case "list":
-		return t.handleList(args, agentID, userID)
+		return t.handleList(ctx, args, agentID, userID)
 	case "add":
 		return t.handleAdd(ctx, args, agentID, userID)
 	case "update":
-		return t.handleUpdate(args, agentID, userID)
+		return t.handleUpdate(ctx, args, agentID, userID)
 	case "remove":
-		return t.handleRemove(args, agentID, userID)
+		return t.handleRemove(ctx, args, agentID, userID)
 	case "run":
-		return t.handleRun(args, agentID, userID)
+		return t.handleRun(ctx, args, agentID, userID)
 	case "runs":
-		return t.handleRuns(args, agentID, userID)
+		return t.handleRuns(ctx, args, agentID, userID)
 	default:
 		return ErrorResult(fmt.Sprintf("unknown action: %s", action))
 	}
@@ -138,11 +209,12 @@ func (t *CronTool) handleStatus() *Result {
 	return NewResult(string(data))
 }
 
-func (t *CronTool) handleList(args map[string]interface{}, agentID, userID string) *Result {
+func (t *CronTool) handleList(ctx context.Context, args map[string]any, agentID, userID string) *Result {
 	includeDisabled, _ := args["includeDisabled"].(bool)
-	jobs := t.cronStore.ListJobs(includeDisabled, agentID, userID)
+	jobs := t.cronStore.ListJobs(ctx, includeDisabled, agentID, userID)
+	jobs = store.RedactCronJobsCredentialContext(jobs)
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"jobs":  jobs,
 		"count": len(jobs),
 	}
@@ -150,8 +222,8 @@ func (t *CronTool) handleList(args map[string]interface{}, agentID, userID strin
 	return NewResult(string(data))
 }
 
-func (t *CronTool) handleAdd(ctx context.Context, args map[string]interface{}, agentID, userID string) *Result {
-	jobObj, ok := args["job"].(map[string]interface{})
+func (t *CronTool) handleAdd(ctx context.Context, args map[string]any, agentID, userID string) *Result {
+	jobObj, ok := args["job"].(map[string]any)
 	if !ok {
 		return ErrorResult("job object is required for add action")
 	}
@@ -161,14 +233,25 @@ func (t *CronTool) handleAdd(ctx context.Context, args map[string]interface{}, a
 		return ErrorResult("job.name is required")
 	}
 
-	scheduleObj, ok := jobObj["schedule"].(map[string]interface{})
+	scheduleObj, ok := jobObj["schedule"].(map[string]any)
 	if !ok {
 		return ErrorResult("job.schedule is required")
 	}
 
+	// Optional deterministic command payload (runs a shell command, no LLM turn).
+	cmdSpec := parseCronCommandSpec(jobObj)
+	if cmdSpec != nil {
+		if !t.commandEnabled {
+			return ErrorResult("command cron is disabled on this gateway (set cron.command_enabled=true to allow it)")
+		}
+		if err := store.ValidateCronCommandSpec(cmdSpec); err != nil {
+			return ErrorResult(err.Error())
+		}
+	}
+
 	message, _ := jobObj["message"].(string)
-	if message == "" {
-		return ErrorResult("job.message is required")
+	if cmdSpec == nil && message == "" {
+		return ErrorResult("job.message is required (or set job.command/job.commandArgv for a deterministic command job)")
 	}
 
 	// Parse schedule
@@ -203,6 +286,11 @@ func (t *CronTool) handleAdd(ctx context.Context, args map[string]interface{}, a
 			return ErrorResult("job.schedule.expr is required for 'cron' schedule")
 		}
 		schedule.TZ = stringFromMap(scheduleObj, "tz")
+		if schedule.TZ != "" {
+			if _, err := time.LoadLocation(schedule.TZ); err != nil {
+				return ErrorResult(fmt.Sprintf("invalid timezone '%s': use IANA names like 'Asia/Ho_Chi_Minh', 'America/New_York'", schedule.TZ))
+			}
+		}
 	default:
 		return ErrorResult(fmt.Sprintf("invalid schedule kind: %s (must be at, every, or cron)", schedule.Kind))
 	}
@@ -212,13 +300,29 @@ func (t *CronTool) handleAdd(ctx context.Context, args map[string]interface{}, a
 	channel, _ := jobObj["channel"].(string)
 	to, _ := jobObj["to"].(string)
 
-	// Auto-fill channel and to from context if deliver is requested but not specified
-	if deliver {
-		if channel == "" {
-			channel = ToolChannelFromCtx(ctx)
+	// Auto-default deliver=true when the request comes from a real channel
+	// (not CLI/system/subagent). Users chatting on Zalo/Telegram expect
+	// cron results delivered back to the same chat.
+	if !deliver {
+		if ctxChannel := ToolChannelFromCtx(ctx); ctxChannel != "" {
+			switch ctxChannel {
+			case "cli", "system", "subagent", "cron", "teammate":
+				// internal channels — don't auto-deliver
+			default:
+				deliver = true
+			}
 		}
-		if to == "" {
-			to = ToolChatIDFromCtx(ctx)
+	}
+
+	// Auto-fill channel and to from context when deliver is requested.
+	// Always prefer context values over LLM-provided values to prevent
+	// misrouted deliveries (e.g. LLM confusing guild ID with channel ID).
+	if deliver {
+		if ctxChannel := ToolChannelFromCtx(ctx); ctxChannel != "" {
+			channel = ctxChannel
+		}
+		if ctxChatID := ToolChatIDFromCtx(ctx); ctxChatID != "" {
+			to = ctxChatID
 		}
 	}
 
@@ -227,24 +331,57 @@ func (t *CronTool) handleAdd(ctx context.Context, args map[string]interface{}, a
 		agentID = explicit
 	}
 
-	job, err := t.cronStore.AddJob(name, schedule, message, deliver, channel, to, agentID, userID)
+	// Resolve optional per-job provider/model override before creating the job.
+	providerID, errR := t.resolveProviderID(ctx, jobObj)
+	if errR != nil {
+		return errR
+	}
+	modelOverride, _ := jobObj["model"].(string)
+
+	job, err := t.cronStore.AddJob(ctx, name, schedule, message, deliver, channel, to, agentID, userID)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create cron job: %v", err))
 	}
 
-	data, _ := json.MarshalIndent(map[string]interface{}{"job": job}, "", "  ")
+	// Apply post-create overrides (wake_heartbeat, provider/model) in a single patch.
+	overridePatch := store.CronJobPatch{}
+	needOverride := false
+	if wh, _ := jobObj["wake_heartbeat"].(bool); wh {
+		wakeTrue := true
+		overridePatch.WakeHeartbeat = &wakeTrue
+		needOverride = true
+	}
+	if providerID != nil {
+		overridePatch.ProviderID = providerID
+		needOverride = true
+	}
+	if modelOverride != "" {
+		overridePatch.Model = &modelOverride
+		needOverride = true
+	}
+	if cmdSpec != nil {
+		overridePatch.Command = cmdSpec
+		needOverride = true
+	}
+	if needOverride {
+		if updated, uErr := t.cronStore.UpdateJob(ctx, job.ID, overridePatch); uErr == nil {
+			job = updated
+		}
+	}
+
+	data, _ := json.MarshalIndent(map[string]any{"job": store.RedactCronJobCredentialContext(*job)}, "", "  ")
 	return NewResult(string(data))
 }
 
 // checkJobOwnership validates that the job belongs to the current agent+user scope.
-// In standalone mode (empty agentID/userID), all jobs are accessible.
-func (t *CronTool) checkJobOwnership(jobID, agentID, userID string) (*store.CronJob, *Result) {
-	job, ok := t.cronStore.GetJob(jobID)
+// When agentID/userID is empty, all jobs are accessible.
+func (t *CronTool) checkJobOwnership(ctx context.Context, jobID, agentID, userID string) (*store.CronJob, *Result) {
+	job, ok := t.cronStore.GetJob(ctx, jobID)
 	if !ok {
 		return nil, ErrorResult(fmt.Sprintf("job %s not found", jobID))
 	}
 
-	// In managed mode, verify ownership
+	// Verify ownership
 	if agentID != "" && job.AgentID != agentID {
 		return nil, ErrorResult(fmt.Sprintf("job %s not found", jobID))
 	}
@@ -255,72 +392,116 @@ func (t *CronTool) checkJobOwnership(jobID, agentID, userID string) (*store.Cron
 	return job, nil
 }
 
-func (t *CronTool) handleUpdate(args map[string]interface{}, agentID, userID string) *Result {
+func (t *CronTool) handleUpdate(ctx context.Context, args map[string]any, agentID, userID string) *Result {
 	jobID := resolveJobID(args)
 	if jobID == "" {
 		return ErrorResult("jobId is required for update action")
 	}
 
-	if _, errResult := t.checkJobOwnership(jobID, agentID, userID); errResult != nil {
+	existing, errResult := t.checkJobOwnership(ctx, jobID, agentID, userID)
+	if errResult != nil {
 		return errResult
 	}
+	if err := store.CheckCronCredentialOwner(ctx, existing); err != nil {
+		return ErrorResult("permission denied: cron job uses a credential context owned by another user")
+	}
 
-	patchObj, ok := args["patch"].(map[string]interface{})
+	patchObj, ok := args["patch"].(map[string]any)
 	if !ok {
 		return ErrorResult("patch object is required for update action")
 	}
+
+	// A command payload on update follows the same forms (shell string or argv)
+	// and the same gate as add. Parse it out first and drop the raw keys so the
+	// generic patch unmarshal below — whose Command field is a structured spec —
+	// can't choke on a shell string, and so update can't slip a command payload
+	// past the command-enabled gate.
+	cmdSpec := parseCronCommandSpec(patchObj)
+	delete(patchObj, "command")
+	delete(patchObj, "commandArgv")
 
 	var patch store.CronJobPatch
 	// Re-marshal and unmarshal to leverage JSON tags
 	patchJSON, _ := json.Marshal(patchObj)
 	json.Unmarshal(patchJSON, &patch)
 
-	job, err := t.cronStore.UpdateJob(jobID, patch)
+	if cmdSpec != nil {
+		if !t.commandEnabled {
+			return ErrorResult("command cron is disabled on this gateway (set cron.command_enabled=true to allow it)")
+		}
+		if err := store.ValidateCronCommandSpec(cmdSpec); err != nil {
+			return ErrorResult(err.Error())
+		}
+		patch.Command = cmdSpec
+	}
+
+	// Resolve provider override by name (providerId UUID is handled by JSON tags above).
+	if name, _ := patchObj["provider"].(string); name != "" {
+		pid, errR := t.resolveProviderID(ctx, patchObj)
+		if errR != nil {
+			return errR
+		}
+		patch.ProviderID = pid
+	}
+
+	// Validate atMs not in the past when updating schedule
+	if patch.Schedule != nil && patch.Schedule.Kind == "at" && patch.Schedule.AtMS != nil {
+		if *patch.Schedule.AtMS <= time.Now().UnixMilli() {
+			return ErrorResult(fmt.Sprintf("schedule.atMs is in the past (%d). Use the datetime tool to get current time, then set a future timestamp. Current time is %d ms", *patch.Schedule.AtMS, time.Now().UnixMilli()))
+		}
+	}
+
+	job, err := t.cronStore.UpdateJob(ctx, jobID, patch)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to update cron job: %v", err))
 	}
 
-	data, _ := json.MarshalIndent(map[string]interface{}{"job": job}, "", "  ")
+	data, _ := json.MarshalIndent(map[string]any{"job": store.RedactCronJobCredentialContext(*job)}, "", "  ")
 	return NewResult(string(data))
 }
 
-func (t *CronTool) handleRemove(args map[string]interface{}, agentID, userID string) *Result {
+func (t *CronTool) handleRemove(ctx context.Context, args map[string]any, agentID, userID string) *Result {
 	jobID := resolveJobID(args)
 	if jobID == "" {
 		return ErrorResult("jobId is required for remove action")
 	}
 
-	if _, errResult := t.checkJobOwnership(jobID, agentID, userID); errResult != nil {
+	_, errResult := t.checkJobOwnership(ctx, jobID, agentID, userID)
+	if errResult != nil {
 		return errResult
 	}
 
-	if err := t.cronStore.RemoveJob(jobID); err != nil {
+	if err := t.cronStore.RemoveJob(ctx, jobID); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to remove cron job: %v", err))
 	}
 
-	data, _ := json.MarshalIndent(map[string]interface{}{"deleted": true, "jobId": jobID}, "", "  ")
+	data, _ := json.MarshalIndent(map[string]any{"deleted": true, "jobId": jobID}, "", "  ")
 	return NewResult(string(data))
 }
 
-func (t *CronTool) handleRun(args map[string]interface{}, agentID, userID string) *Result {
+func (t *CronTool) handleRun(ctx context.Context, args map[string]any, agentID, userID string) *Result {
 	jobID := resolveJobID(args)
 	if jobID == "" {
 		return ErrorResult("jobId is required for run action")
 	}
 
-	if _, errResult := t.checkJobOwnership(jobID, agentID, userID); errResult != nil {
+	existing, errResult := t.checkJobOwnership(ctx, jobID, agentID, userID)
+	if errResult != nil {
 		return errResult
+	}
+	if err := store.CheckCronCredentialOwner(ctx, existing); err != nil {
+		return ErrorResult("permission denied: cron job uses a credential context owned by another user")
 	}
 
 	runMode, _ := args["runMode"].(string)
 	force := runMode == "force"
 
-	ran, reason, err := t.cronStore.RunJob(jobID, force)
+	ran, reason, err := t.cronStore.RunJob(ctx, jobID, force)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("failed to run cron job: %v", err))
 	}
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"ran":   ran,
 		"jobId": jobID,
 	}
@@ -331,12 +512,12 @@ func (t *CronTool) handleRun(args map[string]interface{}, agentID, userID string
 	return NewResult(string(data))
 }
 
-func (t *CronTool) handleRuns(args map[string]interface{}, agentID, userID string) *Result {
+func (t *CronTool) handleRuns(ctx context.Context, args map[string]any, agentID, userID string) *Result {
 	jobID := resolveJobID(args)
 
 	// Validate ownership if a specific job is requested
 	if jobID != "" {
-		if _, errResult := t.checkJobOwnership(jobID, agentID, userID); errResult != nil {
+		if _, errResult := t.checkJobOwnership(ctx, jobID, agentID, userID); errResult != nil {
 			return errResult
 		}
 	}
@@ -346,19 +527,44 @@ func (t *CronTool) handleRuns(args map[string]interface{}, agentID, userID strin
 		limit = int(v)
 	}
 
-	entries := t.cronStore.GetRunLog(jobID, limit)
+	entries, total := t.cronStore.GetRunLog(ctx, jobID, limit, 0)
 
-	result := map[string]interface{}{
+	result := map[string]any{
 		"entries": entries,
 		"count":   len(entries),
+		"total":   total,
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
 	return NewResult(string(data))
 }
 
+// resolveProviderID resolves an optional per-job provider override from a job/patch
+// map. Accepts "providerId" (UUID string) or "provider" (provider name, looked up
+// via the provider store). Returns (nil, nil) when neither is present.
+func (t *CronTool) resolveProviderID(ctx context.Context, m map[string]any) (*uuid.UUID, *Result) {
+	if raw, _ := m["providerId"].(string); raw != "" {
+		id, err := uuid.Parse(raw)
+		if err != nil {
+			return nil, ErrorResult(fmt.Sprintf("invalid providerId %q: must be a UUID", raw))
+		}
+		return &id, nil
+	}
+	if name, _ := m["provider"].(string); name != "" {
+		if t.providerStore == nil {
+			return nil, ErrorResult("provider override by name is unavailable; pass providerId instead")
+		}
+		pd, err := t.providerStore.GetProviderByName(ctx, name)
+		if err != nil || pd == nil {
+			return nil, ErrorResult(fmt.Sprintf("provider %q not found; register it first or pass a valid providerId", name))
+		}
+		return &pd.ID, nil
+	}
+	return nil, nil
+}
+
 // --- helpers ---
 
-func resolveJobID(args map[string]interface{}) string {
+func resolveJobID(args map[string]any) string {
 	if id, ok := args["jobId"].(string); ok && id != "" {
 		return id
 	}
@@ -368,12 +574,58 @@ func resolveJobID(args map[string]interface{}) string {
 	return ""
 }
 
-func stringFromMap(m map[string]interface{}, key string) string {
+func stringFromMap(m map[string]any, key string) string {
 	v, _ := m[key].(string)
 	return v
 }
 
-func numberFromMap(m map[string]interface{}, key string) (float64, bool) {
+func numberFromMap(m map[string]any, key string) (float64, bool) {
 	v, ok := m[key].(float64)
 	return v, ok
+}
+
+// parseCronCommandSpec extracts an optional deterministic command payload from a
+// cron tool "job" object. It accepts either a shell string ("command", wrapped
+// as ["sh","-c",...]) or an explicit argv array ("commandArgv"). Returns nil
+// when no command fields are present (i.e. it's a normal agent-turn job).
+func parseCronCommandSpec(jobObj map[string]any) *store.CronCommandSpec {
+	var argv []string
+	if raw, ok := jobObj["commandArgv"].([]any); ok {
+		for _, v := range raw {
+			if s, ok := v.(string); ok {
+				argv = append(argv, s)
+			}
+		}
+	}
+	if len(argv) == 0 {
+		if s, _ := jobObj["command"].(string); s != "" {
+			argv = []string{"sh", "-c", s}
+		}
+	}
+	if len(argv) == 0 {
+		return nil
+	}
+
+	spec := &store.CronCommandSpec{Argv: argv}
+	if cwd, _ := jobObj["commandCwd"].(string); cwd != "" {
+		spec.Cwd = cwd
+	}
+	if v, ok := numberFromMap(jobObj, "commandTimeoutSeconds"); ok {
+		spec.TimeoutSeconds = int(v)
+	}
+	if v, ok := numberFromMap(jobObj, "commandNoOutputTimeoutSeconds"); ok {
+		spec.NoOutputTimeoutSeconds = int(v)
+	}
+	if v, ok := numberFromMap(jobObj, "commandOutputMaxBytes"); ok {
+		spec.OutputMaxBytes = int(v)
+	}
+	if env, ok := jobObj["commandEnv"].(map[string]any); ok && len(env) > 0 {
+		spec.Env = make(map[string]string, len(env))
+		for k, v := range env {
+			if s, ok := v.(string); ok {
+				spec.Env[k] = s
+			}
+		}
+	}
+	return spec
 }

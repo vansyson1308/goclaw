@@ -1,0 +1,133 @@
+package pipeline
+
+import (
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+)
+
+// ContextState: owned by ContextStage, read by ThinkStage.
+type ContextState struct {
+	ContextFiles   []any // bootstrap.ContextFile — typed in Phase 2, any avoids circular import
+	SkillsSummary  string
+	TeamContext    string // team workspace context injected for team runs
+	MemorySection  string // L0 auto-injected memory context for system prompt
+	Summary        string // session summary for context continuity
+	HadBootstrap   bool
+	OverheadTokens int // system prompt + context files (accurate via TokenCounter)
+
+	// EffectiveContextWindow is the context window size (in tokens) resolved
+	// per-run from the provider/model pair via ModelRegistry. Resolved ONCE in
+	// ContextStage and read by PruneStage on every iteration. Zero means "no
+	// model-specific data available" and PruneStage falls back to
+	// PipelineConfig.ContextWindow.
+	//
+	// Resolved once per run (not per iteration) to avoid budget skew — if the
+	// model somehow changes mid-run a mismatch causes silent truncation loops.
+	EffectiveContextWindow int
+}
+
+// ThinkState: owned by ThinkStage.
+type ThinkState struct {
+	LastResponse *providers.ChatResponse
+	TotalUsage   providers.Usage
+	// LastUsage snapshots the most recent iteration that reported prompt tokens.
+	// Unlike TotalUsage (run-cumulative), it reflects the actual size of the last
+	// prompt sent to the model — the session's current context. Consumed by
+	// FinalizeStage → UpdateMetadata → SetLastPromptTokens for the sessions
+	// context-usage display and compaction calibration.
+	LastUsage         providers.Usage
+	TruncRetries      int  // consecutive truncation retries (max 3)
+	OverflowRetries   int  // context overflow compact+retry attempts (max 1)
+	EmptyReplyRetries int  // consecutive empty final-reply nudges (max maxEmptyReplyRetries)
+	StreamingActive   bool // true during active stream
+
+	// Tools is populated by ContextStage (iteration=0) for overhead calculation.
+	// It holds the best-effort tool list at run start and is used exclusively by
+	// the overhead counter in ContextStage. ThinkStage does NOT consume this field —
+	// it always calls BuildFilteredTools per iteration because the tool list is
+	// iteration-dependent (final iteration strips all tools).
+	Tools []providers.ToolDefinition
+}
+
+// PruneState: owned by PruneStage.
+type PruneState struct {
+	MidLoopCompacted bool // true after first in-loop compaction
+	HistoryTokens    int  // last computed history token count
+	HistoryBudget    int  // contextWindow * maxHistoryShare
+}
+
+// ToolState: owned by ToolStage.
+type ToolState struct {
+	// AllowedTools is the per-iteration execution allowlist built from tool
+	// definitions sent to the provider. Nil means "no runtime restriction".
+	AllowedTools   map[string]bool
+	LoopDetector   any // concrete type toolLoopState lives in agent; Phase 5 defines LoopDetector interface
+	TotalToolCalls int
+	AsyncToolCalls []string      // tool names that executed async (spawn)
+	MediaResults   []MediaResult // media files produced by tools
+	Deliverables   []string      // tool output content for team task results
+	LoopKilled     bool          // set when loop detector triggers critical
+}
+
+// ObserveState: owned by ObserveStage.
+type ObserveState struct {
+	FinalContent   string // accumulated response text
+	FinalThinking  string // reasoning output
+	BlockReplies   int
+	LastBlockReply string
+
+	// ContinueAfterFinal is set when a user follow-up arrives after the model
+	// has produced a final answer but before the run finalizes. The pipeline
+	// must give the model another turn so accepted messages are not silently
+	// stored without being answered.
+	ContinueAfterFinal bool
+
+	// AssistantImages accumulates final (non-partial) images from every iteration's
+	// ChatResponse.Images. FinalizeStage persists these to workspace/media/.
+	// Accumulation is required because LastResponse holds only the final iteration's
+	// response — if the LLM emits an image_generation_call alongside a function_call
+	// in iter N and responds text-only in iter N+1, reading only LastResponse.Images
+	// would lose the image.
+	AssistantImages []providers.ImageContent
+
+	// Post-model-response hook blocking.
+	BlockedByHook       bool   // true if post_model_response hook blocked delivery
+	HookRejectionReason string // rejection reason from hook, injected as user message
+}
+
+// CompactState: owned by CheckpointStage + MemoryFlushStage.
+type CompactState struct {
+	CheckpointFlushedMsgs  int
+	MemoryFlushedThisCycle bool
+	CompactionCount        int
+}
+
+// EvolutionState: owned by skill evolution nudge logic.
+type EvolutionState struct {
+	Nudge70Sent     bool
+	Nudge90Sent     bool
+	PostscriptSent  bool
+	BootstrapWrite  bool // BOOTSTRAP.md write detected
+	TeamTaskCreates int  // team_tasks tool calls
+	TeamTaskSpawns  int  // delegate tool calls (spawns)
+}
+
+// RunResult is the final output of a pipeline run.
+type RunResult struct {
+	RunID          string
+	Content        string
+	Thinking       string
+	TotalUsage     providers.Usage
+	LastUsage      providers.Usage
+	Iterations     int
+	ToolCalls      int
+	LoopKilled     bool
+	Duration       time.Duration
+	AsyncToolCalls []string
+	MediaResults   []MediaResult
+	Deliverables   []string
+	BlockReplies   int
+	LastBlockReply string
+	Calls          []providers.CallUsage
+}

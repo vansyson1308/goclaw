@@ -61,3 +61,163 @@ func TestRenderTableAsCode_Vietnamese(t *testing.T) {
 		}
 	}
 }
+
+func TestMarkdownToTelegramHTML_Mentions(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string // substring that MUST appear
+		deny  string // substring that must NOT appear
+	}{
+		{
+			name:  "mention stays plain text",
+			input: "Hello @viettran how are you?",
+			want:  "@viettran",
+			deny:  `href="https://t.me/`,
+		},
+		{
+			name:  "mention not wrapped in link tag",
+			input: "cc @john please review",
+			want:  "@john",
+			deny:  "<a ",
+		},
+		{
+			name:  "email not treated as mention",
+			input: "send to user@domain.com",
+			want:  "user@domain.com",
+			deny:  `href=`,
+		},
+		{
+			name:  "mention survives italic conversion",
+			input: "_italic_ and @bot_name end",
+			want:  "@bot_name",
+			deny:  `<a `,
+		},
+		{
+			name:  "multiple mentions plain text",
+			input: "@alice and @bob discussed",
+			want:  "@alice",
+			deny:  "t.me",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := markdownToTelegramHTML(tt.input)
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("expected %q in output, got: %s", tt.want, got)
+			}
+			if tt.deny != "" && strings.Contains(got, tt.deny) {
+				t.Errorf("unexpected %q in output, got: %s", tt.deny, got)
+			}
+		})
+	}
+}
+
+func TestChunkHTML(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		maxLen int
+		want   []string
+	}{
+		{
+			name:   "natural boundary",
+			input:  "hello world",
+			maxLen: 6,
+			want:   []string{"hello", "world"},
+		},
+		{
+			name:   "tag exceeds maxLen uses fallback",
+			input:  "hello <a href='url'>link</a> world",
+			maxLen: 12,
+			want:   []string{"hello", "<a href='url", "'>link</a>", "world"},
+		},
+		{
+			name:   "avoid mid-tag split safe",
+			input:  "hello <a href='url'>link</a> world",
+			maxLen: 25,
+			// "hello " (6) -> remaining "<a href='url'>link</a> world" (28)
+			// maxLen 25. remaining[:25] is "<a href='url'>link</a> wo"
+			// lastOpen is at "</a" (18). lastClose at "</a>" (21).
+			// lastOpen < lastClose (18 < 21). No cut change from safety.
+			// lastSpace is at index 22 (" world"). cutAt=23.
+			want: []string{"hello", "<a href='url'>link</a>", "world"},
+		},
+		{
+			name:   "avoid mid-entity split",
+			input:  "hello &amp; world",
+			maxLen: 9,
+			// "hello " (6) -> then "&amp; world"
+			// At second chunk: remaining="&amp; world", maxLen=9
+			// remaining[:9] is "&amp; wor"
+			// lastSpace is at index 5. cutAt=6.
+			want: []string{"hello", "&amp;", "world"},
+		},
+		{
+			name:   "monolithic fallback",
+			input:  "monolithicblock",
+			maxLen: 5,
+			want:   []string{"monol", "ithic", "block"},
+		},
+		{
+			name:   "paragraph preferred",
+			input:  "para1\n\npara2\nline3",
+			maxLen: 10,
+			want:   []string{"para1", "para2", "line3"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := chunkHTML(tt.input, tt.maxLen)
+			if len(got) != len(tt.want) {
+				t.Fatalf("chunkHTML() returned %d chunks, want %d\ngot:  %q\nwant: %q", len(got), len(tt.want), got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("chunk[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestMarkdownToTelegramHTML_URLsWithUnderscores(t *testing.T) {
+	tests := []struct {
+		name string
+		input string
+		want  string
+		deny  string
+	}{
+		{
+			name:  "bare URL with underscores not broken by italic",
+			input: "Check https://pre.glomotra.dev/uk/syngas_dailymail_2026_ai/?fname=James here",
+			want:  "https://pre.glomotra.dev/uk/syngas_dailymail_2026_ai/?fname=James",
+			deny:  "<i>",
+		},
+		{
+			name:  "URL without underscores unchanged",
+			input: "Visit https://example.com/path today",
+			want:  "https://example.com/path",
+		},
+		{
+			name:  "markdown link with underscored URL preserved",
+			input: "[Click](https://example.com/a_b_c)",
+			want:  `href="https://example.com/a_b_c"`,
+			deny:  "<i>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := markdownToTelegramHTML(tt.input)
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("expected %q in output, got: %s", tt.want, got)
+			}
+			if tt.deny != "" && strings.Contains(got, tt.deny) {
+				t.Errorf("unexpected %q in output, got: %s", tt.deny, got)
+			}
+		})
+	}
+}

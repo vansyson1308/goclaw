@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -106,10 +104,13 @@ type apiResponse struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
+	// Bot is only present on the legacy /open-apis/bot/v3/info endpoint,
+	// which returns the bot object at the top level instead of inside "data".
+	Bot json.RawMessage `json:"bot"`
 }
 
 // doJSON performs an authenticated JSON API call with auto token refresh.
-func (c *LarkClient) doJSON(ctx context.Context, method, path string, body interface{}) (*apiResponse, error) {
+func (c *LarkClient) doJSON(ctx context.Context, method, path string, body any) (*apiResponse, error) {
 	resp, err := c.doJSONOnce(ctx, method, path, body)
 	if err != nil {
 		return nil, err
@@ -122,7 +123,7 @@ func (c *LarkClient) doJSON(ctx context.Context, method, path string, body inter
 	return resp, nil
 }
 
-func (c *LarkClient) doJSONOnce(ctx context.Context, method, path string, body interface{}) (*apiResponse, error) {
+func (c *LarkClient) doJSONOnce(ctx context.Context, method, path string, body any) (*apiResponse, error) {
 	token, err := c.getToken(ctx)
 	if err != nil {
 		return nil, err
@@ -251,158 +252,4 @@ func (c *LarkClient) doMultipart(ctx context.Context, path string, fields map[st
 		return nil, fmt.Errorf("lark upload decode: %w", err)
 	}
 	return &result, nil
-}
-
-// --- IM API: Messages ---
-
-type SendMessageResp struct {
-	MessageID string `json:"message_id"`
-}
-
-func (c *LarkClient) SendMessage(ctx context.Context, receiveIDType, receiveID, msgType, content string) (*SendMessageResp, error) {
-	path := "/open-apis/im/v1/messages?receive_id_type=" + receiveIDType
-	body := map[string]string{
-		"receive_id": receiveID,
-		"msg_type":   msgType,
-		"content":    content,
-	}
-	resp, err := c.doJSON(ctx, "POST", path, body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.Code != 0 {
-		return nil, fmt.Errorf("send message: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	var data SendMessageResp
-	json.Unmarshal(resp.Data, &data)
-	return &data, nil
-}
-
-// --- IM API: Images ---
-
-func (c *LarkClient) DownloadImage(ctx context.Context, imageKey string) ([]byte, error) {
-	path := "/open-apis/im/v1/images/" + imageKey
-	data, _, err := c.doDownload(ctx, path)
-	return data, err
-}
-
-func (c *LarkClient) UploadImage(ctx context.Context, data io.Reader) (string, error) {
-	resp, err := c.doMultipart(ctx, "/open-apis/im/v1/images",
-		map[string]string{"image_type": "message"},
-		"image", data, "image.png")
-	if err != nil {
-		return "", err
-	}
-	if resp.Code != 0 {
-		return "", fmt.Errorf("upload image: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	var result struct {
-		ImageKey string `json:"image_key"`
-	}
-	json.Unmarshal(resp.Data, &result)
-	return result.ImageKey, nil
-}
-
-// --- IM API: Files ---
-
-func (c *LarkClient) UploadFile(ctx context.Context, data io.Reader, fileName, fileType string, durationMs int) (string, error) {
-	fields := map[string]string{
-		"file_type": fileType,
-		"file_name": fileName,
-	}
-	if durationMs > 0 {
-		fields["duration"] = strconv.Itoa(durationMs)
-	}
-	resp, err := c.doMultipart(ctx, "/open-apis/im/v1/files", fields, "file", data, fileName)
-	if err != nil {
-		return "", err
-	}
-	if resp.Code != 0 {
-		return "", fmt.Errorf("upload file: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	var result struct {
-		FileKey string `json:"file_key"`
-	}
-	json.Unmarshal(resp.Data, &result)
-	return result.FileKey, nil
-}
-
-// --- IM API: Message Resources ---
-
-func (c *LarkClient) DownloadMessageResource(ctx context.Context, messageID, fileKey, resourceType string) ([]byte, string, error) {
-	path := fmt.Sprintf("/open-apis/im/v1/messages/%s/resources/%s?type=%s", messageID, fileKey, resourceType)
-	return c.doDownload(ctx, path)
-}
-
-// --- CardKit API ---
-
-func (c *LarkClient) CreateCard(ctx context.Context, cardType, data string) (string, error) {
-	resp, err := c.doJSON(ctx, "POST", "/open-apis/cardkit/v1/cards", map[string]string{
-		"type": cardType,
-		"data": data,
-	})
-	if err != nil {
-		return "", err
-	}
-	if resp.Code != 0 {
-		return "", fmt.Errorf("create card: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	var result struct {
-		CardID string `json:"card_id"`
-	}
-	json.Unmarshal(resp.Data, &result)
-	return result.CardID, nil
-}
-
-func (c *LarkClient) UpdateCardSettings(ctx context.Context, cardID, settings string, seq int, uuid string) error {
-	path := "/open-apis/cardkit/v1/cards/" + cardID
-	resp, err := c.doJSON(ctx, "PATCH", path, map[string]interface{}{
-		"settings": settings,
-		"sequence": seq,
-		"uuid":     uuid,
-	})
-	if err != nil {
-		return err
-	}
-	if resp.Code != 0 {
-		return fmt.Errorf("update card settings: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	return nil
-}
-
-func (c *LarkClient) UpdateCardElement(ctx context.Context, cardID, elementID, content string, seq int, uuid string) error {
-	path := fmt.Sprintf("/open-apis/cardkit/v1/cards/%s/elements/%s", cardID, elementID)
-	resp, err := c.doJSON(ctx, "PATCH", path, map[string]interface{}{
-		"content":  content,
-		"sequence": seq,
-		"uuid":     uuid,
-	})
-	if err != nil {
-		return err
-	}
-	if resp.Code != 0 {
-		slog.Debug("lark update card element failed", "code", resp.Code, "msg", resp.Msg)
-		return fmt.Errorf("update card element: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	return nil
-}
-
-// --- Contact API ---
-
-func (c *LarkClient) GetUser(ctx context.Context, userID, userIDType string) (string, error) {
-	path := fmt.Sprintf("/open-apis/contact/v3/users/%s?user_id_type=%s", userID, userIDType)
-	resp, err := c.doJSON(ctx, "GET", path, nil)
-	if err != nil {
-		return "", err
-	}
-	if resp.Code != 0 {
-		return "", fmt.Errorf("get user: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	var result struct {
-		User struct {
-			Name string `json:"name"`
-		} `json:"user"`
-	}
-	json.Unmarshal(resp.Data, &result)
-	return result.User.Name, nil
 }

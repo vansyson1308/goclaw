@@ -3,6 +3,9 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +22,7 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 		*f = ss
 		return nil
 	}
-	var raw []interface{}
+	var raw []any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
@@ -40,46 +43,237 @@ func (f *FlexibleStringSlice) UnmarshalJSON(data []byte) error {
 
 // Config is the root configuration for the GoClaw Gateway.
 type Config struct {
+	DataDir   string          `json:"data_dir,omitempty"` // persistent data directory (default: ~/.goclaw/data)
+	Branding  BrandingConfig  `json:"branding,omitempty"`
 	Agents    AgentsConfig    `json:"agents"`
 	Channels  ChannelsConfig  `json:"channels"`
 	Providers ProvidersConfig `json:"providers"`
 	Gateway   GatewayConfig   `json:"gateway"`
 	Tools     ToolsConfig     `json:"tools"`
+	Skills    SkillsConfig    `json:"skills"`
 	Sessions  SessionsConfig  `json:"sessions"`
-	Database  DatabaseConfig  `json:"database,omitempty"`
-	Tts       TtsConfig       `json:"tts,omitempty"`
-	Cron      CronConfig      `json:"cron,omitempty"`
-	Telemetry TelemetryConfig `json:"telemetry,omitempty"`
-	Tailscale TailscaleConfig `json:"tailscale,omitempty"`
+	Database  DatabaseConfig  `json:"database"`
+	Tts       TtsConfig       `json:"tts"`
+	Audio     *AudioConfig    `json:"audio,omitempty"` // optional STT/Music defaults (Phase 3/4)
+	Cron      CronConfig      `json:"cron"`
+	Telemetry TelemetryConfig `json:"telemetry"`
+	Tailscale TailscaleConfig `json:"tailscale"`
 	Bindings  []AgentBinding  `json:"bindings,omitempty"`
+	Hooks     HooksConfig     `json:"hooks"`
+	Packages  PackagesConfig  `json:"packages"` // runtime package mgmt (GitHub updater)
+	Messages  SystemMsgConfig `json:"system_messages,omitempty"`
 	mu        sync.RWMutex
+}
+
+// BrandingConfig customizes public app metadata and media used by the web UI.
+// URL fields may point to external URLs or to uploaded /branding-assets/* files.
+type BrandingConfig struct {
+	AppName           string `json:"app_name,omitempty"`
+	AppShortName      string `json:"app_short_name,omitempty"`
+	MetaTitle         string `json:"meta_title,omitempty"`
+	MetaDescription   string `json:"meta_description,omitempty"`
+	MetaKeywords      string `json:"meta_keywords,omitempty"`
+	LogoURL           string `json:"logo_url,omitempty"`
+	FaviconURL        string `json:"favicon_url,omitempty"`
+	AppleTouchIconURL string `json:"apple_touch_icon_url,omitempty"`
+	OGTitle           string `json:"og_title,omitempty"`
+	OGDescription     string `json:"og_description,omitempty"`
+	OGImageURL        string `json:"og_image_url,omitempty"`
+	ThemeColor        string `json:"theme_color,omitempty"`
+}
+
+// HasValues reports whether any branding override is configured.
+func (b BrandingConfig) HasValues() bool {
+	return strings.TrimSpace(b.AppName) != "" ||
+		strings.TrimSpace(b.AppShortName) != "" ||
+		strings.TrimSpace(b.MetaTitle) != "" ||
+		strings.TrimSpace(b.MetaDescription) != "" ||
+		strings.TrimSpace(b.MetaKeywords) != "" ||
+		strings.TrimSpace(b.LogoURL) != "" ||
+		strings.TrimSpace(b.FaviconURL) != "" ||
+		strings.TrimSpace(b.AppleTouchIconURL) != "" ||
+		strings.TrimSpace(b.OGTitle) != "" ||
+		strings.TrimSpace(b.OGDescription) != "" ||
+		strings.TrimSpace(b.OGImageURL) != "" ||
+		strings.TrimSpace(b.ThemeColor) != ""
+}
+
+// PackagesConfig tunes the runtime package update flow (Phase 1: GitHub
+// binaries). GitHubToken is RESERVED for Phase 2 (authenticated rate-limit
+// bump); currently unwired.
+//
+// UpdatesCheckTTL controls how stale the updates cache can get before a
+// GET /v1/packages/updates triggers a background refresh. Encoded as
+// human-readable string (e.g. "1h", "30m") parsed via time.ParseDuration;
+// empty string → default 1h.
+//
+// ScratchDir is the tmp workspace used by the update executor for download
+// + extract + staging before atomic swap. Empty or unusable values fall back to
+// "{runtimeDir}/tmp"; operators MAY set an explicit writable path.
+type PackagesConfig struct {
+	GitHubToken     string `json:"github_token,omitempty"`      // Phase 2 stub
+	UpdatesCheckTTL string `json:"updates_check_ttl,omitempty"` // e.g. "1h"
+	ScratchDir      string `json:"scratch_dir,omitempty"`       // abs path
+}
+
+// UpdatesCheckTTLDuration parses UpdatesCheckTTL returning 1h on empty/invalid.
+// SystemMsgConfig customizes operator-facing system messages that GoClaw
+// sends directly, outside normal LLM replies. Message templates use
+// {{variable}} placeholders and may be overridden per locale.
+type SystemMsgConfig struct {
+	DefaultLocale string                            `json:"default_locale,omitempty"`
+	Messages      map[string]LocalizedSystemMessage `json:"messages,omitempty"`
+}
+
+// LocalizedSystemMessage maps locale code ("en", "vi", "zh", "ko", "ru") to a
+// template override for one system message key.
+type LocalizedSystemMessage map[string]string
+
+// Clone returns a deep copy safe for snapshots and ReplaceFrom.
+func (s SystemMsgConfig) Clone() SystemMsgConfig {
+	out := SystemMsgConfig{DefaultLocale: strings.TrimSpace(s.DefaultLocale)}
+	if len(s.Messages) == 0 {
+		return out
+	}
+	out.Messages = make(map[string]LocalizedSystemMessage, len(s.Messages))
+	for key, byLocale := range s.Messages {
+		if len(byLocale) == 0 {
+			continue
+		}
+		cp := make(LocalizedSystemMessage, len(byLocale))
+		for locale, template := range byLocale {
+			cp[locale] = template
+		}
+		out.Messages[key] = cp
+	}
+	return out
+}
+
+func (p PackagesConfig) UpdatesCheckTTLDuration() time.Duration {
+	if p.UpdatesCheckTTL == "" {
+		return time.Hour
+	}
+	d, err := time.ParseDuration(p.UpdatesCheckTTL)
+	if err != nil || d <= 0 {
+		return time.Hour
+	}
+	return d
+}
+
+// HooksConfig tunes the script-hook runtime caps. All zero-valued fields fall
+// back to the handlers package defaults (see handlers.NewScriptHandler).
+//
+// ScriptConcurrency bounds the total concurrent script executions per process.
+// ScriptPerTenantConcurrency bounds a single tenant's share of that pool so a
+// runaway tenant cannot starve global slots. ScriptCacheSize caps the LRU of
+// compiled goja programs keyed by (hookID, version).
+//
+// BuiltinDisable names builtin hook IDs (from Phase 04's builtins.yaml) that
+// the operator wants force-disabled at startup — per-deployment escape hatch.
+type HooksConfig struct {
+	ScriptConcurrency          int      `json:"script_concurrency,omitempty"`
+	ScriptPerTenantConcurrency int      `json:"script_per_tenant_concurrency,omitempty"`
+	ScriptCacheSize            int      `json:"script_cache_size,omitempty"`
+	BuiltinDisable             []string `json:"builtin_disable,omitempty"`
 }
 
 // TailscaleConfig configures the optional Tailscale tsnet listener.
 // Requires building with -tags tsnet. Auth key from env only (never persisted).
 type TailscaleConfig struct {
-	Hostname  string `json:"hostname"`            // Tailscale machine name (e.g. "goclaw-gateway")
-	StateDir  string `json:"state_dir,omitempty"` // persistent state directory (default: os.UserConfigDir/tsnet-goclaw)
-	AuthKey   string `json:"-"`                   // from env GOCLAW_TSNET_AUTH_KEY only
-	Ephemeral bool   `json:"ephemeral,omitempty"` // remove node on exit (default false)
+	Hostname  string `json:"hostname"`             // Tailscale machine name (e.g. "goclaw-gateway")
+	StateDir  string `json:"state_dir,omitempty"`  // persistent state directory (default: os.UserConfigDir/tsnet-goclaw)
+	AuthKey   string `json:"-"`                    // from env GOCLAW_TSNET_AUTH_KEY only
+	Ephemeral bool   `json:"ephemeral,omitempty"`  // remove node on exit (default false)
 	EnableTLS bool   `json:"enable_tls,omitempty"` // use ListenTLS for auto HTTPS certs
 }
 
-// DatabaseConfig configures Postgres for managed mode.
-// PostgresDSN is NEVER read from config.json (secret) — only from env GOCLAW_POSTGRES_DSN.
+// DatabaseConfig configures the database connection and optional Redis cache.
+// DSN fields are NEVER read from config.json (secrets) — only from env vars.
 type DatabaseConfig struct {
-	PostgresDSN string `json:"-"`              // from env GOCLAW_POSTGRES_DSN only
-	Mode        string `json:"mode,omitempty"` // "standalone" (default) or "managed"
-}
-
-// IsManagedMode returns true if the gateway is running in managed (multi-tenant) mode.
-func (c *Config) IsManagedMode() bool {
-	return c.Database.Mode == "managed" && c.Database.PostgresDSN != ""
+	PostgresDSN    string `json:"-"` // from env GOCLAW_POSTGRES_DSN only
+	RedisDSN       string `json:"-"` // from env GOCLAW_REDIS_DSN only (optional, requires -tags redis)
+	StorageBackend string `json:"-"` // from env GOCLAW_STORAGE_BACKEND only ("postgres" or "sqlite", default "postgres")
+	SQLitePath     string `json:"-"` // from env GOCLAW_SQLITE_PATH only (default: {dataDir}/goclaw.db)
 }
 
 // SkillsConfig configures the skills storage system.
 type SkillsConfig struct {
-	StorageDir string `json:"storage_dir,omitempty"` // directory for skill content (default: ~/.goclaw/skills-store/)
+	StorageDir      string                  `json:"storage_dir,omitempty"`        // directory for skill content (default: dataDir/skills-store/)
+	MaxUploadSizeMB int                     `json:"max_upload_size_mb,omitempty"` // per-file ZIP upload limit
+	SlashCommands   SkillSlashCommandConfig `json:"slash_commands"`
+}
+
+// SkillSlashCommandConfig controls explicit slash-command skill activation.
+type SkillSlashCommandConfig struct {
+	Enabled         *bool  `json:"enabled,omitempty"`
+	SuggestNotFound *bool  `json:"suggest_not_found,omitempty"`
+	PartialMatching bool   `json:"partial_matching,omitempty"`
+	Prefix          string `json:"prefix,omitempty"`
+}
+
+const (
+	DefaultSkillMaxUploadSizeMB = 20
+	MinSkillMaxUploadSizeMB     = 1
+	MaxSkillMaxUploadSizeMB     = 500
+
+	DefaultSkillSlashCommandPrefix = "/"
+
+	SkillMaxUploadSizeSystemConfigKey        = "skills.max_upload_size_mb"
+	SkillSlashCommandsEnabledSystemConfigKey = "skills.slash_commands.enabled"
+	SkillSlashSuggestNotFoundSystemConfigKey = "skills.slash_commands.suggest_not_found"
+	SkillSlashPartialMatchingSystemConfigKey = "skills.slash_commands.partial_matching"
+	SkillSlashCommandPrefixSystemConfigKey   = "skills.slash_commands.prefix"
+)
+
+func ClampSkillMaxUploadSizeMB(value int) int {
+	if value == 0 {
+		return DefaultSkillMaxUploadSizeMB
+	}
+	if value < MinSkillMaxUploadSizeMB {
+		return MinSkillMaxUploadSizeMB
+	}
+	if value > MaxSkillMaxUploadSizeMB {
+		return MaxSkillMaxUploadSizeMB
+	}
+	return value
+}
+
+func (c SkillsConfig) EffectiveMaxUploadSizeMB() int {
+	return ClampSkillMaxUploadSizeMB(c.MaxUploadSizeMB)
+}
+
+func (c SkillsConfig) EffectiveMaxUploadSizeBytes() int64 {
+	return int64(c.EffectiveMaxUploadSizeMB()) << 20
+}
+
+func (c SkillSlashCommandConfig) EffectiveEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+func (c SkillSlashCommandConfig) EffectiveSuggestNotFound() bool {
+	if c.SuggestNotFound == nil {
+		return true
+	}
+	return *c.SuggestNotFound
+}
+
+func (c SkillSlashCommandConfig) EffectivePartialMatching() bool {
+	return c.PartialMatching
+}
+
+func (c SkillSlashCommandConfig) EffectivePrefix() string {
+	prefix := strings.TrimSpace(c.Prefix)
+	if prefix == "" {
+		return DefaultSkillSlashCommandPrefix
+	}
+	runes := []rune(prefix)
+	if len(runes) != 1 || runes[0] == ' ' || runes[0] == '\t' || runes[0] == '\n' || runes[0] == '\r' {
+		return DefaultSkillSlashCommandPrefix
+	}
+	return prefix
 }
 
 // AgentBinding maps a channel/peer pattern to a specific agent.
@@ -91,7 +285,7 @@ type AgentBinding struct {
 
 // BindingMatch specifies what messages this binding applies to.
 type BindingMatch struct {
-	Channel   string       `json:"channel"`            // "telegram", "discord", "slack", etc.
+	Channel   string       `json:"channel"`             // "telegram", "discord", "slack", etc.
 	AccountID string       `json:"accountId,omitempty"` // bot account ID
 	Peer      *BindingPeer `json:"peer,omitempty"`      // specific DM/group
 	GuildID   string       `json:"guildId,omitempty"`   // Discord guild
@@ -111,22 +305,22 @@ type AgentsConfig struct {
 
 // AgentDefaults are default settings for all agents.
 type AgentDefaults struct {
-	Workspace           string          `json:"workspace"`
-	RestrictToWorkspace bool            `json:"restrict_to_workspace"`
-	Provider            string          `json:"provider"`
-	Model               string          `json:"model"`
-	MaxTokens           int             `json:"max_tokens"`
-	Temperature         float64         `json:"temperature"`
-	MaxToolIterations   int             `json:"max_tool_iterations"`
-	ContextWindow       int             `json:"context_window"`
-	AgentType           string          `json:"agent_type,omitempty"` // "open" (default) or "predefined"
-	Subagents           *SubagentsConfig `json:"subagents,omitempty"`
-	Sandbox             *SandboxConfig         `json:"sandbox,omitempty"`
+	Workspace           string                `json:"workspace"`
+	AllowedPaths        []string              `json:"allowed_paths,omitempty"` // extra paths agents can access (cross-drive on Windows)
+	RestrictToWorkspace bool                  `json:"restrict_to_workspace"`
+	Provider            string                `json:"provider"`
+	Model               string                `json:"model"`
+	MaxTokens           int                   `json:"max_tokens"`
+	Temperature         float64               `json:"temperature"`
+	MaxToolIterations   int                   `json:"max_tool_iterations"`
+	ContextWindow       int                   `json:"context_window"`
+	MaxToolCalls        int                   `json:"max_tool_calls,omitempty"` // max total tool calls per run (0 = unlimited, default 25)
+	AgentType           string                `json:"agent_type,omitempty"`     // "open" (default) or "predefined"
+	Subagents           *SubagentsConfig      `json:"subagents,omitempty"`
+	Sandbox             *SandboxConfig        `json:"sandbox,omitempty"`
 	Memory              *MemoryConfig         `json:"memory,omitempty"`
-	Compaction          *CompactionConfig      `json:"compaction,omitempty"`
-	ContextPruning      *ContextPruningConfig  `json:"contextPruning,omitempty"`
-	Heartbeat           *HeartbeatConfig       `json:"heartbeat,omitempty"`
-
+	Compaction          *CompactionConfig     `json:"compaction,omitempty"`
+	ContextPruning      *ContextPruningConfig `json:"contextPruning,omitempty"`
 	// Bootstrap context truncation limits (matching TS bootstrapMaxChars / bootstrapTotalMaxChars)
 	BootstrapMaxChars      int `json:"bootstrapMaxChars,omitempty"`      // per-file max before truncation (default 20000)
 	BootstrapTotalMaxChars int `json:"bootstrapTotalMaxChars,omitempty"` // total budget across all files (default 24000)
@@ -136,8 +330,11 @@ type AgentDefaults struct {
 // Matching TS agents.defaults.compaction.
 type CompactionConfig struct {
 	ReserveTokensFloor int                `json:"reserveTokensFloor,omitempty"` // min reserve tokens (default 20000)
-	MaxHistoryShare    float64            `json:"maxHistoryShare,omitempty"`    // max share of context for history (default 0.75)
-	MemoryFlush        *MemoryFlushConfig `json:"memoryFlush,omitempty"`       // pre-compaction flush
+	MaxHistoryShare    float64            `json:"maxHistoryShare,omitempty"`    // max share of context for history-only post-turn compaction (default 0.85)
+	MaxRequestShare    float64            `json:"maxRequestShare,omitempty"`    // max share of context for the final request sent to the model (default 0.85)
+	KeepLastMessages   int                `json:"keepLastMessages,omitempty"`   // messages to keep after compaction (default 4)
+	TimeoutSeconds     int                `json:"timeoutSeconds,omitempty"`     // summarization timeout in seconds (default 120)
+	MemoryFlush        *MemoryFlushConfig `json:"memoryFlush,omitempty"`        // pre-compaction flush
 }
 
 // MemoryFlushConfig configures the pre-compaction memory flush.
@@ -146,20 +343,25 @@ type MemoryFlushConfig struct {
 	Enabled             *bool  `json:"enabled,omitempty"`             // default true (nil = enabled)
 	SoftThresholdTokens int    `json:"softThresholdTokens,omitempty"` // flush when within N tokens of compaction (default 4000)
 	Prompt              string `json:"prompt,omitempty"`              // user prompt for flush turn
-	SystemPrompt        string `json:"systemPrompt,omitempty"`       // system prompt for flush turn
+	SystemPrompt        string `json:"systemPrompt,omitempty"`        // system prompt for flush turn
 }
 
 // ContextPruningConfig configures in-memory context pruning of old tool results.
-// Matching TS src/agents/pi-extensions/context-pruning/settings.ts.
-// Mode "cache-ttl": prune when context exceeds softTrimRatio of context window.
+// Matches TS openclaw/src/agents/pi-hooks/context-pruning/settings.ts.
+//
+// Mode "" (default) or "off" → pruning disabled, zero overhead.
+// Mode "cache-ttl" → prune eligible tool results when ratio exceeds softTrimRatio,
+//
+//	gated by provider prompt-cache TTL (see PruneStage).
 type ContextPruningConfig struct {
-	Mode                string                    `json:"mode,omitempty"`                // "off" (default), "cache-ttl"
-	KeepLastAssistants  int                       `json:"keepLastAssistants,omitempty"`  // protect last N assistant msgs (default 3)
-	SoftTrimRatio       float64                   `json:"softTrimRatio,omitempty"`       // start soft trim at this % of window (default 0.3)
-	HardClearRatio      float64                   `json:"hardClearRatio,omitempty"`      // start hard clear at this % (default 0.5)
+	Mode                 string                   `json:"mode,omitempty"`                 // "" (default off), "off", "cache-ttl"
+	TTL                  string                   `json:"ttl,omitempty"`                  // cache TTL gate duration (default "5m"), Go duration string e.g. "5m", "30s"
+	KeepLastAssistants   int                      `json:"keepLastAssistants,omitempty"`   // protect last N assistant msgs (default 3)
+	SoftTrimRatio        float64                  `json:"softTrimRatio,omitempty"`        // start soft trim at this % of window (default 0.3)
+	HardClearRatio       float64                  `json:"hardClearRatio,omitempty"`       // start hard clear at this % (default 0.5)
 	MinPrunableToolChars int                      `json:"minPrunableToolChars,omitempty"` // min chars in prunable tools before acting (default 50000)
-	SoftTrim            *ContextPruningSoftTrim   `json:"softTrim,omitempty"`
-	HardClear           *ContextPruningHardClear  `json:"hardClear,omitempty"`
+	SoftTrim             *ContextPruningSoftTrim  `json:"softTrim,omitempty"`
+	HardClear            *ContextPruningHardClear `json:"hardClear,omitempty"`
 }
 
 // ContextPruningSoftTrim configures how long tool results are trimmed.
@@ -175,26 +377,6 @@ type ContextPruningHardClear struct {
 	Placeholder string `json:"placeholder,omitempty"` // replacement text (default "[Old tool result content cleared]")
 }
 
-// HeartbeatConfig configures periodic agent heartbeats.
-// Matching TS agents.defaults.heartbeat.
-type HeartbeatConfig struct {
-	Every       string             `json:"every,omitempty"`       // duration string: "30m", "1h", "0m"=disabled (default "30m")
-	ActiveHours *ActiveHoursConfig `json:"activeHours,omitempty"` // restrict to time window
-	Model       string             `json:"model,omitempty"`       // optional model override
-	Session     string             `json:"session,omitempty"`     // "main" (default) or explicit session key
-	Target      string             `json:"target,omitempty"`      // "last" (default), "none", or channel ID
-	To          string             `json:"to,omitempty"`          // optional recipient override (chat ID)
-	Prompt      string             `json:"prompt,omitempty"`      // custom heartbeat prompt
-	AckMaxChars int                `json:"ackMaxChars,omitempty"` // max chars after HEARTBEAT_OK before dropping (default 300)
-}
-
-// ActiveHoursConfig restricts heartbeats to a time window.
-type ActiveHoursConfig struct {
-	Start    string `json:"start,omitempty"`    // "HH:MM" inclusive
-	End      string `json:"end,omitempty"`      // "HH:MM" exclusive
-	Timezone string `json:"timezone,omitempty"` // IANA timezone (default: local)
-}
-
 // MemoryConfig configures the agent memory system (SQLite + FTS5 + optional embeddings).
 // Matching TS agents.defaults.memory.
 type MemoryConfig struct {
@@ -204,9 +386,26 @@ type MemoryConfig struct {
 	EmbeddingAPIBase  string  `json:"embedding_api_base,omitempty"` // custom endpoint URL
 	MaxResults        int     `json:"max_results,omitempty"`        // default 6
 	MaxChunkLen       int     `json:"max_chunk_len,omitempty"`      // default 1000
+	ChunkOverlap      int     `json:"chunk_overlap,omitempty"`      // overlap chars between chunks (default 200)
 	VectorWeight      float64 `json:"vector_weight,omitempty"`      // hybrid search vector weight (default 0.7)
 	TextWeight        float64 `json:"text_weight,omitempty"`        // hybrid search FTS weight (default 0.3)
 	MinScore          float64 `json:"min_score,omitempty"`          // minimum relevance score (default 0.35)
+
+	// Dreaming configures the episodic → long-term consolidation worker.
+	// nil = use hardcoded defaults (threshold=5, debounce=10min, enabled).
+	Dreaming *DreamingConfig `json:"dreaming,omitempty"`
+}
+
+// DreamingConfig controls per-agent behaviour of the consolidation dreaming
+// worker (episodic summaries → long-term memory). Pointer fields allow partial
+// overrides from JSONB to merge cleanly with defaults without clobbering
+// unset values (e.g. leaving VerboseLog at its default when only Threshold is
+// overridden).
+type DreamingConfig struct {
+	Enabled    *bool `json:"enabled,omitempty"`     // default true (nil = enabled)
+	DebounceMs int   `json:"debounce_ms,omitempty"` // min interval between runs per agent/user (default 600000 = 10 min)
+	Threshold  int   `json:"threshold,omitempty"`   // min unpromoted entries before running (default 5)
+	VerboseLog *bool `json:"verbose_log,omitempty"` // log debounce/below-threshold skips at info level (default false)
 }
 
 // SandboxConfig configures Docker-based sandbox execution.
@@ -225,9 +424,10 @@ type SandboxConfig struct {
 	Env             map[string]string `json:"env,omitempty"`              // extra environment variables
 
 	// Enhanced security
-	User           string `json:"user,omitempty"`              // container user (e.g. "1000:1000", "nobody")
-	TmpfsSizeMB    int    `json:"tmpfs_size_mb,omitempty"`     // default tmpfs size in MB (0 = Docker default)
-	MaxOutputBytes int    `json:"max_output_bytes,omitempty"`  // limit exec output capture (default 1MB)
+	User           string `json:"user,omitempty"`             // container user (e.g. "1000:1000", "nobody")
+	TmpfsSizeMB    int    `json:"tmpfs_size_mb,omitempty"`    // default tmpfs size in MB (0 = Docker default)
+	MaxOutputBytes int    `json:"max_output_bytes,omitempty"` // limit exec output capture (default 1MB)
+	Workdir        string `json:"workdir,omitempty"`          // container workdir + workspace mount target (default "/workspace")
 
 	// Pruning (matching TS SandboxPruneSettings)
 	IdleHours        int `json:"idle_hours,omitempty"`         // prune containers idle > N hours (default 24)
@@ -301,6 +501,9 @@ func (sc *SandboxConfig) ToSandboxConfig() sandbox.Config {
 	if sc.MaxOutputBytes > 0 {
 		cfg.MaxOutputBytes = sc.MaxOutputBytes
 	}
+	if sc.Workdir != "" {
+		cfg.Workdir = sc.Workdir
+	}
 
 	// Pruning
 	if sc.IdleHours > 0 {
@@ -316,23 +519,72 @@ func (sc *SandboxConfig) ToSandboxConfig() sandbox.Config {
 	return cfg
 }
 
+// ModelPricing defines per-million-token pricing for a model.
+type ModelPricing struct {
+	InputPerMillion       float64 `json:"input_per_million"`
+	OutputPerMillion      float64 `json:"output_per_million"`
+	CacheReadPerMillion   float64 `json:"cache_read_per_million,omitempty"`
+	CacheCreatePerMillion float64 `json:"cache_create_per_million,omitempty"`
+	// ReasoningPerMillion is the per-million-token rate for reasoning/thinking tokens
+	// (e.g., Claude extended thinking, GPT-5 reasoning, o3/o4-mini CoT). If zero,
+	// reasoning tokens fall back to OutputPerMillion (providers typically charge
+	// reasoning at the same rate as output tokens).
+	ReasoningPerMillion float64 `json:"reasoning_per_million,omitempty"`
+}
+
 // TelemetryConfig configures OpenTelemetry export for traces and spans.
 // When enabled, spans are exported to an OTLP-compatible backend (Jaeger, Tempo, Datadog, etc.)
 // in addition to PostgreSQL storage.
 type TelemetryConfig struct {
-	Enabled     bool              `json:"enabled,omitempty"`      // enable OTLP export (default false)
-	Endpoint    string            `json:"endpoint,omitempty"`     // OTLP endpoint (e.g. "localhost:4317", "https://otel.example.com:4318")
-	Protocol    string            `json:"protocol,omitempty"`     // "grpc" (default) or "http"
-	Insecure    bool              `json:"insecure,omitempty"`     // skip TLS verification (default false, set true for local dev)
-	ServiceName string            `json:"service_name,omitempty"` // OTEL service name (default "goclaw-gateway")
-	Headers     map[string]string `json:"headers,omitempty"`      // extra headers (e.g. auth tokens for cloud backends)
+	Enabled      bool                     `json:"enabled,omitempty"`       // enable OTLP export (default false)
+	Endpoint     string                   `json:"endpoint,omitempty"`      // OTLP endpoint (e.g. "localhost:4317", "https://otel.example.com:4318")
+	Protocol     string                   `json:"protocol,omitempty"`      // "grpc" (default) or "http"
+	Insecure     bool                     `json:"insecure,omitempty"`      // skip TLS verification (default false, set true for local dev)
+	ServiceName  string                   `json:"service_name,omitempty"`  // OTEL service name (default "goclaw-gateway")
+	Headers      map[string]string        `json:"headers,omitempty"`       // extra headers (e.g. auth tokens for cloud backends)
+	ModelPricing map[string]*ModelPricing `json:"model_pricing,omitempty"` // cost per model, key = "provider/model" or just "model"
 }
 
 // CronConfig configures the cron job system.
 type CronConfig struct {
-	MaxRetries     int    `json:"max_retries,omitempty"`      // max retry attempts on failure (default 3, 0 = no retry)
-	RetryBaseDelay string `json:"retry_base_delay,omitempty"` // initial backoff delay (default "2s", Go duration)
-	RetryMaxDelay  string `json:"retry_max_delay,omitempty"`  // maximum backoff delay (default "30s", Go duration)
+	MaxRetries      int    `json:"max_retries,omitempty"`      // max retry attempts on failure (default 3, 0 = no retry)
+	RetryBaseDelay  string `json:"retry_base_delay,omitempty"` // initial backoff delay (default "2s", Go duration)
+	RetryMaxDelay   string `json:"retry_max_delay,omitempty"`  // maximum backoff delay (default "30s", Go duration)
+	DefaultTimezone string `json:"default_timezone,omitempty"` // IANA timezone for cron expressions when not set per-job (e.g. "Asia/Ho_Chi_Minh")
+	JobTimeout      string `json:"job_timeout,omitempty"`      // max duration per cron job execution (default "10m", Go duration)
+	CommandEnabled  bool   `json:"command_enabled,omitempty"`  // allow deterministic shell-command cron payloads (kind="command"). Default false. These run inside the gateway process with its privileges — enable only on trusted deployments.
+	CommandTimeout  string `json:"command_timeout,omitempty"`  // default per-command wall-clock timeout when a job sets none (default "5m", Go duration)
+}
+
+// DefaultJobTimeout is the fallback timeout for cron job execution.
+const DefaultJobTimeout = 10 * time.Minute
+
+// DefaultCommandTimeout is the fallback per-command timeout for command cron payloads.
+const DefaultCommandTimeout = 5 * time.Minute
+
+// JobTimeoutDuration returns the configured job timeout or the default (10m).
+func (cc CronConfig) JobTimeoutDuration() time.Duration {
+	if cc.JobTimeout != "" {
+		d, err := time.ParseDuration(cc.JobTimeout)
+		if err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("cron: invalid job_timeout, using default", "value", cc.JobTimeout, "default", DefaultJobTimeout)
+	}
+	return DefaultJobTimeout
+}
+
+// CommandTimeoutDuration returns the configured default per-command timeout or
+// the default (5m). A per-job timeoutSeconds, when set, overrides this.
+func (cc CronConfig) CommandTimeoutDuration() time.Duration {
+	if cc.CommandTimeout != "" {
+		d, err := time.ParseDuration(cc.CommandTimeout)
+		if err == nil && d > 0 {
+			return d
+		}
+		slog.Warn("cron: invalid command_timeout, using default", "value", cc.CommandTimeout, "default", DefaultCommandTimeout)
+	}
+	return DefaultCommandTimeout
 }
 
 // ToRetryConfig converts CronConfig to cron.RetryConfig with defaults applied.
@@ -354,13 +606,14 @@ func (cc CronConfig) ToRetryConfig() cron.RetryConfig {
 	return cfg
 }
 
-// SubagentsConfig configures the subagent system (matching TS agents.defaults.subagents).
+// SubagentsConfig configures the GoClaw subagent system.
 // All fields optional — zero values mean "use default".
 type SubagentsConfig struct {
-	MaxConcurrent       int    `json:"maxConcurrent,omitempty"`       // default 8 (TS: DEFAULT_SUBAGENT_MAX_CONCURRENT)
+	MaxConcurrent       int    `json:"maxConcurrent,omitempty"`       // executing descendants per root agent; default 20
 	MaxSpawnDepth       int    `json:"maxSpawnDepth,omitempty"`       // default 1, range 1-5
 	MaxChildrenPerAgent int    `json:"maxChildrenPerAgent,omitempty"` // default 5, range 1-20
 	ArchiveAfterMinutes int    `json:"archiveAfterMinutes,omitempty"` // default 60
+	MaxRetries          int    `json:"maxRetries,omitempty"`          // max LLM retries on error (default 2)
 	Model               string `json:"model,omitempty"`               // model override for subagents
 }
 
@@ -374,9 +627,10 @@ type AgentSpec struct {
 	Temperature       float64         `json:"temperature,omitempty"`
 	MaxToolIterations int             `json:"max_tool_iterations,omitempty"`
 	ContextWindow     int             `json:"context_window,omitempty"`
-	AgentType         string          `json:"agent_type,omitempty"` // "open" or "predefined"
-	Skills            []string        `json:"skills,omitempty"`     // nil = all skills allowed
-	Tools             *ToolPolicySpec `json:"tools,omitempty"`      // per-agent tool policy
+	MaxToolCalls      int             `json:"max_tool_calls,omitempty"` // per-agent override
+	AgentType         string          `json:"agent_type,omitempty"`     // "open" or "predefined"
+	Skills            []string        `json:"skills,omitempty"`         // nil = all skills allowed
+	Tools             *ToolPolicySpec `json:"tools,omitempty"`          // per-agent tool policy
 	Workspace         string          `json:"workspace,omitempty"`
 	Default           bool            `json:"default,omitempty"`
 	Sandbox           *SandboxConfig  `json:"sandbox,omitempty"`
@@ -387,11 +641,14 @@ type AgentSpec struct {
 func (c *Config) ReplaceFrom(src *Config) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.DataDir = src.DataDir
+	c.Branding = src.Branding
 	c.Agents = src.Agents
 	c.Channels = src.Channels
 	c.Providers = src.Providers
 	c.Gateway = src.Gateway
 	c.Tools = src.Tools
+	c.Skills = src.Skills
 	c.Sessions = src.Sessions
 	c.Database = src.Database
 	c.Tts = src.Tts
@@ -399,6 +656,53 @@ func (c *Config) ReplaceFrom(src *Config) {
 	c.Telemetry = src.Telemetry
 	c.Tailscale = src.Tailscale
 	c.Bindings = src.Bindings
+	c.Messages = src.Messages.Clone()
+}
+
+// Clone returns a deep copy of the config while holding the read lock.
+func (c *Config) Clone() *Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	data, err := json.Marshal(c)
+	if err != nil {
+		return &Config{}
+	}
+	cp := Default()
+	if err := json.Unmarshal(data, cp); err != nil {
+		return &Config{}
+	}
+	return cp
+}
+
+// BrandingSnapshot returns the current branding overrides without exposing the
+// mutable root config to HTTP handlers.
+func (c *Config) BrandingSnapshot() BrandingConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Branding
+}
+
+// ShellDenyGroupsSnapshot returns a copy of the current global shell deny-group
+// overrides. Callers can safely resolve patterns without racing config reloads.
+func (c *Config) ShellDenyGroupsSnapshot() map[string]bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.Tools.ShellDenyGroups) == 0 {
+		return nil
+	}
+	groups := make(map[string]bool, len(c.Tools.ShellDenyGroups))
+	maps.Copy(groups, c.Tools.ShellDenyGroups)
+	return groups
+}
+
+// SystemMessagesSnapshot returns a deep copy of configured system-message
+// overrides without exposing mutable config state to long-lived channels.
+func (c *Config) SystemMessagesSnapshot() SystemMsgConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Messages.Clone()
 }
 
 // IdentityConfig defines agent persona / display identity.

@@ -1,4 +1,7 @@
+import { useTranslation } from "react-i18next";
 import { Switch } from "@/components/ui/switch";
+
+export { InfoLabel } from "@/components/shared/info-label";
 
 interface ConfigSectionProps {
   title: string;
@@ -15,6 +18,7 @@ export function ConfigSection({
   onToggle,
   children,
 }: ConfigSectionProps) {
+  const { t } = useTranslation("agents");
   return (
     <section className="space-y-3">
       <div className="flex items-center justify-between">
@@ -25,10 +29,10 @@ export function ConfigSection({
         <Switch checked={enabled} onCheckedChange={onToggle} />
       </div>
       {enabled ? (
-        <div className="rounded-lg border p-4 space-y-4">{children}</div>
+        <div className="rounded-lg border p-3 space-y-4 sm:p-4">{children}</div>
       ) : (
         <p className="text-xs text-muted-foreground italic">
-          Using global defaults from config.json
+          {t("config.usingGlobalDefaults")}
         </p>
       )}
     </section>

@@ -1,4 +1,7 @@
-import { useState, useMemo, useEffect } from "react";
+import { useMemo, useEffect, useState } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useTranslation } from "react-i18next";
 import {
   Dialog,
   DialogContent,
@@ -7,23 +10,17 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Combobox } from "@/components/ui/combobox";
 import type { AgentData } from "@/types/agent";
-import { slugify, isValidSlug } from "@/lib/slug";
 import { useProviders } from "@/pages/providers/hooks/use-providers";
 import { useProviderModels } from "@/pages/providers/hooks/use-provider-models";
 import { useProviderVerify } from "@/pages/providers/hooks/use-provider-verify";
-import { AGENT_PRESETS } from "./agent-presets";
+import { getChatGPTOAuthPoolOwnership } from "@/pages/providers/provider-utils";
+import { useAgentPresets } from "./agent-presets";
+import { agentCreateSchema, type AgentCreateFormData } from "@/schemas/agent.schema";
+import { AgentIdentityAndModelFields } from "./agent-identity-and-model-fields";
+import { AgentDescriptionSection } from "./agent-description-section";
+import { Label } from "@/components/ui/label";
+import { PromptModeCards, type PromptMode } from "./prompt-mode-cards";
 
 interface AgentCreateDialogProps {
   open: boolean;
@@ -32,228 +29,148 @@ interface AgentCreateDialogProps {
 }
 
 export function AgentCreateDialog({ open, onOpenChange, onCreate }: AgentCreateDialogProps) {
-  const { providers } = useProviders();
-  const [agentKey, setAgentKey] = useState("");
-  const [keyTouched, setKeyTouched] = useState(false);
-  const [displayName, setDisplayName] = useState("");
-  const [provider, setProvider] = useState("");
-  const [model, setModel] = useState("");
-  const [agentType, setAgentType] = useState<"open" | "predefined">("open");
-  const [description, setDescription] = useState("");
+  const { t } = useTranslation("agents");
+  const agentPresets = useAgentPresets();
+  const { providers, refresh: refreshProviders } = useProviders();
   const [loading, setLoading] = useState(false);
+  const [submitError, setSubmitError] = useState("");
 
-  const enabledProviders = providers.filter((p) => p.enabled);
+  const form = useForm<AgentCreateFormData>({
+    resolver: zodResolver(agentCreateSchema),
+    mode: "onChange",
+    defaultValues: {
+      emoji: "",
+      displayName: "",
+      agentKey: "",
+      provider: "",
+      model: "",
+      agentType: "predefined",
+      description: "",
+      selfEvolve: false,
+    },
+  });
 
-  // Look up provider ID from selected provider name for model fetching
-  const selectedProviderId = useMemo(
-    () => enabledProviders.find((p) => p.name === provider)?.id,
+  const { handleSubmit, watch, setValue, reset, formState: { errors } } = form;
+
+  const provider = watch("provider");
+  const model = watch("model");
+  const agentKey = watch("agentKey");
+  const displayName = watch("displayName");
+
+  const poolOwnership = useMemo(() => getChatGPTOAuthPoolOwnership(providers), [providers]);
+  const enabledProviders = useMemo(
+    () => providers.filter((p) => p.enabled && !poolOwnership.ownerByMember.has(p.name)),
+    [providers, poolOwnership],
+  );
+  const poolOwnerNames = useMemo(
+    () => new Set(poolOwnership.membersByOwner.keys()),
+    [poolOwnership],
+  );
+  const selectedProvider = useMemo(
+    () => enabledProviders.find((p) => p.name === provider),
     [enabledProviders, provider],
   );
+  const selectedProviderId = selectedProvider?.id;
   const { models, loading: modelsLoading } = useProviderModels(selectedProviderId);
   const { verify, verifying, result: verifyResult, reset: resetVerify } = useProviderVerify();
 
-  // Reset verification when provider or model changes
+  useEffect(() => { resetVerify(); }, [provider, model, resetVerify]);
+
   useEffect(() => {
-    resetVerify();
-  }, [provider, model, resetVerify]);
+    if (open) {
+      refreshProviders();
+    } else {
+      reset();
+      setSubmitError("");
+      resetVerify();
+    }
+  }, [open, reset, resetVerify, refreshProviders]);
 
   const handleVerify = async () => {
     if (!selectedProviderId || !model.trim()) return;
     await verify(selectedProviderId, model.trim());
   };
 
-  const handleCreate = async () => {
-    if (!agentKey.trim()) return;
+  const handleSubmitForm = async (data: AgentCreateFormData) => {
     setLoading(true);
+    setSubmitError("");
     try {
+      const otherConfig: Record<string, unknown> = {};
+      if (data.promptMode && data.promptMode !== "full") {
+        otherConfig.prompt_mode = data.promptMode;
+      }
       await onCreate({
-        agent_key: agentKey.trim(),
-        display_name: displayName.trim() || undefined,
-        provider: provider.trim(),
-        model: model.trim(),
-        agent_type: agentType,
-        other_config: description.trim() ? { description: description.trim() } : undefined,
+        agent_key: data.agentKey,
+        display_name: data.displayName || undefined,
+        provider: data.provider,
+        model: data.model,
+        agent_type: data.agentType,
+        // Promoted fields at top level
+        emoji: data.emoji?.trim() || null,
+        agent_description: data.description?.trim() || null,
+        self_evolve: data.selfEvolve || false,
+        ...(Object.keys(otherConfig).length > 0 && { other_config: otherConfig }),
       });
       onOpenChange(false);
-      setAgentKey("");
-      setKeyTouched(false);
-      setDisplayName("");
-      setProvider("");
-      setModel("");
-      setAgentType("open");
-      setDescription("");
-    } catch {
-      // error handled upstream
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : t("create.failedToCreate"));
     } finally {
       setLoading(false);
     }
   };
 
   const handleProviderChange = (value: string) => {
-    setProvider(value);
-    setModel("");
+    setValue("provider", value, { shouldValidate: true });
+    setValue("model", "", { shouldValidate: false });
   };
+
+  const canCreate = !!agentKey && !!displayName && !!provider && !!model &&
+    !errors.agentKey && !errors.displayName &&
+    !!watch("description")?.trim();
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl max-h-[90vh] flex flex-col">
+      <DialogContent className="sm:max-w-4xl max-h-[90vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>Create Agent</DialogTitle>
+          <DialogTitle>{t("create.title")}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4 py-4 overflow-y-auto min-h-0">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="displayName">Display Name *</Label>
-              <Input
-                id="displayName"
-                value={displayName}
-                onChange={(e) => setDisplayName(e.target.value)}
-                onBlur={() => {
-                  if (!keyTouched && displayName.trim()) {
-                    setAgentKey(slugify(displayName.trim()));
-                  }
-                }}
-                placeholder="My Agent"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="agentKey">Agent Key *</Label>
-              <Input
-                id="agentKey"
-                value={agentKey}
-                onChange={(e) => {
-                  setKeyTouched(true);
-                  setAgentKey(e.target.value);
-                }}
-                onBlur={() => setAgentKey(slugify(agentKey))}
-                placeholder="e.g. my-agent"
-              />
-              <p className="text-xs text-muted-foreground">Lowercase, numbers, hyphens</p>
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label>Provider *</Label>
-              {enabledProviders.length > 0 ? (
-                <Select value={provider} onValueChange={handleProviderChange}>
-                  <SelectTrigger>
-                    <SelectValue placeholder="Select provider" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {enabledProviders.map((p) => (
-                      <SelectItem key={p.name} value={p.name}>
-                        {p.display_name || p.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              ) : (
-                <Input
-                  value={provider}
-                  onChange={(e) => setProvider(e.target.value)}
-                  placeholder="openrouter"
-                />
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label>Model *</Label>
-              <div className="flex gap-2">
-                <div className="flex-1">
-                  <Combobox
-                    value={model}
-                    onChange={setModel}
-                    options={models.map((m) => ({ value: m.id, label: m.name }))}
-                    placeholder={modelsLoading ? "Loading models..." : "Enter or select model"}
-                  />
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  className="h-9 px-3"
-                  disabled={!selectedProviderId || !model.trim() || verifying}
-                  onClick={handleVerify}
-                >
-                  {verifying ? "..." : "Check"}
-                </Button>
-              </div>
-              {verifyResult && (
-                <p className={`text-xs ${verifyResult.valid ? "text-emerald-400" : "text-red-400"}`}>
-                  {verifyResult.valid ? "Model verified" : verifyResult.error || "Verification failed"}
-                </p>
-              )}
-              {!verifyResult && provider && !modelsLoading && models.length === 0 && (
-                <p className="text-xs text-muted-foreground">This provider doesn't list models — type the model ID manually.</p>
-              )}
-            </div>
-          </div>
-          <div className="space-y-2">
-            <Label>Agent Type</Label>
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => setAgentType("open")}
-                className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
-                  agentType === "open"
-                    ? "border-primary bg-primary text-primary-foreground"
-                    : "border-input bg-background hover:bg-accent"
-                }`}
-              >
-                Open
-                <span className="block text-xs font-normal opacity-70">Per-user context</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setAgentType("predefined")}
-                className={`flex-1 rounded-md border px-3 py-2 text-sm font-medium transition-colors ${
-                  agentType === "predefined"
-                    ? "border-primary bg-primary text-primary-foreground"
-                    : "border-input bg-background hover:bg-accent"
-                }`}
-              >
-                Predefined
-                <span className="block text-xs font-normal opacity-70">Agent-level config</span>
-              </button>
-            </div>
+
+        <div className="space-y-4 py-4 -mx-4 px-4 sm:-mx-6 sm:px-6 overflow-y-auto min-h-0">
+          <AgentIdentityAndModelFields
+            form={form}
+            enabledProviders={enabledProviders}
+            poolOwnerNames={poolOwnerNames}
+            models={models}
+            modelsLoading={modelsLoading}
+            verifying={verifying}
+            verifyResult={verifyResult}
+            onProviderChange={handleProviderChange}
+            onVerify={handleVerify}
+          />
+          <AgentDescriptionSection form={form} agentPresets={agentPresets} />
+
+          {/* Prompt Mode selector */}
+          <div className="space-y-1.5">
+            <Label>{t("detail.prompt.title")}</Label>
+            <PromptModeCards
+              value={(watch("promptMode") ?? "full") as PromptMode}
+              onChange={(m) => setValue("promptMode", m === "full" ? undefined : m)}
+              compact
+            />
           </div>
 
-          {agentType === "predefined" && (
-            <div className="space-y-3">
-              <Label>Describe Your Agent</Label>
-              <div className="flex flex-wrap gap-1.5">
-                {AGENT_PRESETS.map((preset) => (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    onClick={() => setDescription(preset.prompt)}
-                    className="rounded-full border px-2.5 py-0.5 text-xs transition-colors hover:bg-accent"
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-              <Textarea
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="Describe your agent's personality, purpose, and behavior..."
-                className="min-h-[120px]"
-              />
-              <p className="text-xs text-muted-foreground">
-                AI will automatically generate your agent's context files from this description.
-                Leave empty to start with templates.
-              </p>
-            </div>
-          )}
+          {submitError && <p className="text-sm text-destructive">{submitError}</p>}
         </div>
+
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
-            Cancel
+            {t("create.cancel")}
           </Button>
           {loading ? (
-            <Button disabled>Creating...</Button>
+            <Button disabled>{t("create.creating")}</Button>
           ) : (
-            <Button onClick={handleCreate} disabled={!displayName.trim() || !agentKey.trim() || !isValidSlug(agentKey) || !provider.trim() || !model.trim() || !verifyResult?.valid}>
-              Create
+            <Button onClick={handleSubmit(handleSubmitForm)} disabled={!canCreate || loading}>
+              {t("create.create")}
             </Button>
           )}
         </DialogFooter>

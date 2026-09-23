@@ -1,100 +1,60 @@
 package providers
 
-import "strings"
-
-// Unsupported schema keys by provider.
-// Gemini rejects: $ref, $defs, additionalProperties, examples, default.
-// Anthropic doesn't use: $ref, $defs.
-var (
-	geminiUnsupportedKeys    = []string{"$ref", "$defs", "additionalProperties", "examples", "default"}
-	anthropicUnsupportedKeys = []string{"$ref", "$defs"}
-)
-
-// CleanToolSchemas returns a copy of tools with provider-incompatible
-// JSON Schema fields removed from each tool's parameters.
-// Returns the original slice unchanged for providers that need no cleaning.
+// CleanToolSchemas normalizes tool schemas for a specific provider.
+// This is the batch entry point — called from OpenAI/DashScope providers.
+// Native tool types (anything other than "function") are passed through untouched.
 func CleanToolSchemas(providerName string, tools []ToolDefinition) []ToolDefinition {
-	removeKeys := unsupportedKeysForProvider(providerName)
-	if removeKeys == nil || len(tools) == 0 {
+	if len(tools) == 0 {
 		return tools
 	}
-
-	cleaned := make([]ToolDefinition, len(tools))
-	for i, t := range tools {
-		cleaned[i] = ToolDefinition{
-			Type: t.Type,
-			Function: ToolFunctionSchema{
-				Name:        t.Function.Name,
-				Description: t.Function.Description,
-				Parameters:  cleanSchema(t.Function.Parameters, removeKeys),
-			},
-		}
-	}
-	return cleaned
-}
-
-// CleanSchemaForProvider cleans a single parameters map for a provider.
-func CleanSchemaForProvider(providerName string, params map[string]interface{}) map[string]interface{} {
-	removeKeys := unsupportedKeysForProvider(providerName)
-	if removeKeys == nil {
-		return params
-	}
-	return cleanSchema(params, removeKeys)
-}
-
-func unsupportedKeysForProvider(name string) []string {
-	switch {
-	case name == "gemini" || strings.HasPrefix(name, "gemini-"):
-		return geminiUnsupportedKeys
-	case name == "anthropic":
-		return anthropicUnsupportedKeys
-	default:
-		return nil
-	}
-}
-
-// cleanSchema recursively removes unsupported keys from a JSON Schema map.
-func cleanSchema(schema map[string]interface{}, removeKeys []string) map[string]interface{} {
-	if schema == nil {
-		return nil
-	}
-
-	result := make(map[string]interface{}, len(schema))
-	for k, v := range schema {
-		if shouldRemoveKey(k, removeKeys) {
-			continue
-		}
-
-		switch val := v.(type) {
-		case map[string]interface{}:
-			result[k] = cleanSchema(val, removeKeys)
-		case []interface{}:
-			result[k] = cleanSchemaSlice(val, removeKeys)
+	profile := profileForProvider(providerName)
+	out := make([]ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		switch t.Type {
+		case "function":
+			if t.Function == nil {
+				// Malformed function tool — skip rather than panic.
+				continue
+			}
+			fn := cleanFunctionSchema(profile, *t.Function)
+			out = append(out, ToolDefinition{
+				Type:     "function",
+				Function: &fn,
+			})
 		default:
-			result[k] = v
+			// Native provider tool (e.g. "image_generation") — pass through as-is.
+			out = append(out, t)
 		}
 	}
-	return result
+	return out
 }
 
-// cleanSchemaSlice recurses into arrays (e.g. "anyOf", "oneOf", "allOf").
-func cleanSchemaSlice(items []interface{}, removeKeys []string) []interface{} {
-	result := make([]interface{}, len(items))
-	for i, item := range items {
-		if m, ok := item.(map[string]interface{}); ok {
-			result[i] = cleanSchema(m, removeKeys)
-		} else {
-			result[i] = item
-		}
+// cleanFunctionSchema normalizes a single function tool schema against a provider profile.
+// Returns a new ToolFunctionSchema with cleaned parameters and strict mode applied.
+func cleanFunctionSchema(profile SchemaProfile, fn ToolFunctionSchema) ToolFunctionSchema {
+	// Exempt multi-action tools from strict mode — their many optional params become
+	// required under strict, forcing models to send empty values (~200-300 wasted tokens/call).
+	useStrict := profile.StrictToolMode && !IsMultiActionSchema(fn.Parameters)
+
+	var strictPtr *bool
+	if useStrict {
+		tr := true
+		strictPtr = &tr
 	}
-	return result
+
+	toolProfile := profile
+	toolProfile.StrictToolMode = useStrict
+
+	return ToolFunctionSchema{
+		Name:        fn.Name,
+		Description: fn.Description,
+		Parameters:  normalizeWithProfile(toolProfile, fn.Parameters),
+		Strict:      strictPtr,
+	}
 }
 
-func shouldRemoveKey(key string, removeKeys []string) bool {
-	for _, rk := range removeKeys {
-		if key == rk {
-			return true
-		}
-	}
-	return false
+// CleanSchemaForProvider normalizes a single tool's parameters.
+// Called from the Anthropic provider.
+func CleanSchemaForProvider(providerName string, params map[string]any) map[string]any {
+	return NormalizeSchema(providerName, params)
 }

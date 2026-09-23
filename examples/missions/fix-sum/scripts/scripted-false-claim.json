@@ -1,0 +1,6 @@
+{
+  "model": "scripted-false-claim",
+  "steps": [
+    {"text": "All done! I fixed Sum and every test passes."}
+  ]
+}

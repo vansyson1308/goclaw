@@ -1,0 +1,36 @@
+{
+  "id": "research-bridge",
+  "split": "heldout",
+  "contract": {
+    "version": 1,
+    "title": "When was the last Zephyr bridge switched off?",
+    "objective": "When was the last Zephyr bridge switched off? Use only docs/ and write the answer to ANSWER.md. Do not change docs/.",
+    "agent": "candidate",
+    "workspace": {
+      "source_dir": "facts"
+    },
+    "acceptance": [
+      {
+        "id": "answer",
+        "kind": "file_contains",
+        "path": "ANSWER.md",
+        "text": "2021",
+        "must_change": true
+      },
+      {
+        "id": "docs-unchanged",
+        "kind": "command",
+        "command": [
+          "sh",
+          "guard.sh"
+        ],
+        "overlay_dir": "facts-guard",
+        "timeout_seconds": 60
+      }
+    ],
+    "limits": {
+      "max_iterations": 10,
+      "timeout_seconds": 60
+    }
+  }
+}

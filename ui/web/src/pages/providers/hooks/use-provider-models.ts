@@ -1,40 +1,31 @@
-import { useState, useEffect, useCallback } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useHttp } from "@/hooks/use-ws";
+import { queryKeys } from "@/lib/query-keys";
+import type { ModelInfo, ProviderModelsResponse } from "@/types/provider";
 
-export interface ModelInfo {
-  id: string;
-  name?: string;
-}
+export type { ModelInfo };
 
 export function useProviderModels(providerId: string | undefined) {
   const http = useHttp();
-  const [models, setModels] = useState<ModelInfo[]>([]);
-  const [loading, setLoading] = useState(false);
 
-  const load = useCallback(
-    async (id: string) => {
-      setLoading(true);
-      try {
-        const res = await http.get<{ models: ModelInfo[] }>(
-          `/v1/providers/${id}/models`,
-        );
-        setModels(res.models ?? []);
-      } catch {
-        setModels([]);
-      } finally {
-        setLoading(false);
-      }
+  const {
+    data,
+    isLoading: loading,
+  } = useQuery({
+    queryKey: queryKeys.providers.models(providerId ?? ""),
+    queryFn: async () => {
+      const res = await http.get<ProviderModelsResponse>(
+        `/v1/providers/${providerId}/models`,
+      );
+      return res;
     },
-    [http],
-  );
+    staleTime: 60_000,
+    enabled: !!providerId,
+  });
 
-  useEffect(() => {
-    if (!providerId) {
-      setModels([]);
-      return;
-    }
-    load(providerId);
-  }, [providerId, load]);
-
-  return { models, loading };
+  return {
+    models: data?.models ?? [],
+    reasoningDefaults: data?.reasoning_defaults ?? null,
+    loading,
+  };
 }

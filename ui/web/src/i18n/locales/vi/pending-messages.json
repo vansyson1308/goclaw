@@ -1,0 +1,50 @@
+{
+  "title": "Tin nhắn đang chờ",
+  "description": "Tin nhắn channel đã được lưu đệm đang chờ xử lý từ agent",
+  "emptyTitle": "Không có tin nhắn đang chờ",
+  "emptyDescription": "Không tìm thấy nhóm tin nhắn đệm. Tin nhắn xuất hiện ở đây khi channel lưu đệm tin nhắn đến trước khi agent xử lý.",
+  "howItWorks": {
+    "title": "Cơ chế hoạt động",
+    "step1": "Tin nhắn từ các channel (Telegram, Discord, v.v.) được lưu đệm tại đây khi agent đang bận hoặc offline.",
+    "step2": "Khi bộ đệm đạt ngưỡng (mặc định: 50 tin nhắn), hệ thống tự động tóm tắt — LLM tóm gọn các tin nhắn cũ, chỉ giữ lại 15 tin mới nhất.",
+    "step3": "Ở lượt tiếp theo của agent, bản tóm tắt + tin nhắn gần đây được inject làm ngữ cảnh, giúp agent nắm bắt nhanh mà không bị quá tải.",
+    "compactAction": "Tóm tắt — Kích hoạt LLM tóm tắt thủ công ngay. Hữu ích khi bạn muốn agent xử lý bản tóm tắt sạch thay vì hàng loạt tin nhắn thô.",
+    "clearAction": "Xóa — Xóa vĩnh viễn tất cả tin nhắn đệm của một nhóm. Dùng khi tin nhắn không còn liên quan."
+  },
+  "columns": {
+    "channel": "Channel",
+    "group": "Nhóm",
+    "messages": "Tin nhắn",
+    "status": "Trạng thái",
+    "lastActivity": "Hoạt động gần nhất",
+    "actions": "Thao tác"
+  },
+  "status": {
+    "compacted": "Đã tóm tắt",
+    "raw": "Thô"
+  },
+  "compact": "Tóm tắt",
+  "compacting": "Đang tóm tắt…",
+  "clear": "Xóa",
+  "confirmClear": {
+    "title": "Xóa tin nhắn?",
+    "description": "Thao tác này sẽ xóa vĩnh viễn tất cả tin nhắn trong {{channel}} / {{key}}. Không thể hoàn tác.",
+    "cancel": "Hủy",
+    "confirm": "Xóa"
+  },
+  "dialog": {
+    "title": "Tin nhắn — {{name}}",
+    "noMessages": "Không tìm thấy tin nhắn.",
+    "summary": "Tóm tắt"
+  },
+  "toast": {
+    "compacted": "Tóm tắt hoàn tất",
+    "compactedSummarized": "Đã tóm tắt còn {{count}} tin nhắn",
+    "compactedDeleted": "Đã xóa tất cả (không có LLM provider)",
+    "compacting": "Đang tóm tắt…",
+    "compactingDesc": "LLM đang tóm tắt ở nền. Danh sách sẽ tự động cập nhật.",
+    "failedCompact": "Tóm tắt thất bại",
+    "cleared": "Đã xóa tin nhắn",
+    "failedClear": "Không thể xóa tin nhắn"
+  }
+}

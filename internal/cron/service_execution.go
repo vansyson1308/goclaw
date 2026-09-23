@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/adhocore/gronx"
+
+	"github.com/nextlevelbuilder/goclaw/internal/safego"
 )
 
 // RunJob manually triggers a job execution.
@@ -77,8 +79,8 @@ func (cs *Service) RunJob(jobID string, force bool) (bool, string, error) {
 		break
 	}
 
-	// Record run log
-	cs.recordRun(jobID, err, result)
+	// Record run log (already holding cs.mu via defer above)
+	cs.recordRunLocked(jobID, err, result)
 
 	if err != nil {
 		return true, "", err
@@ -108,7 +110,11 @@ func (cs *Service) GetRunLog(jobID string, limit int) []RunLogEntry {
 func (cs *Service) recordRun(jobID string, err error, resultText string) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
+	cs.recordRunLocked(jobID, err, resultText)
+}
 
+// recordRunLocked appends a run log entry. Must be called with cs.mu held.
+func (cs *Service) recordRunLocked(jobID string, err error, resultText string) {
 	entry := RunLogEntry{
 		Ts:    nowMS(),
 		JobID: jobID,
@@ -130,8 +136,20 @@ func (cs *Service) recordRun(jobID string, err error, resultText string) {
 
 // --- Internal scheduling loop ---
 
-func (cs *Service) runLoop(stopChan chan struct{}) {
-	ticker := time.NewTicker(1 * time.Second)
+// runLoopTickInterval is the cron run loop tick rate. Production default = 1s.
+// Tests override this via the setFastTick(t) helper to avoid waiting >1s per
+// scheduled-job test. Production behavior is unchanged.
+//
+// The value is read synchronously inside Start() before the runLoop goroutine
+// is spawned — runLoop itself takes `tick` as a parameter so it never reads
+// this package-level var. This avoids a cross-test race where test A's Stop()
+// returns before its runLoop has executed the ticker-construction line, and
+// test B subsequently calls setFastTick(), mutating the var while test A's
+// goroutine is still racing to read it.
+var runLoopTickInterval = 1 * time.Second
+
+func (cs *Service) runLoop(stopChan chan struct{}, tick time.Duration) {
+	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
 
 	for {
@@ -139,33 +157,51 @@ func (cs *Service) runLoop(stopChan chan struct{}) {
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			cs.checkJobs()
+			cs.safeCheckJobs()
 		}
 	}
+}
+
+// safeCheckJobs wraps checkJobs with panic recovery so a panic in any
+// check/claim logic doesn't kill the runLoop goroutine.
+func (cs *Service) safeCheckJobs() {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("cron: checkJobs panicked — runLoop continues", "panic", fmt.Sprint(r))
+		}
+	}()
+	cs.checkJobs()
 }
 
 func (cs *Service) checkJobs() {
 	cs.mu.Lock()
 
 	now := nowMS()
-	var dueJobIDs []string
+
+	// Collect due jobs and preserve their original scheduled times.
+	// The scheduled time is used as anchor for "every" jobs to prevent drift.
+	type dueJob struct {
+		id            string
+		scheduledAtMS int64
+	}
+	var dueJobs []dueJob
 
 	for i := range cs.store.Jobs {
 		job := &cs.store.Jobs[i]
 		if job.Enabled && job.State.NextRunAtMS != nil && *job.State.NextRunAtMS <= now {
-			dueJobIDs = append(dueJobIDs, job.ID)
+			dueJobs = append(dueJobs, dueJob{id: job.ID, scheduledAtMS: *job.State.NextRunAtMS})
 		}
 	}
 
-	if len(dueJobIDs) == 0 {
+	if len(dueJobs) == 0 {
 		cs.mu.Unlock()
 		return
 	}
 
 	// Clear NextRunAtMS to prevent duplicate execution
-	dueMap := make(map[string]bool, len(dueJobIDs))
-	for _, id := range dueJobIDs {
-		dueMap[id] = true
+	dueMap := make(map[string]bool, len(dueJobs))
+	for _, dj := range dueJobs {
+		dueMap[dj.id] = true
 	}
 	for i := range cs.store.Jobs {
 		if dueMap[cs.store.Jobs[i].ID] {
@@ -173,15 +209,23 @@ func (cs *Service) checkJobs() {
 		}
 	}
 	cs.saveUnsafe()
+	cs.jobWG.Add(len(dueJobs))
 	cs.mu.Unlock()
 
-	// Execute jobs outside lock
-	for _, jobID := range dueJobIDs {
-		cs.executeJobByID(jobID)
+	// Execute jobs in parallel without blocking the runLoop.
+	// Previously wg.Wait() blocked here — if any job hung (e.g. LLM timeout,
+	// agent loop stuck), the entire cron scheduler would stop checking for new
+	// due jobs. Now each job runs independently with panic recovery.
+	for _, dj := range dueJobs {
+		go func(id string, scheduledAtMS int64) {
+			defer cs.jobWG.Done()
+			defer safego.Recover(nil, "job_id", id)
+			cs.executeJobByID(id, scheduledAtMS)
+		}(dj.id, dj.scheduledAtMS)
 	}
 }
 
-func (cs *Service) executeJobByID(jobID string) {
+func (cs *Service) executeJobByID(jobID string, scheduledAtMS int64) {
 	cs.mu.Lock()
 	var job *Job
 	for i := range cs.store.Jobs {
@@ -233,14 +277,29 @@ func (cs *Service) executeJobByID(jobID string) {
 		if cs.store.Jobs[i].DeleteAfterRun {
 			cs.store.Jobs = append(cs.store.Jobs[:i], cs.store.Jobs[i+1:]...)
 		} else {
-			next := cs.computeNextRun(&cs.store.Jobs[i].Schedule, now)
-			cs.store.Jobs[i].State.NextRunAtMS = next
-			if next == nil {
-				cs.store.Jobs[i].Enabled = false
+			schedule := &cs.store.Jobs[i].Schedule
+			// For "every" (interval) jobs, compute next run from the original
+			// scheduled time (anchor) to prevent drift and synchronization.
+			if schedule.Kind == "every" && schedule.EveryMS != nil && *schedule.EveryMS > 0 && scheduledAtMS > 0 {
+				interval := *schedule.EveryMS
+				// O(1) advance to the next future slot from anchor
+				elapsed := now - scheduledAtMS
+				periods := elapsed / interval
+				next := scheduledAtMS + (periods+1)*interval
+				cs.store.Jobs[i].State.NextRunAtMS = &next
+			} else {
+				next := cs.computeNextRun(schedule, now)
+				cs.store.Jobs[i].State.NextRunAtMS = next
+				if next == nil {
+					cs.store.Jobs[i].Enabled = false
+				}
 			}
 		}
 		break
 	}
+
+	// Record run log (already holding cs.mu via defer above)
+	cs.recordRunLocked(jobID, err, result)
 
 	cs.saveUnsafe()
 }
@@ -267,6 +326,11 @@ func (cs *Service) computeNextRun(schedule *Schedule, now int64) *int64 {
 			return nil
 		}
 		nowTime := time.UnixMilli(now)
+		if schedule.TZ != "" {
+			if loc, err := time.LoadLocation(schedule.TZ); err == nil {
+				nowTime = nowTime.In(loc)
+			}
+		}
 		nextTime, err := gronx.NextTickAfter(schedule.Expr, nowTime, false)
 		if err != nil {
 			slog.Error("cron: failed to compute next run", "expr", schedule.Expr, "error", err)
@@ -297,6 +361,11 @@ func (cs *Service) validateSchedule(schedule *Schedule) error {
 		gx := gronx.New()
 		if !gx.IsValid(schedule.Expr) {
 			return fmt.Errorf("invalid cron expression: %s", schedule.Expr)
+		}
+		if schedule.TZ != "" {
+			if _, err := time.LoadLocation(schedule.TZ); err != nil {
+				return fmt.Errorf("invalid timezone: %s", schedule.TZ)
+			}
 		}
 	default:
 		return fmt.Errorf("unknown schedule kind: %s", schedule.Kind)

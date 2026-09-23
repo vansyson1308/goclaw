@@ -3,10 +3,17 @@
 // --- Per-agent config types (matching Go config structs) ---
 
 export interface ToolPolicyConfig {
-  profile?: string; // "default", "strict", "permissive"
+  profile?: string; // "full", "coding", "messaging", "minimal"
   allow?: string[];
   deny?: string[];
   alsoAllow?: string[];
+  byProvider?: Record<string, ToolPolicyConfig>;
+  wait?: {
+    min_ms?: number;
+    max_ms?: number;
+  };
+  toolCallPrefix?: string; // prefix to strip from model's tool call names
+  rate_limit_per_hour?: number; // per-agent tool calls/hour (0 = use global)
 }
 
 export interface SubagentsConfig {
@@ -14,12 +21,16 @@ export interface SubagentsConfig {
   maxSpawnDepth?: number;
   maxChildrenPerAgent?: number;
   archiveAfterMinutes?: number;
+  maxRetries?: number;
   model?: string;
 }
 
 export interface CompactionConfig {
   reserveTokensFloor?: number;
   maxHistoryShare?: number;
+  maxRequestShare?: number;
+  keepLastMessages?: number;
+  timeoutSeconds?: number;
   memoryFlush?: {
     enabled?: boolean;
     softThresholdTokens?: number;
@@ -28,6 +39,7 @@ export interface CompactionConfig {
 
 export interface ContextPruningConfig {
   mode?: "off" | "cache-ttl";
+  ttl?: string;             // cache TTL gate duration, e.g. "5m" (default). Only used when mode="cache-ttl"
   keepLastAssistants?: number;
   softTrimRatio?: number;
   hardClearRatio?: number;
@@ -41,6 +53,24 @@ export interface ContextPruningConfig {
     enabled?: boolean;
     placeholder?: string;
   };
+}
+
+export interface DeliveryGeneratorConfig {
+  enabled?: boolean;
+  mode?: "sidecar_generated" | "llm_generated" | "fixed_template" | "off";
+  provider?: string;
+  model?: string;
+  timeout_ms?: number;
+  max_tokens?: number;
+  max_chars?: number;
+  min_delay_ms?: number;
+  templates?: string[];
+}
+
+export interface DeliveryBehaviorConfig {
+  enabled?: boolean;
+  intermediate_replies?: DeliveryGeneratorConfig;
+  quick_ack?: DeliveryGeneratorConfig;
 }
 
 export interface SandboxConfig {
@@ -60,18 +90,85 @@ export interface MemoryConfig {
   embedding_model?: string;
   max_results?: number;
   max_chunk_len?: number;
+  chunk_overlap?: number;
   vector_weight?: number;
   text_weight?: number;
+  min_score?: number;
+  dreaming?: DreamingConfig | null;
 }
 
-export interface QualityGateConfig {
-  event: string;
-  type: "agent" | "command";
-  agent?: string;
-  command?: string;
-  block_on_failure: boolean;
-  max_retries?: number;
-  timeout_seconds?: number;
+/**
+ * DreamingConfig mirrors Go internal/config.DreamingConfig — per-agent
+ * overrides for the consolidation dreaming worker. Pointer fields stay
+ * undefined when the operator hasn't set them so partial overrides merge
+ * cleanly with backend defaults.
+ */
+export interface DreamingConfig {
+  enabled?: boolean;
+  debounce_ms?: number;
+  threshold?: number;
+  verbose_log?: boolean;
+}
+
+export interface WorkspaceSharingConfig {
+  shared_dm?: boolean;
+  shared_group?: boolean;
+  shared_users?: string[];
+  share_memory?: boolean;
+  share_knowledge_graph?: boolean;
+  share_sessions?: boolean;
+}
+
+export type ChatGPTOAuthRoutingStrategy =
+  | "round_robin"
+  | "priority_order";
+
+export type EffectiveChatGPTOAuthRoutingStrategy =
+  | "round_robin"
+  | "priority_order";
+
+export type ChatGPTOAuthRoutingOverrideMode = "inherit" | "custom";
+export type ReasoningOverrideMode = "inherit" | "custom";
+export type InboundDebounceOverrideMode = "inherit" | "custom";
+
+export interface AgentReasoningConfig {
+  override_mode?: ReasoningOverrideMode;
+  effort?: string;
+  fallback?: "downgrade" | "provider_default" | "off";
+}
+
+export interface InboundDebounceConfig {
+  override_mode?: InboundDebounceOverrideMode;
+  inbound_debounce_ms?: number;
+}
+
+export interface ChatGPTOAuthRoutingConfig {
+  override_mode?: ChatGPTOAuthRoutingOverrideMode;
+  strategy?: ChatGPTOAuthRoutingStrategy;
+  extra_provider_names?: string[];
+}
+
+export interface ModelFallbackCandidate {
+  provider?: string;
+  model?: string;
+}
+
+export interface ModelFallbackConfig {
+  enabled?: boolean;
+  strategy?: "priority_order";
+  candidates?: ModelFallbackCandidate[];
+  max_attempts?: number;
+  cooldown_enabled?: boolean;
+}
+
+export interface KgDedupConfig {
+  enabled?: boolean;
+  similarity_threshold?: number;
+  merge_strategy?: string;
+}
+
+export interface ShellDenyGroups {
+  groups?: string[];
 }
 
 export interface AgentData {
@@ -92,6 +189,21 @@ export interface AgentData {
   created_at?: string;
   updated_at?: string;
 
+  // Promoted fields (formerly in other_config)
+  emoji?: string | null;
+  agent_description?: string | null;
+  thinking_level?: string | null;
+  max_tokens?: number | null;
+  self_evolve?: boolean | null;
+  skill_evolve?: boolean | null;
+  skill_nudge_interval?: number | null;
+  reasoning_config?: AgentReasoningConfig | null;
+  workspace_sharing?: WorkspaceSharingConfig | null;
+  chatgpt_oauth_routing?: ChatGPTOAuthRoutingConfig | null;
+  model_fallback?: ModelFallbackConfig | null;
+  shell_deny_groups?: ShellDenyGroups | null;
+  kg_dedup_config?: KgDedupConfig | null;
+
   // Per-agent JSONB configs (null/undefined = use global defaults)
   tools_config?: ToolPolicyConfig | null;
   sandbox_config?: SandboxConfig | null;
@@ -99,7 +211,19 @@ export interface AgentData {
   memory_config?: MemoryConfig | null;
   compaction_config?: CompactionConfig | null;
   context_pruning?: ContextPruningConfig | null;
+  // Extensibility bag for future/unknown fields
   other_config?: Record<string, unknown> | null;
+  budget_monthly_cents?: number | null;
+  tenant_id?: string;
+  grant_gateway_operator_access?: boolean;
+  gateway_operator_bootstrap?: GatewayOperatorBootstrapResult | null;
+}
+
+export interface GatewayOperatorBootstrapResult {
+  status: "granted" | "warning" | "skipped" | string;
+  binary_id?: string;
+  grant_id?: string;
+  warning?: string;
 }
 
 export interface AgentShareData {

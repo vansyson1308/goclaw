@@ -1,0 +1,233 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/security"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
+)
+
+// --- Context helpers for media video ---
+
+const ctxMediaVideoRefs toolContextKey = "tool_media_video_refs"
+
+// WithMediaVideoRefs stores video MediaRefs in context for read_video tool access.
+func WithMediaVideoRefs(ctx context.Context, refs []providers.MediaRef) context.Context {
+	return context.WithValue(ctx, ctxMediaVideoRefs, refs)
+}
+
+// MediaVideoRefsFromCtx retrieves stored video MediaRefs from context.
+func MediaVideoRefsFromCtx(ctx context.Context) []providers.MediaRef {
+	v, _ := ctx.Value(ctxMediaVideoRefs).([]providers.MediaRef)
+	return v
+}
+
+// --- ReadVideoTool ---
+
+// videoMaxBytes is the max file size for video analysis (100MB).
+const videoMaxBytes = 100 * 1024 * 1024
+
+const videoURLPinnedIPParam = "_pinned_ip"
+
+// videoLocalPathParam forwards the resolved local file path so the budget probe can read the real file.
+const videoLocalPathParam = "_local_path"
+
+// videoProviderPriority is the order in which providers are tried for video analysis.
+// OpenAI excluded — no native video upload in chat completions.
+var videoProviderPriority = []string{"gemini", "openrouter"}
+
+// videoModelDefaults maps provider names to preferred video-capable models.
+var videoModelDefaults = map[string]string{
+	"gemini":     "gemini-2.5-flash",
+	"openrouter": "google/gemini-2.5-flash",
+}
+
+// ReadVideoTool uses a video-capable provider to analyze video files
+// attached to the current conversation.
+type ReadVideoTool struct {
+	registry    *providers.Registry
+	mediaLoader MediaPathLoader
+	usageCaps   *usagecaps.Service
+	// streamToGemini is injected per instance rather than through a package
+	// global, so parallel tests cannot race each other over one seam.
+	streamToGemini geminiStreamFn
+}
+
+// geminiStreamFn is the upload a gate-passing URL is handed to.
+type geminiStreamFn func(ctx context.Context, apiKey, model, prompt string, reader io.Reader, contentLength int64, mime string, httpTimeout time.Duration) (*providers.ChatResponse, error)
+
+func NewReadVideoTool(registry *providers.Registry, mediaLoader MediaPathLoader) *ReadVideoTool {
+	return &ReadVideoTool{registry: registry, mediaLoader: mediaLoader, streamToGemini: geminiFileAPICallStream}
+}
+
+// setStreamToGeminiForTest observes what reaches the upload without contacting a provider.
+func (t *ReadVideoTool) setStreamToGeminiForTest(fn geminiStreamFn) {
+	t.streamToGemini = fn
+}
+
+func (t *ReadVideoTool) SetUsageCapService(svc *usagecaps.Service) {
+	t.usageCaps = svc
+}
+
+func (t *ReadVideoTool) Name() string { return "read_video" }
+
+func (t *ReadVideoTool) Description() string {
+	return "Analyze video files attached to the conversation. " +
+		"Use when you see <media:video> tags and need to describe, summarize, or analyze video content. " +
+		"A workspace-relative path such as inputs/clip.mp4 may also be provided. Specify what you want to extract or analyze."
+}
+
+func (t *ReadVideoTool) Parameters() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"prompt": map[string]any{
+				"type":        "string",
+				"description": "What to analyze. E.g. 'Describe what happens in this video', 'Summarize the key scenes', 'What text appears on screen?'",
+			},
+			"media_id": map[string]any{
+				"type":        "string",
+				"description": "Optional: specific media_id from <media:video> tag. If omitted, uses most recent video.",
+			},
+			"url": map[string]any{
+				"type":        "string",
+				"description": "Optional URL to a video file. Use this to analyze videos hosted online.",
+			},
+			"path": map[string]any{
+				"type":        "string",
+				"description": "Optional workspace-relative video path. Delegated inputs use inputs/<name>.",
+			},
+		},
+		"required": []string{"prompt"},
+	}
+}
+
+func (t *ReadVideoTool) Execute(ctx context.Context, args map[string]any) *Result {
+	prompt, _ := args["prompt"].(string)
+	if prompt == "" {
+		prompt = "Analyze this video and describe its contents."
+	}
+	mediaID, _ := args["media_id"].(string)
+	videoURL, _ := args["url"].(string)
+	videoArg, _ := args["path"].(string)
+
+	sourceCount := 0
+	for _, source := range []string{mediaID, videoURL, videoArg} {
+		if source != "" {
+			sourceCount++
+		}
+	}
+	if sourceCount > 1 {
+		if videoArg == "" && mediaID != "" && videoURL != "" {
+			return ErrorResult("Both 'media_id' and 'url' parameters cannot be specified. Choose only one.")
+		}
+		return ErrorResult("Only one of 'media_id', 'url', or 'path' may be specified.")
+	}
+
+	var data []byte
+	var videoMime string
+	var videoPath string
+	var pinnedIP net.IP
+
+	if videoURL != "" {
+		validatedURL, validatedIP, err := security.Validate(videoURL)
+		if err != nil {
+			return ErrorResult(fmt.Sprintf("Invalid video URL: %v", err))
+		}
+		pinnedIP = validatedIP
+
+		// Infer MIME type from URL extension
+		ext := filepath.Ext(validatedURL.Path)
+		videoMime = mimeFromVideoExt(ext)
+	} else {
+		var mime string
+		var err error
+		if videoArg != "" {
+			videoPath, err = resolveStructuredMediaPath(ctx, videoArg, "video")
+			mime = mimeFromVideoExt(filepath.Ext(videoPath))
+		} else {
+			videoPath, mime, err = t.resolveVideoFile(ctx, mediaID)
+		}
+		if err != nil {
+			return ErrorResult(err.Error())
+		}
+		videoMime = mime
+		slog.Info("read_video: resolved file", "mime", videoMime, "media_id", mediaID, "logical_path", videoArg)
+
+		fileData, err := os.ReadFile(videoPath)
+		if err != nil {
+			if videoArg != "" && IsDelegationArtifactRun(ctx) {
+				return ErrorResult("Failed to read delegation video input")
+			}
+			return ErrorResult(fmt.Sprintf("Failed to read video file: %v", err))
+		}
+		slog.Info("read_video: file loaded", "size_bytes", len(fileData))
+		if len(fileData) > videoMaxBytes {
+			return ErrorResult(fmt.Sprintf("Video too large: %d bytes (max %d)", len(fileData), videoMaxBytes))
+		}
+		data = fileData
+	}
+
+	chain := ResolveMediaProviderChain(ctx, "read_video", "", "",
+		videoProviderPriority, videoModelDefaults, t.registry)
+
+	for i := range chain {
+		if chain[i].Params == nil {
+			chain[i].Params = make(map[string]any)
+		}
+		chain[i].Params["prompt"] = prompt
+		chain[i].Params["data"] = data
+		chain[i].Params["url"] = videoURL
+		chain[i].Params["mime"] = videoMime
+		chain[i].Params[videoLocalPathParam] = videoPath
+		if pinnedIP != nil {
+			chain[i].Params[videoURLPinnedIPParam] = pinnedIP
+		}
+	}
+
+	chainResult, err := ExecuteWithChain(ctx, chain, t.registry, t.callProvider)
+	if err != nil {
+		return ErrorResult(fmt.Sprintf("Video analysis failed: %v", err))
+	}
+
+	result := NewResult(string(chainResult.Data))
+	result.Usage = chainResult.Usage
+	result.Provider = chainResult.Provider
+	result.Model = chainResult.Model
+	return result
+}
+
+// mimeFromVideoExt returns MIME type for video file extensions.
+func mimeFromVideoExt(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".mp4":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mov":
+		return "video/quicktime"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".wmv":
+		return "video/x-ms-wmv"
+	case ".flv":
+		return "video/x-flv"
+	case ".3gp":
+		return "video/3gpp"
+	case ".mpeg", ".mpg":
+		return "video/mpeg"
+	default:
+		return "video/mp4"
+	}
+}

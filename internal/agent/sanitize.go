@@ -12,14 +12,16 @@
 //	     - collapseConsecutiveDuplicateBlocks()
 //
 // Additional Go-specific:
-//	  5. stripEchoedSystemMessages()       → strip hallucinated [System Message] blocks
-//	  6. stripGarbledToolXML()             → strip garbled XML from models like DeepSeek
+//  5. stripEchoedSystemMessages()       → strip hallucinated [System Message] blocks
+//  6. stripGarbledToolXML()             → strip garbled XML from models like DeepSeek
 package agent
 
 import (
 	"log/slog"
 	"regexp"
 	"strings"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // SanitizeAssistantContent applies the full sanitization pipeline to assistant
@@ -53,7 +55,10 @@ func SanitizeAssistantContent(content string) string {
 	// 6. Collapse consecutive duplicate blocks
 	content = collapseConsecutiveDuplicateBlocks(content)
 
-	// 7. Strip leading blank lines (preserve indentation)
+	// 7. Strip MEDIA: paths from LLM output (media delivered separately)
+	content = stripMediaPaths(content)
+
+	// 8. Strip leading blank lines (preserve indentation)
 	content = stripLeadingBlankLines(content)
 
 	content = strings.TrimSpace(content)
@@ -76,9 +81,34 @@ var garbledToolXMLPattern = regexp.MustCompile(
 	`(?s)</?(?:function_calls?|functioninvoke|invoke|invfunction_calls|tool_call|tool_use|parameter|minimax:tool_call)[^>]*>`,
 )
 
+// fullToolCallBlockPattern matches a COMPLETE Anthropic-style tool-call block
+// (`<function_calls>...</function_calls>`) that a model emitted as text instead
+// of invoking it natively. Unlike garbledToolXMLPattern — which removes only the
+// tags — this captures the whole block, tags plus the inner <parameter> text, so
+// a stray block is removed cleanly rather than leaving the argument values
+// orphaned in the user-facing reply.
+var fullToolCallBlockPattern = regexp.MustCompile(
+	`(?is)<function_calls?>.*?</function_calls?>`,
+)
+
+// invokeNamePattern extracts the tool name from an `<invoke name="...">` tag so a
+// dropped text-encoded tool call can be logged with the tool it tried to call.
+var invokeNamePattern = regexp.MustCompile(`(?i)<invoke\s+name="([^"]+)"`)
+
+// bareInvokeBlockPattern matches a complete `<invoke name="...">...</invoke>`
+// block emitted as text WITHOUT the surrounding <function_calls> wrapper. Some
+// models — and the claude-cli proxy under a degraded session — drop the wrapper
+// and emit just the invoke block, which fullToolCallBlockPattern misses; the
+// tag-only strip would then leak the inner <parameter> text. Applied after the
+// wrapped form so wrapper-nested invokes are already gone.
+var bareInvokeBlockPattern = regexp.MustCompile(
+	`(?is)<invoke\s+name="[^"]*".*?</invoke>`,
+)
+
 var garbledToolXMLIndicators = []string{
 	"invfunction_calls",
 	"functioninvoke",
+	"<invoke name=",
 	"<parameter name=",
 	"</parameter",
 	"<function_call",
@@ -100,19 +130,52 @@ func stripGarbledToolXML(content string) string {
 		return content
 	}
 
-	cleaned := garbledToolXMLPattern.ReplaceAllString(content, "")
-	cleaned = strings.TrimSpace(cleaned)
+	original := content
 
-	if cleaned != "" && hasIndicator {
-		slog.Warn("stripped garbled tool call response",
-			"original_len", len(content),
-			"remaining_len", len(cleaned),
+	// A COMPLETE tool-call block is not "garble" — it is a tool call the model
+	// wrote as TEXT instead of invoking it natively. This shows up with the
+	// claude-cli thin-proxy provider, where tool execution lives inside the CLI:
+	// when the model emits the call as text the tool never runs, and the tag-only
+	// strip below would leave the inner <parameter> values mangled into the reply.
+	// Remove whole blocks — <function_calls>...</function_calls> wrappers first,
+	// then any bare <invoke>...</invoke> left without a wrapper — and log the
+	// attempted tool name(s) at WARN so this otherwise-silent no-op is diagnosable.
+	var droppedTools []string
+	var droppedBlocks int
+	for _, re := range []*regexp.Regexp{fullToolCallBlockPattern, bareInvokeBlockPattern} {
+		blocks := re.FindAllString(content, -1)
+		if len(blocks) == 0 {
+			continue
+		}
+		droppedBlocks += len(blocks)
+		for _, b := range blocks {
+			for _, m := range invokeNamePattern.FindAllStringSubmatch(b, -1) {
+				droppedTools = append(droppedTools, m[1])
+			}
+		}
+		content = re.ReplaceAllString(content, "")
+	}
+	if droppedBlocks > 0 {
+		slog.Warn("dropped text-encoded tool call from response",
+			"tools", droppedTools,
+			"blocks", droppedBlocks,
+			"hint", "model wrote a tool call as text instead of invoking it; the tool did not run",
 		)
+	}
+
+	// Strip any remaining stray tags (partial DeepSeek/GLM/Minimax artifacts).
+	cleaned := strings.TrimSpace(garbledToolXMLPattern.ReplaceAllString(content, ""))
+
+	if cleaned == "" {
+		slog.Warn("stripped entire response as garbled tool XML", "original_len", len(original))
 		return ""
 	}
 
-	if cleaned == "" {
-		slog.Warn("stripped entire response as garbled tool XML", "original_len", len(content))
+	if cleaned != original {
+		slog.Warn("stripped garbled tool call XML from response",
+			"original_len", len(original),
+			"remaining_len", len(cleaned),
+		)
 	}
 	return cleaned
 }
@@ -165,21 +228,25 @@ func stripDowngradedToolCallText(content string) string {
 // --- 3. Thinking/reasoning tags ---
 
 // Matches TS stripThinkingTagsFromText() with strict mode.
-// Strips: <think>...</think>, <thinking>...</thinking>, <thought>...</thought>,
-//         <antThinking>...</antThinking>
+// Strips: <redacted_thinking>...</redacted_thinking>, <think>...</think>,
+//
+//	<thinking>...</thinking>, <thought>...</thought>,
+//	<antThinking>...</antThinking>
+//
 // Go regexp doesn't support backreferences, so we use separate patterns.
 var thinkingTagPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?is)<think>.*?</think>`),
-	regexp.MustCompile(`(?is)<thinking>.*?</thinking>`),
-	regexp.MustCompile(`(?is)<thought>.*?</thought>`),
-	regexp.MustCompile(`(?is)<antThinking>.*?</antThinking>`),
-	regexp.MustCompile(`(?is)<antthinking>.*?</antthinking>`),
+	regexp.MustCompile(`(?is)<redacted_thinking\b[^>]*>.*?</redacted_thinking\s*>`),
+	regexp.MustCompile(`(?is)<thinking\b[^>]*>.*?</thinking\s*>`),
+	regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think\s*>`),
+	regexp.MustCompile(`(?is)<thought\b[^>]*>.*?</thought\s*>`),
+	regexp.MustCompile(`(?is)<antThinking\b[^>]*>.*?</antThinking\s*>`),
+	regexp.MustCompile(`(?is)<antthinking\b[^>]*>.*?</antthinking\s*>`),
 }
 
 func stripThinkingTags(content string) string {
 	lower := strings.ToLower(content)
 	if !strings.Contains(lower, "<think") && !strings.Contains(lower, "<thought") &&
-		!strings.Contains(lower, "<antthinking") {
+		!strings.Contains(lower, "<antthinking") && !strings.Contains(lower, "<redacted_thinking") {
 		return content
 	}
 	result := content
@@ -277,7 +344,37 @@ func collapseConsecutiveDuplicateBlocks(content string) string {
 	return collapsed
 }
 
-// --- 7. Strip leading blank lines ---
+// --- 7. Strip MEDIA: paths ---
+
+// mediaPathPattern matches "MEDIA:" followed by a path (absolute or relative).
+var mediaPathPattern = regexp.MustCompile(`MEDIA:\S+`)
+
+// stripMediaPaths removes lines containing MEDIA:/path references from LLM output.
+// These are tool result artifacts that should not appear in user-facing text
+// (media files are delivered separately via OutboundMessage.Media).
+func stripMediaPaths(content string) string {
+	if !strings.Contains(content, "MEDIA:") {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	var result []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[[audio_as_voice]]") {
+			continue
+		}
+		// Strip any line containing a MEDIA: path reference, regardless of wrapping format.
+		// LLMs echo these in many forms: bare "MEDIA:/path", markdown "![alt](MEDIA:relative/path)",
+		// JSON '{"image":"MEDIA:/path"}', etc. Match MEDIA: followed by any non-space path char.
+		if mediaPathPattern.MatchString(trimmed) {
+			continue
+		}
+		result = append(result, line)
+	}
+	return strings.TrimSpace(strings.Join(result, "\n"))
+}
+
+// --- 8. Strip leading blank lines ---
 
 var leadingBlankLinesPattern = regexp.MustCompile(`^(?:[ \t]*\r?\n)+`)
 
@@ -285,37 +382,130 @@ func stripLeadingBlankLines(content string) string {
 	return leadingBlankLinesPattern.ReplaceAllString(content, "")
 }
 
+// --- 9. Config leak detection (predefined agents) ---
+
+// configLeakFileNames are internal file names that should not appear in user-facing output
+// when a predefined agent describes its procedures or configuration.
+var configLeakFileNames = []string{
+	"SOUL.md", "IDENTITY.md", "AGENTS.md", "BOOTSTRAP.md",
+	"internal_config", "system prompt",
+}
+
+// Patterns to strip markdown code from content before config leak detection.
+// Mentions inside code blocks/inline code are typically architecture docs, not leaks.
+var fencedCodeBlockPattern = regexp.MustCompile("(?s)```[^`]*```")
+var inlineCodePattern = regexp.MustCompile("`[^`\n]+`")
+
+// stripMarkdownCode removes fenced code blocks and inline code from text.
+func stripMarkdownCode(s string) string {
+	s = fencedCodeBlockPattern.ReplaceAllString(s, "")
+	s = inlineCodePattern.ReplaceAllString(s, "")
+	return s
+}
+
+// StripConfigLeak detects when a predefined agent dumps its internal configuration
+// (e.g. referencing SOUL.md, AGENTS.md, IDENTITY.md) and replaces the entire
+// response with a friendly decline.
+//
+// Only active for predefined agents. Single-gate detection:
+// 3+ distinct internal file names mentioned in plain text → replace entire response.
+// Mentions inside markdown code blocks and inline code are excluded from counting,
+// as they typically appear in architecture explanations rather than actual leaks.
+func StripConfigLeak(content, agentType string) string {
+	if agentType != store.AgentTypePredefined || content == "" {
+		return content
+	}
+
+	// Count hits only in plain text (outside code blocks/inline code)
+	plain := stripMarkdownCode(content)
+
+	hits := 0
+	for _, name := range configLeakFileNames {
+		if strings.Contains(plain, name) {
+			hits++
+		}
+	}
+	if hits < 3 {
+		return content
+	}
+
+	slog.Warn("security.config_leak_stripped",
+		"file_hits", hits,
+		"original_len", len(content),
+	)
+
+	return "🔒 Security check not passed."
+}
+
 // --- NO_REPLY detection ---
 
-// IsSilentReply checks if the text is a NO_REPLY token.
-// Matching TS isSilentReplyText() from auto-reply/tokens.ts.
+// IsSilentReply checks if the text contains a standalone NO_REPLY token.
+//
+// Divergent from TS isSilentReplyText() (exact-match only) — we match broadly so
+// both prefix forms (`NO_REPLY because offline`) and terminal sentinel forms
+// (`not for me. NO_REPLY`) suppress delivery. The token must not be glued to
+// another word (`NO_REPLYING` and `XNO_REPLY` are not silent). Case-insensitive.
 func IsSilentReply(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
 	}
+	// Strip decorative wrappers from both ends (quotes, markdown emphasis, punctuation).
+	stripped := strings.Trim(trimmed, "_ \t\n\r.,:;!?\"'`*~#>-()[]{}")
 	const token = "NO_REPLY"
-	// Exact match
-	if trimmed == token {
-		return true
+	return containsStandaloneNoReplyToken(stripped, token)
+}
+
+func containsStandaloneNoReplyToken(text, token string) bool {
+	if len(text) < len(token) {
+		return false
 	}
-	// Starts with token followed by non-word char or end
-	if strings.HasPrefix(trimmed, token) {
-		rest := trimmed[len(token):]
-		if rest == "" || !isWordChar(rune(rest[0])) {
-			return true
+	for i := 0; i+len(token) <= len(text); i++ {
+		if !strings.EqualFold(text[i:i+len(token)], token) {
+			continue
 		}
-	}
-	// Ends with token preceded by non-word char
-	if strings.HasSuffix(trimmed, token) {
-		before := trimmed[:len(trimmed)-len(token)]
-		if before == "" || !isWordChar(rune(before[len(before)-1])) {
+		beforeOK := i == 0 || !isAlphaNumByte(text[i-1])
+		after := i + len(token)
+		afterOK := after == len(text) || !isAlphaNumByte(text[after])
+		if beforeOK && afterOK {
 			return true
 		}
 	}
 	return false
 }
 
+func isAlphaNumByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
+}
+
+func isAlphaNum(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
 func isWordChar(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+}
+
+// --- Message Directives ([[name:value]]) ---
+
+// messageDirectivePattern matches structured routing tags: [[word]] or [[word:value]].
+// Single-line only (no (?s) dotall). Does NOT match arbitrary [[...]] content.
+var messageDirectivePattern = regexp.MustCompile(`\[\[\w+(?::[^\]\n]+)?\]\]`)
+
+// StripMessageDirectives removes internal [[...]] routing tags from user-facing text,
+// preserving [[tts...]] tags needed by the TTS auto-apply pipeline.
+func StripMessageDirectives(content string) string {
+	if !strings.Contains(content, "[[") {
+		return content
+	}
+	result := messageDirectivePattern.ReplaceAllStringFunc(content, func(match string) string {
+		inner := match[2 : len(match)-2] // strip [[ and ]]
+		if strings.HasPrefix(inner, "tts") {
+			return match // preserve for TTS AutoTagged mode
+		}
+		return ""
+	})
+	return strings.TrimSpace(result)
 }

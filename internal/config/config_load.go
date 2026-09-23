@@ -4,6 +4,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -12,19 +15,78 @@ import (
 	"github.com/titanous/json5"
 )
 
+const GatewayAllowInsecureNoAuthEnv = "GOCLAW_ALLOW_INSECURE_NO_AUTH"
+
+// GatewayNoAuthFallbackAllowed reports whether empty-token gateway auth may
+// run in local/dev compatibility mode.
+func GatewayNoAuthFallbackAllowed(g GatewayConfig) bool {
+	if strings.TrimSpace(g.Token) != "" {
+		return false
+	}
+	if insecureNoAuthOptIn() {
+		return true
+	}
+	return isLoopbackGatewayHost(g.Host)
+}
+
+// ValidateGatewayAuth fails configurations that would expose the gateway
+// without any bearer token.
+func ValidateGatewayAuth(g GatewayConfig) error {
+	if strings.TrimSpace(g.Token) != "" || GatewayNoAuthFallbackAllowed(g) {
+		return nil
+	}
+	return fmt.Errorf("gateway token is required when GOCLAW_HOST=%q; set GOCLAW_GATEWAY_TOKEN or explicit %s=1 for local development only", g.Host, GatewayAllowInsecureNoAuthEnv)
+}
+
+func insecureNoAuthOptIn() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(GatewayAllowInsecureNoAuthEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLoopbackGatewayHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.IsLoopback()
+}
+
+func parseEnvBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // Default returns a Config with sensible defaults.
 func Default() *Config {
 	return &Config{
+		DataDir: "~/.goclaw/data",
 		Agents: AgentsConfig{
 			Defaults: AgentDefaults{
 				Workspace:           "~/.goclaw/workspace",
 				RestrictToWorkspace: true,
 				Provider:            "anthropic",
 				Model:               "claude-sonnet-4-5-20250929",
-				MaxTokens:           8192,
-				Temperature:         0.7,
-				MaxToolIterations:   20,
-				ContextWindow:       200000,
+				MaxTokens:           DefaultMaxTokens,
+				Temperature:         DefaultTemperature,
+				MaxToolIterations:   DefaultMaxIterations,
+				MaxToolCalls:        25,
+				ContextWindow:       DefaultContextWindow,
 				Subagents: &SubagentsConfig{
 					MaxConcurrent: 20,
 					MaxSpawnDepth: 1,
@@ -33,32 +95,34 @@ func Default() *Config {
 		},
 		Channels: ChannelsConfig{
 			Telegram: TelegramConfig{
-				StreamMode:    "none",
 				ReactionLevel: "full",
+			},
+			Discord: DiscordConfig{
+				HistoryLimit: 200,
 			},
 		},
 		Gateway: GatewayConfig{
 			Host:            "0.0.0.0",
 			Port:            18790,
-			MaxMessageChars: 32000,
+			MaxMessageChars: DefaultMaxMessageChars,
 			RateLimitRPM:    20,
 		},
 		Tools: ToolsConfig{
-			Web: WebToolsConfig{
-				DuckDuckGo: DuckDuckGoConfig{Enabled: true, MaxResults: 5},
-			},
 			Browser: BrowserToolConfig{
-				Enabled:  true,
-				Headless: true,
+				Enabled:           true,
+				Headless:          true,
+				CookieSyncEnabled: true,
 			},
 			ExecApproval: ExecApprovalCfg{
 				Security: "full",
 				Ask:      "off",
 			},
+			RateLimitPerHour: 150,
 		},
-		Sessions: SessionsConfig{
-			Storage: "~/.goclaw/sessions",
+		Skills: SkillsConfig{
+			MaxUploadSizeMB: DefaultSkillMaxUploadSizeMB,
 		},
+		Sessions: SessionsConfig{},
 	}
 }
 
@@ -69,6 +133,7 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			cfg.applyEnvOverrides()
 			return cfg, nil
 		}
 		return nil, fmt.Errorf("read config: %w", err)
@@ -79,7 +144,6 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg.applyEnvOverrides()
-	cfg.applyContextPruningDefaults()
 	return cfg, nil
 }
 
@@ -92,7 +156,13 @@ func (c *Config) applyEnvOverrides() {
 		}
 	}
 	envStr("GOCLAW_ANTHROPIC_API_KEY", &c.Providers.Anthropic.APIKey)
+	envStr("GOCLAW_ANTHROPIC_BASE_URL", &c.Providers.Anthropic.APIBase)
 	envStr("GOCLAW_OPENAI_API_KEY", &c.Providers.OpenAI.APIKey)
+	envStr("GOCLAW_OPENAI_BASE_URL", &c.Providers.OpenAI.APIBase)
+	envStr("GOCLAW_ATLASCLOUD_API_KEY", &c.Providers.AtlasCloud.APIKey)
+	envStr("GOCLAW_ATLASCLOUD_BASE_URL", &c.Providers.AtlasCloud.APIBase)
+	envStr("GOCLAW_API_ROUTE_API_KEY", &c.Providers.APIRoute.APIKey)
+	envStr("GOCLAW_API_ROUTE_BASE_URL", &c.Providers.APIRoute.APIBase)
 	envStr("GOCLAW_OPENROUTER_API_KEY", &c.Providers.OpenRouter.APIKey)
 	envStr("GOCLAW_GROQ_API_KEY", &c.Providers.Groq.APIKey)
 	envStr("GOCLAW_DEEPSEEK_API_KEY", &c.Providers.DeepSeek.APIKey)
@@ -102,13 +172,34 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_MINIMAX_API_KEY", &c.Providers.MiniMax.APIKey)
 	envStr("GOCLAW_COHERE_API_KEY", &c.Providers.Cohere.APIKey)
 	envStr("GOCLAW_PERPLEXITY_API_KEY", &c.Providers.Perplexity.APIKey)
+	envStr("GOCLAW_DASHSCOPE_API_KEY", &c.Providers.DashScope.APIKey)
+	envStr("GOCLAW_BAILIAN_API_KEY", &c.Providers.Bailian.APIKey)
+	envStr("GOCLAW_ZAI_API_KEY", &c.Providers.Zai.APIKey)
+	envStr("GOCLAW_ZAI_CODING_API_KEY", &c.Providers.ZaiCoding.APIKey)
+	envStr("GOCLAW_OLLAMA_HOST", &c.Providers.Ollama.Host)
+	envStr("GOCLAW_OLLAMA_CLOUD_API_KEY", &c.Providers.OllamaCloud.APIKey)
+	envStr("GOCLAW_OLLAMA_CLOUD_API_BASE", &c.Providers.OllamaCloud.APIBase)
+	// Google Cloud Vertex AI (OAuth2 service account + ADC).
+	// APIKey may hold inline SA JSON; CredentialsFile is a path to SA JSON.
+	// If both empty, ADC (GOOGLE_APPLICATION_CREDENTIALS / gcloud / GCE metadata) is used.
+	envStr("GOCLAW_VERTEX_API_KEY", &c.Providers.Vertex.APIKey)
+	envStr("GOCLAW_VERTEX_CREDENTIALS_FILE", &c.Providers.Vertex.CredentialsFile)
+	envStr("GOCLAW_VERTEX_PROJECT_ID", &c.Providers.Vertex.ProjectID)
+	envStr("GOCLAW_VERTEX_REGION", &c.Providers.Vertex.Region)
+	envStr("GOCLAW_VERTEX_MODEL", &c.Providers.Vertex.Model)
 	envStr("GOCLAW_GATEWAY_TOKEN", &c.Gateway.Token)
+	envStr("GOCLAW_MCP_SERVER_TOKEN", &c.Gateway.MCPServerToken)
 	envStr("GOCLAW_TELEGRAM_TOKEN", &c.Channels.Telegram.Token)
+	envStr("GOCLAW_DISCORD_TOKEN", &c.Channels.Discord.Token)
 	envStr("GOCLAW_ZALO_TOKEN", &c.Channels.Zalo.Token)
-	envStr("GOCLAW_FEISHU_APP_ID", &c.Channels.Feishu.AppID)
-	envStr("GOCLAW_FEISHU_APP_SECRET", &c.Channels.Feishu.AppSecret)
-	envStr("GOCLAW_FEISHU_ENCRYPT_KEY", &c.Channels.Feishu.EncryptKey)
-	envStr("GOCLAW_FEISHU_VERIFICATION_TOKEN", &c.Channels.Feishu.VerificationToken)
+	envStr("GOCLAW_LARK_APP_ID", &c.Channels.Feishu.AppID)
+	envStr("GOCLAW_LARK_APP_SECRET", &c.Channels.Feishu.AppSecret)
+	envStr("GOCLAW_LARK_ENCRYPT_KEY", &c.Channels.Feishu.EncryptKey)
+	envStr("GOCLAW_LARK_VERIFICATION_TOKEN", &c.Channels.Feishu.VerificationToken)
+	// WhatsApp no longer needs bridge_url — runs natively via whatsmeow.
+	envStr("GOCLAW_SLACK_BOT_TOKEN", &c.Channels.Slack.BotToken)
+	envStr("GOCLAW_SLACK_APP_TOKEN", &c.Channels.Slack.AppToken)
+	envStr("GOCLAW_SLACK_USER_TOKEN", &c.Channels.Slack.UserToken)
 
 	// TTS secrets
 	envStr("GOCLAW_TTS_OPENAI_API_KEY", &c.Tts.OpenAI.APIKey)
@@ -120,20 +211,41 @@ func (c *Config) applyEnvOverrides() {
 	if c.Channels.Telegram.Token != "" {
 		c.Channels.Telegram.Enabled = true
 	}
+	if c.Channels.Discord.Token != "" {
+		c.Channels.Discord.Enabled = true
+	}
 	if c.Channels.Zalo.Token != "" {
 		c.Channels.Zalo.Enabled = true
 	}
 	if c.Channels.Feishu.AppID != "" && c.Channels.Feishu.AppSecret != "" {
 		c.Channels.Feishu.Enabled = true
 	}
+	// WhatsApp is enabled via config or DB instances (no bridge_url needed).
+	if c.Channels.Slack.BotToken != "" && c.Channels.Slack.AppToken != "" {
+		c.Channels.Slack.Enabled = true
+	}
 
-	// Allow overriding default provider/model
-	envStr("GOCLAW_PROVIDER", &c.Agents.Defaults.Provider)
-	envStr("GOCLAW_MODEL", &c.Agents.Defaults.Model)
+	// Claude CLI provider
+	envStr("GOCLAW_CLAUDE_CLI_PATH", &c.Providers.ClaudeCLI.CLIPath)
+	envStr("GOCLAW_CLAUDE_CLI_MODEL", &c.Providers.ClaudeCLI.Model)
+	envStr("GOCLAW_CLAUDE_CLI_WORK_DIR", &c.Providers.ClaudeCLI.BaseWorkDir)
 
-	// Workspace & sessions
+	// Default provider/model: env is fallback only (applied when config has no value).
+	// The onboard wizard sets these in .env for initial bootstrap; once the user
+	// saves a provider/model via the Dashboard, the config-file value wins.
+	envFallback := func(key string, dst *string) {
+		if *dst == "" {
+			if v := os.Getenv(key); v != "" {
+				*dst = v
+			}
+		}
+	}
+	envFallback("GOCLAW_PROVIDER", &c.Agents.Defaults.Provider)
+	envFallback("GOCLAW_MODEL", &c.Agents.Defaults.Model)
+
+	// Data directory, workspace & sessions
+	envStr("GOCLAW_DATA_DIR", &c.DataDir)
 	envStr("GOCLAW_WORKSPACE", &c.Agents.Defaults.Workspace)
-	envStr("GOCLAW_SESSIONS_STORAGE", &c.Sessions.Storage)
 
 	// Gateway host/port
 	envStr("GOCLAW_HOST", &c.Gateway.Host)
@@ -142,10 +254,51 @@ func (c *Config) applyEnvOverrides() {
 			c.Gateway.Port = port
 		}
 	}
+	if v := os.Getenv("GOCLAW_SKILLS_MAX_UPLOAD_SIZE_MB"); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil {
+			c.Skills.MaxUploadSizeMB = ClampSkillMaxUploadSizeMB(mb)
+		}
+	}
+	// Webhook agent-run timeouts (seconds). Bounds (default 600, cap 3600) are
+	// applied at consumption via webhooks.ResolveTimeoutSec.
+	if v := os.Getenv("GOCLAW_WEBHOOK_ASYNC_TIMEOUT_SEC"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+			c.Gateway.WebhookAsyncTimeoutSec = sec
+		}
+	}
+	if v := os.Getenv("GOCLAW_WEBHOOK_SYNC_TIMEOUT_SEC"); v != "" {
+		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
+			c.Gateway.WebhookSyncTimeoutSec = sec
+		}
+	}
+	envBoolPtr := func(key string, dst **bool) {
+		if v := os.Getenv(key); v != "" {
+			b := parseEnvBool(v)
+			*dst = &b
+		}
+	}
+	envBool := func(key string, dst *bool) {
+		if v := os.Getenv(key); v != "" {
+			*dst = parseEnvBool(v)
+		}
+	}
+	// Webhook internal streaming toggle (default true; nil → on via webhooks.ResolveStream).
+	envBoolPtr("GOCLAW_WEBHOOK_STREAM", &c.Gateway.WebhookStream)
+	envBoolPtr("GOCLAW_SKILLS_SLASH_COMMANDS_ENABLED", &c.Skills.SlashCommands.Enabled)
+	envBoolPtr("GOCLAW_SKILLS_SLASH_COMMANDS_SUGGEST_NOT_FOUND", &c.Skills.SlashCommands.SuggestNotFound)
+	envBool("GOCLAW_SKILLS_SLASH_COMMANDS_PARTIAL_MATCHING", &c.Skills.SlashCommands.PartialMatching)
+	envStr("GOCLAW_SKILLS_SLASH_COMMANDS_PREFIX", &c.Skills.SlashCommands.Prefix)
 
 	// Database
 	envStr("GOCLAW_POSTGRES_DSN", &c.Database.PostgresDSN)
-	envStr("GOCLAW_MODE", &c.Database.Mode)
+	envStr("GOCLAW_REDIS_DSN", &c.Database.RedisDSN)
+	envStr("GOCLAW_STORAGE_BACKEND", &c.Database.StorageBackend)
+	envStr("GOCLAW_SQLITE_PATH", &c.Database.SQLitePath)
+
+	// Deprecation warning for GOCLAW_MODE (removed — PostgreSQL is always active)
+	if v := os.Getenv("GOCLAW_MODE"); v != "" {
+		slog.Warn("GOCLAW_MODE is deprecated; managed mode is now the only mode", "value", v)
+	}
 
 	// Telemetry
 	envStr("GOCLAW_TELEMETRY_ENDPOINT", &c.Telemetry.Endpoint)
@@ -158,9 +311,39 @@ func (c *Config) applyEnvOverrides() {
 		c.Telemetry.Insecure = v == "true" || v == "1"
 	}
 
-	// Owner IDs from env (comma-separated)
+	// Owner IDs from env (comma-separated, whitespace-trimmed)
 	if v := os.Getenv("GOCLAW_OWNER_IDS"); v != "" {
-		c.Gateway.OwnerIDs = strings.Split(v, ",")
+		var ids []string
+		for id := range strings.SplitSeq(v, ",") {
+			if trimmed := strings.TrimSpace(id); trimmed != "" {
+				ids = append(ids, trimmed)
+			}
+		}
+		c.Gateway.OwnerIDs = ids
+	}
+
+	// Allowed origins from env (comma-separated, whitespace-trimmed)
+	if v := os.Getenv("GOCLAW_ALLOWED_ORIGINS"); v != "" {
+		var origins []string
+		for origin := range strings.SplitSeq(v, ",") {
+			if trimmed := strings.TrimSpace(origin); trimmed != "" {
+				origins = append(origins, trimmed)
+			}
+		}
+		c.Gateway.AllowedOrigins = origins
+	}
+
+	// Trusted MCP server hosts from env (comma-separated, whitespace-trimmed).
+	// These hosts are exempt from the private-IP SSRF block when registering MCP
+	// servers (e.g. self-hosted MCP on a private network).
+	if v := os.Getenv("GOCLAW_MCP_ALLOWED_HOSTS"); v != "" {
+		var hosts []string
+		for h := range strings.SplitSeq(v, ",") {
+			if trimmed := strings.TrimSpace(h); trimmed != "" {
+				hosts = append(hosts, trimmed)
+			}
+		}
+		c.Gateway.MCPAllowedHosts = hosts
 	}
 
 	// Tailscale (tsnet)
@@ -212,30 +395,16 @@ func (c *Config) applyEnvOverrides() {
 		ensureSandbox()
 		c.Agents.Defaults.Sandbox.NetworkEnabled = v == "true" || v == "1"
 	}
-}
 
-// applyContextPruningDefaults auto-enables context pruning when the Anthropic
-// provider is configured, matching TS applyContextPruningDefaults() in
-// src/config/defaults.ts.
-//
-// Go port does not have OAuth vs API-key distinction — we always treat it as
-// API-key mode (heartbeat 30m).
-func (c *Config) applyContextPruningDefaults() {
-	// Only apply when Anthropic is configured.
-	if c.Providers.Anthropic.APIKey == "" {
-		return
+	// Browser (for Docker-compose browser sidecar overlay)
+	envStr("GOCLAW_BROWSER_REMOTE_URL", &c.Tools.Browser.RemoteURL)
+	envStr("GOCLAW_BROWSER_BACKEND", &c.Tools.Browser.Backend)
+	if c.Tools.Browser.RemoteURL != "" {
+		c.Tools.Browser.Enabled = true
 	}
 
-	defaults := &c.Agents.Defaults
-
-	// Auto-enable context pruning if mode not explicitly set.
-	if defaults.ContextPruning == nil {
-		defaults.ContextPruning = &ContextPruningConfig{
-			Mode: "cache-ttl",
-		}
-	} else if defaults.ContextPruning.Mode == "" {
-		defaults.ContextPruning.Mode = "cache-ttl"
-	}
+	// Cron job execution
+	envStr("GOCLAW_CRON_JOB_TIMEOUT", &c.Cron.JobTimeout)
 }
 
 // Save writes the config to a JSON file.
@@ -263,6 +432,22 @@ func (c *Config) Hash() string {
 	data, _ := json.Marshal(c)
 	h := sha256.Sum256(data)
 	return fmt.Sprintf("%x", h[:8])
+}
+
+// ResolvedDataDir returns the expanded data directory path.
+func (c *Config) ResolvedDataDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return ExpandHome(c.DataDir)
+}
+
+// ResolvedDataDirFromEnv returns the data dir from GOCLAW_DATA_DIR env or default.
+// Use this in packages that don't have access to a Config instance.
+func ResolvedDataDirFromEnv() string {
+	if v := os.Getenv("GOCLAW_DATA_DIR"); v != "" {
+		return ExpandHome(v)
+	}
+	return ExpandHome("~/.goclaw/data")
 }
 
 // WorkspacePath returns the expanded workspace path.
@@ -297,6 +482,9 @@ func (c *Config) ResolveAgent(agentID string) AgentDefaults {
 		}
 		if spec.ContextWindow > 0 {
 			d.ContextWindow = spec.ContextWindow
+		}
+		if spec.MaxToolCalls > 0 {
+			d.MaxToolCalls = spec.MaxToolCalls
 		}
 		if spec.Workspace != "" {
 			d.Workspace = spec.Workspace
@@ -341,7 +529,6 @@ func (c *Config) ResolveDisplayName(agentID string) string {
 // Call this after modifying config to restore runtime secrets from env vars.
 func (c *Config) ApplyEnvOverrides() {
 	c.applyEnvOverrides()
-	c.applyContextPruningDefaults()
 }
 
 // ExpandHome replaces leading ~ with the user home directory.
@@ -354,4 +541,17 @@ func ExpandHome(path string) string {
 		return home + path[1:]
 	}
 	return home
+}
+
+// ContractHome replaces the user home directory prefix with ~.
+// Reverse of ExpandHome — used to store portable paths in the database.
+func ContractHome(path string) string {
+	if path == "" {
+		return path
+	}
+	home, _ := os.UserHomeDir()
+	if home != "" && strings.HasPrefix(path, home) {
+		return "~" + path[len(home):]
+	}
+	return path
 }

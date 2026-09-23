@@ -1,8 +1,11 @@
 package pg
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -19,26 +22,102 @@ type PGSessionStore struct {
 	mu sync.RWMutex
 	// In-memory cache for hot sessions (reduces DB reads during tool loops)
 	cache map[string]*store.SessionData
+	// OnDelete is called with the session key when a session is deleted.
+	// Used for media file cleanup.
+	OnDelete func(sessionKey string)
 }
 
 func NewPGSessionStore(db *sql.DB) *PGSessionStore {
-	return &PGSessionStore{
+	s := &PGSessionStore{
 		db:    db,
 		cache: make(map[string]*store.SessionData),
 	}
+	s.migrateLegacyWSKeys()
+	s.migrateUUIDSessionKeys()
+	return s
 }
 
-func (s *PGSessionStore) GetOrCreate(key string) *store.SessionData {
+// migrateLegacyWSKeys renames old WS session keys from non-canonical format
+// (agent:X:ws-userId-ts) to canonical format (agent:X:ws:direct:ts).
+// The last hyphen-delimited segment is the base36 timestamp used as convId.
+// Idempotent — no-op if no legacy keys exist.
+func (s *PGSessionStore) migrateLegacyWSKeys() {
+	res, err := s.db.ExecContext(context.Background(), `
+		UPDATE sessions
+		SET session_key = regexp_replace(
+			session_key,
+			'^(agent:[^:]+):ws-.+-([^-]+)$',
+			'\1:ws:direct:\2'
+		)
+		WHERE session_key ~ '^agent:[^:]+:ws-'
+	`)
+	if err != nil {
+		slog.Warn("sessions.migrate_legacy_ws_keys", "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		slog.Info("sessions.migrate_legacy_ws_keys", "migrated", n)
+	}
+}
+
+// migrateUUIDSessionKeys fixes legacy heartbeat/cron session keys that used the agent's
+// UUID instead of agentKey. The old format "agent:{UUID}:heartbeat" or "agent:{UUID}:cron:..."
+// is replaced with "agent:{agentKey}:..." by JOINing with the agents table.
+// Idempotent — no-op if no UUID-based keys exist.
+func (s *PGSessionStore) migrateUUIDSessionKeys() {
+	// UUID pattern: 8-4-4-4-12 hex chars. Matches session keys where the agent segment is a UUID.
+	// Rewrites to use agents.agent_key instead.
+	// Build the target key and skip rows where the target already exists (avoids unique constraint violation
+	// when both UUID-keyed and agentKey-keyed sessions coexist for the same agent).
+	res, err := s.db.ExecContext(context.Background(), `
+		UPDATE sessions s
+		SET session_key = 'agent:' || a.agent_key || ':' || split_part(s.session_key, ':', 3)
+			|| CASE WHEN array_length(string_to_array(s.session_key, ':'), 1) > 3
+				THEN ':' || (SELECT string_agg(part, ':') FROM unnest((string_to_array(s.session_key, ':'))[4:]) AS part)
+				ELSE '' END
+		FROM agents a
+		WHERE s.session_key ~ '^agent:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:'
+		  AND a.id = (split_part(s.session_key, ':', 2))::uuid
+		  AND a.deleted_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM sessions s2
+		    WHERE s2.tenant_id = s.tenant_id
+		      AND s2.session_key = 'agent:' || a.agent_key || ':' || split_part(s.session_key, ':', 3)
+		        || CASE WHEN array_length(string_to_array(s.session_key, ':'), 1) > 3
+		            THEN ':' || (SELECT string_agg(p, ':') FROM unnest((string_to_array(s.session_key, ':'))[4:]) AS p)
+		            ELSE '' END
+		  )
+	`)
+	if err != nil {
+		slog.Warn("sessions.migrate_uuid_keys", "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		slog.Info("sessions.migrate_uuid_keys", "migrated", n)
+	}
+}
+
+// sessionCacheKey prefixes session key with tenant UUID to prevent cross-tenant cache collisions.
+// Two tenants with the same agent_key produce different cache keys.
+func sessionCacheKey(ctx context.Context, key string) string {
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		tid = store.MasterTenantID
+	}
+	return tid.String() + ":" + key
+}
+
+func (s *PGSessionStore) GetOrCreate(ctx context.Context, key string) *store.SessionData {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if cached, ok := s.cache[key]; ok {
+	if cached, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		return cached
 	}
 
-	data := s.loadFromDB(key)
+	data := s.loadFromDB(ctx, key)
 	if data != nil {
-		s.cache[key] = data
+		s.cache[sessionCacheKey(ctx, key)] = data
 		return data
 	}
 
@@ -50,30 +129,69 @@ func (s *PGSessionStore) GetOrCreate(key string) *store.SessionData {
 		Created:  now,
 		Updated:  now,
 	}
-	s.cache[key] = data
+
+	// Extract team_id from team session keys (agent:{agentId}:team:{teamId}:{chatId}).
+	var teamID *uuid.UUID
+	if parts := strings.SplitN(key, ":", 5); len(parts) >= 4 && parts[2] == "team" {
+		if tid, err := uuid.Parse(parts[3]); err == nil {
+			teamID = &tid
+			data.TeamID = teamID
+		}
+	}
+	s.cache[sessionCacheKey(ctx, key)] = data
 
 	msgsJSON, _ := json.Marshal([]providers.Message{})
-	s.db.Exec(
-		`INSERT INTO sessions (id, session_key, messages, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (session_key) DO NOTHING`,
-		uuid.Must(uuid.NewV7()), key, msgsJSON, now, now,
+	s.db.ExecContext(ctx,
+		`INSERT INTO sessions (id, session_key, messages, created_at, updated_at, team_id, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (tenant_id, session_key) DO NOTHING`,
+		uuid.Must(uuid.NewV7()), key, msgsJSON, now, now, teamID, tenantIDForInsert(ctx),
 	)
 
 	return data
 }
 
-func (s *PGSessionStore) AddMessage(key string, msg providers.Message) {
+// Get returns the session if it exists (cache or DB), nil otherwise. Never creates.
+func (s *PGSessionStore) Get(ctx context.Context, key string) *store.SessionData {
+	s.mu.RLock()
+	if cached, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
+		s.mu.RUnlock()
+		return cached
+	}
+	s.mu.RUnlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data := s.getOrInit(key)
+	// Double-check after acquiring write lock
+	if cached, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
+		return cached
+	}
+
+	data := s.loadFromDB(ctx, key)
+	if data != nil {
+		s.cache[sessionCacheKey(ctx, key)] = data
+	}
+	return data
+}
+
+func (s *PGSessionStore) AddMessage(ctx context.Context, key string, msg providers.Message) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Stamp message creation time if not already set.
+	if msg.CreatedAt == nil {
+		now := time.Now().UTC()
+		msg.CreatedAt = &now
+	}
+
+	data := s.getOrInit(ctx, key)
 	data.Messages = append(data.Messages, msg)
 	data.Updated = time.Now()
 }
 
-func (s *PGSessionStore) GetHistory(key string) []providers.Message {
+func (s *PGSessionStore) GetHistory(ctx context.Context, key string) []providers.Message {
 	s.mu.RLock()
-	if data, ok := s.cache[key]; ok {
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		msgs := make([]providers.Message, len(data.Messages))
 		copy(msgs, data.Messages)
 		s.mu.RUnlock()
@@ -86,53 +204,84 @@ func (s *PGSessionStore) GetHistory(key string) []providers.Message {
 	defer s.mu.Unlock()
 
 	// Double-check after acquiring write lock
-	if data, ok := s.cache[key]; ok {
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		msgs := make([]providers.Message, len(data.Messages))
 		copy(msgs, data.Messages)
 		return msgs
 	}
 
-	data := s.loadFromDB(key)
+	data := s.loadFromDB(ctx, key)
 	if data == nil {
 		return nil
 	}
-	s.cache[key] = data
+	s.cache[sessionCacheKey(ctx, key)] = data
 	msgs := make([]providers.Message, len(data.Messages))
 	copy(msgs, data.Messages)
 	return msgs
 }
 
-func (s *PGSessionStore) GetSummary(key string) string {
+func (s *PGSessionStore) GetSummary(ctx context.Context, key string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if data, ok := s.cache[key]; ok {
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		return data.Summary
 	}
 	return ""
 }
 
-func (s *PGSessionStore) SetSummary(key, summary string) {
+func (s *PGSessionStore) SetSummary(ctx context.Context, key, summary string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		data.Summary = summary
 		data.Updated = time.Now()
 	}
 }
 
-func (s *PGSessionStore) SetLabel(key, label string) {
+func (s *PGSessionStore) GetLabel(ctx context.Context, key string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
+		return data.Label
+	}
+	return ""
+}
+
+func (s *PGSessionStore) SetLabel(ctx context.Context, key, label string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		data.Label = label
 		data.Updated = time.Now()
 	}
 }
 
-func (s *PGSessionStore) SetAgentInfo(key string, agentUUID uuid.UUID, userID string) {
+func (s *PGSessionStore) GetSessionMetadata(ctx context.Context, key string) map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok && data.Metadata != nil {
+		out := make(map[string]string, len(data.Metadata))
+		maps.Copy(out, data.Metadata)
+		return out
+	}
+	return nil
+}
+
+func (s *PGSessionStore) SetSessionMetadata(ctx context.Context, key string, metadata map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data := s.getOrInit(key)
+	data := s.getOrInit(ctx, key)
+	if data.Metadata == nil {
+		data.Metadata = make(map[string]string)
+	}
+	maps.Copy(data.Metadata, metadata)
+	data.Updated = time.Now()
+}
+
+func (s *PGSessionStore) SetAgentInfo(ctx context.Context, key string, agentUUID uuid.UUID, userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data := s.getOrInit(ctx, key)
 	if agentUUID != uuid.Nil {
 		data.AgentUUID = agentUUID
 	}
@@ -141,10 +290,10 @@ func (s *PGSessionStore) SetAgentInfo(key string, agentUUID uuid.UUID, userID st
 	}
 }
 
-func (s *PGSessionStore) UpdateMetadata(key, model, provider, channel string) {
+func (s *PGSessionStore) UpdateMetadata(ctx context.Context, key, model, provider, channel string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
+	if data, ok := s.cache[sessionCacheKey(ctx, key)]; ok {
 		if model != "" {
 			data.Model = model
 		}
@@ -155,341 +304,4 @@ func (s *PGSessionStore) UpdateMetadata(key, model, provider, channel string) {
 			data.Channel = channel
 		}
 	}
-}
-
-func (s *PGSessionStore) AccumulateTokens(key string, input, output int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
-		data.InputTokens += input
-		data.OutputTokens += output
-	}
-}
-
-func (s *PGSessionStore) IncrementCompaction(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
-		data.CompactionCount++
-	}
-}
-
-func (s *PGSessionStore) GetCompactionCount(key string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if data, ok := s.cache[key]; ok {
-		return data.CompactionCount
-	}
-	return 0
-}
-
-func (s *PGSessionStore) GetMemoryFlushCompactionCount(key string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if data, ok := s.cache[key]; ok {
-		return data.MemoryFlushCompactionCount
-	}
-	return -1
-}
-
-func (s *PGSessionStore) SetMemoryFlushDone(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
-		data.MemoryFlushCompactionCount = data.CompactionCount
-		data.MemoryFlushAt = time.Now().UnixMilli()
-	}
-}
-
-func (s *PGSessionStore) SetSpawnInfo(key, spawnedBy string, depth int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
-		data.SpawnedBy = spawnedBy
-		data.SpawnDepth = depth
-	}
-}
-
-func (s *PGSessionStore) TruncateHistory(key string, keepLast int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
-		if keepLast <= 0 {
-			data.Messages = []providers.Message{}
-		} else if len(data.Messages) > keepLast {
-			data.Messages = data.Messages[len(data.Messages)-keepLast:]
-		}
-		data.Updated = time.Now()
-	}
-}
-
-func (s *PGSessionStore) Reset(key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if data, ok := s.cache[key]; ok {
-		data.Messages = []providers.Message{}
-		data.Summary = ""
-		data.Updated = time.Now()
-	}
-}
-
-func (s *PGSessionStore) Delete(key string) error {
-	s.mu.Lock()
-	delete(s.cache, key)
-	s.mu.Unlock()
-
-	_, err := s.db.Exec("DELETE FROM sessions WHERE session_key = $1", key)
-	return err
-}
-
-func (s *PGSessionStore) List(agentID string) []store.SessionInfo {
-	var rows *sql.Rows
-	var err error
-	if agentID != "" {
-		prefix := "agent:" + agentID + ":%"
-		rows, err = s.db.Query(
-			"SELECT session_key, messages, created_at, updated_at FROM sessions WHERE session_key LIKE $1 ORDER BY updated_at DESC", prefix)
-	} else {
-		rows, err = s.db.Query(
-			"SELECT session_key, messages, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
-	}
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	var result []store.SessionInfo
-	for rows.Next() {
-		var key string
-		var msgsJSON []byte
-		var createdAt, updatedAt time.Time
-		if err := rows.Scan(&key, &msgsJSON, &createdAt, &updatedAt); err != nil {
-			continue
-		}
-		var msgs []providers.Message
-		json.Unmarshal(msgsJSON, &msgs)
-		result = append(result, store.SessionInfo{
-			Key:          key,
-			MessageCount: len(msgs),
-			Created:      createdAt,
-			Updated:      updatedAt,
-		})
-	}
-	return result
-}
-
-func (s *PGSessionStore) ListPaged(opts store.SessionListOpts) store.SessionListResult {
-	limit := opts.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	offset := opts.Offset
-	if offset < 0 {
-		offset = 0
-	}
-
-	var where string
-	var whereArgs []interface{}
-
-	if opts.AgentID != "" {
-		where = " WHERE session_key LIKE $1"
-		whereArgs = append(whereArgs, "agent:"+opts.AgentID+":%")
-	}
-
-	// Count total
-	var total int
-	countQ := "SELECT COUNT(*) FROM sessions" + where
-	if err := s.db.QueryRow(countQ, whereArgs...).Scan(&total); err != nil {
-		return store.SessionListResult{Sessions: []store.SessionInfo{}, Total: 0}
-	}
-
-	// Fetch page using jsonb_array_length to avoid loading full messages
-	var selectQ string
-	var selectArgs []interface{}
-
-	if opts.AgentID != "" {
-		selectQ = `SELECT session_key, jsonb_array_length(messages), created_at, updated_at
-		           FROM sessions WHERE session_key LIKE $1 ORDER BY updated_at DESC LIMIT $2 OFFSET $3`
-		selectArgs = []interface{}{whereArgs[0], limit, offset}
-	} else {
-		selectQ = `SELECT session_key, jsonb_array_length(messages), created_at, updated_at
-		           FROM sessions ORDER BY updated_at DESC LIMIT $1 OFFSET $2`
-		selectArgs = []interface{}{limit, offset}
-	}
-
-	rows, err := s.db.Query(selectQ, selectArgs...)
-	if err != nil {
-		return store.SessionListResult{Sessions: []store.SessionInfo{}, Total: total}
-	}
-	defer rows.Close()
-
-	var result []store.SessionInfo
-	for rows.Next() {
-		var key string
-		var msgCount int
-		var createdAt, updatedAt time.Time
-		if err := rows.Scan(&key, &msgCount, &createdAt, &updatedAt); err != nil {
-			continue
-		}
-		result = append(result, store.SessionInfo{
-			Key:          key,
-			MessageCount: msgCount,
-			Created:      createdAt,
-			Updated:      updatedAt,
-		})
-	}
-	if result == nil {
-		result = []store.SessionInfo{}
-	}
-	return store.SessionListResult{Sessions: result, Total: total}
-}
-
-func (s *PGSessionStore) Save(key string) error {
-	s.mu.RLock()
-	data, ok := s.cache[key]
-	if !ok {
-		s.mu.RUnlock()
-		return nil
-	}
-	// Snapshot
-	snapshot := *data
-	msgs := make([]providers.Message, len(data.Messages))
-	copy(msgs, data.Messages)
-	snapshot.Messages = msgs
-	s.mu.RUnlock()
-
-	msgsJSON, _ := json.Marshal(snapshot.Messages)
-
-	_, err := s.db.Exec(
-		`UPDATE sessions SET
-			messages = $1, summary = $2, model = $3, provider = $4, channel = $5,
-			input_tokens = $6, output_tokens = $7, compaction_count = $8,
-			memory_flush_compaction_count = $9, memory_flush_at = $10,
-			label = $11, spawned_by = $12, spawn_depth = $13,
-			agent_id = $14, user_id = $15, updated_at = $16
-		 WHERE session_key = $17`,
-		msgsJSON, nilStr(snapshot.Summary), nilStr(snapshot.Model), nilStr(snapshot.Provider), nilStr(snapshot.Channel),
-		snapshot.InputTokens, snapshot.OutputTokens, snapshot.CompactionCount,
-		snapshot.MemoryFlushCompactionCount, snapshot.MemoryFlushAt,
-		nilStr(snapshot.Label), nilStr(snapshot.SpawnedBy), snapshot.SpawnDepth,
-		nilSessionUUID(snapshot.AgentUUID), nilStr(snapshot.UserID), snapshot.Updated,
-		key,
-	)
-	return err
-}
-
-func (s *PGSessionStore) LastUsedChannel(agentID string) (string, string) {
-	prefix := "agent:" + agentID + ":%"
-	var sessionKey string
-	err := s.db.QueryRow(
-		`SELECT session_key FROM sessions
-		 WHERE session_key LIKE $1
-		   AND session_key NOT LIKE $2
-		   AND session_key NOT LIKE $3
-		   AND session_key NOT LIKE $4
-		 ORDER BY updated_at DESC LIMIT 1`,
-		prefix,
-		"agent:"+agentID+":cron:%",
-		"agent:"+agentID+":subagent:%",
-		"agent:"+agentID+":heartbeat:%",
-	).Scan(&sessionKey)
-	if err != nil {
-		return "", ""
-	}
-	parts := strings.SplitN(sessionKey, ":", 5)
-	if len(parts) >= 5 {
-		return parts[2], parts[4]
-	}
-	return "", ""
-}
-
-// --- helpers ---
-
-func (s *PGSessionStore) getOrInit(key string) *store.SessionData {
-	if data, ok := s.cache[key]; ok {
-		return data
-	}
-
-	// Try loading from DB first to avoid overwriting existing messages
-	data := s.loadFromDB(key)
-	if data != nil {
-		s.cache[key] = data
-		return data
-	}
-
-	// Not in DB — create new
-	now := time.Now()
-	data = &store.SessionData{
-		Key:      key,
-		Messages: []providers.Message{},
-		Created:  now,
-		Updated:  now,
-	}
-	s.cache[key] = data
-
-	msgsJSON, _ := json.Marshal([]providers.Message{})
-	s.db.Exec(
-		`INSERT INTO sessions (id, session_key, messages, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (session_key) DO NOTHING`,
-		uuid.Must(uuid.NewV7()), key, msgsJSON, now, now,
-	)
-	return data
-}
-
-func (s *PGSessionStore) loadFromDB(key string) *store.SessionData {
-	var sessionKey string
-	var msgsJSON []byte
-	var summary, model, provider, channel, label, spawnedBy, userID *string
-	var agentID *uuid.UUID
-	var inputTokens, outputTokens int64
-	var compactionCount, memoryFlushCompactionCount, spawnDepth int
-	var memoryFlushAt int64
-	var createdAt, updatedAt time.Time
-
-	err := s.db.QueryRow(
-		`SELECT session_key, messages, summary, model, provider, channel,
-		 input_tokens, output_tokens, compaction_count,
-		 memory_flush_compaction_count, memory_flush_at,
-		 label, spawned_by, spawn_depth, agent_id, user_id,
-		 created_at, updated_at
-		 FROM sessions WHERE session_key = $1`, key,
-	).Scan(&sessionKey, &msgsJSON, &summary, &model, &provider, &channel,
-		&inputTokens, &outputTokens, &compactionCount,
-		&memoryFlushCompactionCount, &memoryFlushAt,
-		&label, &spawnedBy, &spawnDepth, &agentID, &userID,
-		&createdAt, &updatedAt)
-	if err != nil {
-		return nil
-	}
-
-	var msgs []providers.Message
-	json.Unmarshal(msgsJSON, &msgs)
-
-	return &store.SessionData{
-		Key:                        sessionKey,
-		Messages:                   msgs,
-		Summary:                    derefStr(summary),
-		Created:                    createdAt,
-		Updated:                    updatedAt,
-		AgentUUID:                  derefUUID(agentID),
-		UserID:                     derefStr(userID),
-		Model:                      derefStr(model),
-		Provider:                   derefStr(provider),
-		Channel:                    derefStr(channel),
-		InputTokens:                inputTokens,
-		OutputTokens:               outputTokens,
-		CompactionCount:            compactionCount,
-		MemoryFlushCompactionCount: memoryFlushCompactionCount,
-		MemoryFlushAt:              memoryFlushAt,
-		Label:                      derefStr(label),
-		SpawnedBy:                  derefStr(spawnedBy),
-		SpawnDepth:                 spawnDepth,
-	}
-}
-
-func nilSessionUUID(u uuid.UUID) *uuid.UUID {
-	if u == uuid.Nil {
-		return nil
-	}
-	return &u
 }

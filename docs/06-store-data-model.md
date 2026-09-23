@@ -1,40 +1,115 @@
 # 06 - Store Layer and Data Model
 
-The store layer abstracts all persistence behind Go interfaces, allowing the same core engine to run with file-based storage (standalone mode) or PostgreSQL (managed mode). Each store interface has independent implementations, and the system determines which backend to use based on configuration at startup.
+The store layer abstracts all persistence behind Go interfaces. Each store interface has a PostgreSQL implementation (standard edition) or SQLite implementation (Lite desktop edition). Implementations are wired at startup based on `//go:build` tags and edition configuration.
 
 ---
 
-## 1. Store Layer Routing
+## 1. Store Layer
 
 ```mermaid
 flowchart TD
-    START["Gateway Startup"] --> CHECK{"StoreConfig.IsManaged()?<br/>(DSN + mode = managed)"}
-    CHECK -->|Yes| PG["PostgreSQL Backend"]
-    CHECK -->|No| FILE["File Backend"]
+    START["Gateway Startup"] --> CHOOSE{"Edition<br/>& Build Tag"}
+    
+    CHOOSE -->|Standard<br/>(PostgreSQL)| PG["PostgreSQL Backend"]
+    CHOOSE -->|Lite<br/>(-tags sqliteonly)| SQLite["SQLite Backend"]
 
-    PG --> PG_STORES["PGSessionStore<br/>PGAgentStore<br/>PGProviderStore<br/>PGCronStore<br/>PGPairingStore<br/>PGSkillStore<br/>PGMemoryStore<br/>PGTracingStore<br/>PGMCPServerStore<br/>PGCustomToolStore"]
-
-    FILE --> FILE_STORES["FileSessionStore<br/>FileMemoryStore (SQLite + FTS5)<br/>FileCronStore<br/>FilePairingStore<br/>FileSkillStore<br/>AgentStore = nil<br/>ProviderStore = nil<br/>TracingStore = nil<br/>MCPServerStore = nil<br/>CustomToolStore = nil"]
+    PG --> PG_STORES["PGSessionStore<br/>PGMemoryStore<br/>PGCronStore<br/>PGPairingStore<br/>PGSkillStore<br/>PGAgentStore<br/>PGProviderStore<br/>PGTracingStore<br/>PGMCPServerStore<br/>PGCustomToolStore<br/>PGChannelInstanceStore<br/>PGConfigSecretsStore<br/>PGTeamStore<br/>PGBuiltinToolStore<br/>PGPendingMessageStore<br/>PGKnowledgeGraphStore<br/>PGContactStore<br/>PGActivityStore<br/>PGSnapshotStore<br/>PGSecureCLIStore<br/>PGAPIKeyStore"]
+    
+    SQLite --> SQLITE_STORES["SQLiteActivityStore<br/>SQLiteEpisodicStore<br/>SQLiteEvolutionMetrics<br/>SQLiteEvolutionSuggestions<br/>SQLiteKnowledgeGraph<br/>SQLiteVaultStore<br/>SQLiteAgentLinks<br/>SQLiteSubagentTasks<br/>SQLiteSecureCLIStore"]
 ```
 
 ---
 
 ## 2. Store Interface Map
 
-The `Stores` struct is the top-level container holding all storage backends. In standalone mode, managed-only stores are `nil`.
+The `Stores` struct is the top-level container holding all PostgreSQL-backed storage implementations.
 
-| Interface | Standalone Implementation | Managed Implementation | Mode |
-|-----------|--------------------------|------------------------|------|
-| SessionStore | `FileSessionStore` via `sessions.Manager` | `PGSessionStore` | Both |
-| MemoryStore | `FileMemoryStore` (SQLite + FTS5 + embeddings) | `PGMemoryStore` (tsvector + pgvector) | Both |
-| CronStore | `FileCronStore` | `PGCronStore` | Both |
-| PairingStore | `FilePairingStore` via `pairing.Service` | `PGPairingStore` | Both |
-| SkillStore | `FileSkillStore` via `skills.Loader` | `PGSkillStore` | Both |
-| AgentStore | `nil` | `PGAgentStore` | Managed only |
-| ProviderStore | `nil` | `PGProviderStore` | Managed only |
-| TracingStore | `nil` | `PGTracingStore` | Managed only |
-| MCPServerStore | `nil` | `PGMCPServerStore` | Managed only |
-| CustomToolStore | `nil` | `PGCustomToolStore` | Managed only |
+| Interface | Implementation | Purpose |
+|-----------|---|---------|
+| SessionStore | `PGSessionStore` | Conversation history with in-memory write-behind cache |
+| MemoryStore | `PGMemoryStore` | Memory documents, embedding, FTS, hybrid search (tsvector + pgvector) |
+| CronStore | `PGCronStore` | Scheduled job definitions and execution logs |
+| PairingStore | `PGPairingStore` | Browser pairing codes and paired device tracking |
+| SkillStore | `PGSkillStore` | SKILL.md definitions, BM25 search, agent/user grants |
+| AgentStore | `PGAgentStore` | Agent definitions, soft delete, RBAC sharing, access control |
+| ProviderStore | `PGProviderStore` | LLM provider configs, encrypted API keys, model listings |
+| TracingStore | `PGTracingStore` | LLM call traces, spans, observability aggregation |
+| MCPServerStore | `PGMCPServerStore` | MCP server configs, transport (stdio/sse), tool grants |
+| CustomToolStore | `PGCustomToolStore` | Dynamic tool definitions, shell command templates, agent/global scoping |
+| ChannelInstanceStore | `PGChannelInstanceStore` | Channel instance configs (Telegram account, Discord guild, etc.) |
+| ConfigSecretsStore | `PGConfigSecretsStore` | Encrypted configuration secrets (AES-256-GCM) |
+| TeamStore | `PGTeamStore` | Teams, tasks (atomic claim), members, messages, delegation history |
+| BuiltinToolStore | `PGBuiltinToolStore` | System tool metadata, enable/disable toggles, settings |
+| PendingMessageStore | `PGPendingMessageStore` | Offline group chat message queue, auto-compaction to summaries |
+| KnowledgeGraphStore | `PGKnowledgeGraphStore` | Entity-relationship graphs, traversal, inference extraction |
+| ContactStore | `PGContactStore` | Channel contacts (auto-collected), cross-channel deduplication, merge |
+| ActivityStore | `PGActivityStore` | Audit logs, action tracking, compliance |
+| SnapshotStore | `PGSnapshotStore` | Hourly usage snapshots, cost aggregation, time series queries |
+| UsageCapStore | `PGUsageCapStore` | OpenRouter pricing catalog, pricing overrides, cap policies, reservations, counters, events |
+| SecureCLIStore | `PGSecureCLIStore` | CLI binary configs with encrypted credential injection |
+| APIKeyStore | `PGAPIKeyStore` | Gateway API keys, scopes, expiration, revocation |
+| HookStore | `PGHookStore` | Lifecycle hook definitions (event, handler type, matcher, config), execution audit log |
+
+### SQLite Parity (Lite Edition)
+
+**New in v3:** SQLite backend supports 9 additional stores for Lite desktop edition (`-tags sqliteonly`). Schema v9 adds 4 new tables. Text search uses LIKE (no FTS5). Vector features omitted.
+
+| Interface | Implementation | PostgreSQL vs SQLite |
+|-----------|---|---|
+| ActivityStore | `SQLiteActivityStore` | ✓ Parity |
+| EpisodicStore | `SQLiteEpisodicStore` | LIKE search (no tsvector), no vector embedding |
+| EvolutionMetrics | `SQLiteEvolutionMetrics` | ✓ Parity (json_extract instead of JSONB operator) |
+| EvolutionSuggestions | `SQLiteEvolutionSuggestions` | ✓ Parity |
+| KnowledgeGraphStore | `SQLiteKnowledgeGraph` | LIKE search, Go-side dedup (Jaro-Winkler), no vector embedding, recursive CTE for traversal, depth cap 5 |
+| VaultStore | `SQLiteVaultStore` | LIKE search (no tsvector), no vector embedding |
+| AgentLinksStore | `SQLiteAgentLinks` | LIKE search, no vector |
+| SubagentTasksStore | `SQLiteSubagentTasks` | ✓ Parity (json_set for metadata merge) |
+| SecureCLIStore | `SQLiteSecureCLIStore` | ✓ Parity + AES-256-GCM encryption mandatory (GOCLAW_KEY env var required) |
+| HookStore | `SQLiteHookStore` | ✓ Parity (agent_hooks + hook_executions tables, same schema as PG) |
+
+---
+
+## Agent Model Fallback Storage
+
+Agent rows include `model_fallback`, stored as JSONB in PostgreSQL and TEXT JSON in SQLite. The config is per-agent and normalized before runtime use:
+
+- `enabled`: whether fallback is active.
+- `strategy`: currently `priority_order`.
+- `candidates`: ordered backup provider/model pairs. The primary agent provider/model is not stored in this list.
+- `max_attempts`: optional cap across primary plus fallback candidates.
+- `cooldown_enabled`: temporarily skips recently failing routes when enabled.
+
+Migration versions:
+
+- PostgreSQL: `000065_agent_model_fallback`.
+- SQLite: schema v33 to v34.
+
+---
+
+## Usage Cap Storage
+
+Usage cap enforcement is Standard/PostgreSQL-only in round one. The `UsageCapStore` is wired on the PostgreSQL store factory and left nil in SQLite/Lite builds.
+
+Tables:
+- `usage_pricing_catalog`: OpenRouter model catalog prices, raw upstream model payload, sync time.
+- `usage_pricing_overrides`: tenant/provider/model override prices for custom billing assumptions.
+- `usage_cap_policies`: cap definitions scoped by tenant, agent, provider, provider type, model, `window_key`, and `source`.
+- `usage_cap_counters`: current window used and reserved token/cost counters.
+- `usage_cap_reservations`: preflight reservations keyed by LLM call attempt.
+- `usage_cap_events`: allow/block/reconcile/skip audit events.
+
+Reservation updates are atomic: counters are updated only when `used + reserved + estimate` remains below configured token and cost ceilings.
+Reservation keys are idempotent per policy, so a retry using the same key does not double-increment reserved counters.
+Policy `agent_id` references must belong to the same tenant as the policy. Policy and pricing override `provider_id` references may belong to the same tenant or the master tenant for default provider fallback, but not another non-master tenant.
+Catalog and override price fields are nullable decimal strings with non-negative validation in the store layer and database checks.
+Pricing resolution checks exact override/catalog model IDs first, then provider-derived OpenRouter aliases for native unprefixed model IDs.
+
+Agent `budget_monthly_cents` values are bridged into `usage_cap_policies` with `source = 'agent_budget_monthly_cents'`, an agent scope, `window_key = 'month'`, and `max_cost_micros = budget_monthly_cents * 10000`. Updating or clearing the agent budget keeps that generated policy in sync; manual cap policies continue to use `source = 'manual'`.
+
+Migration versions:
+
+- PostgreSQL: `000070_usage_caps_pricing`, `000071_usage_cap_policies`, `000072_agent_budget_usage_cap_bridge`.
+- SQLite: no schema change; feature is not active in Lite.
 
 ---
 
@@ -52,7 +127,7 @@ flowchart TD
         CACHE --> GETSM["GetSummary()"]
     end
 
-    CACHE -->|"Save(key)"| DB[("PostgreSQL / JSON file")]
+    CACHE -->|"Save(key)"| DB[("PostgreSQL")]
     DB -->|"Cache miss via GetOrCreate"| CACHE
 ```
 
@@ -73,17 +148,23 @@ flowchart TD
 | Cron | `agent:{agentId}:cron:{jobId}:run:{runId}` | `agent:default:cron:reminder:run:abc123` |
 | Main | `agent:{agentId}:{mainKey}` | `agent:default:main` |
 
-### File-Based Persistence (Standalone)
+### Session Metadata - Compaction Tracking
 
-- Startup: `loadAll()` reads all `.json` files into memory
-- Save: temp file + rename (atomic write, prevents corruption on crash)
-- Filename: session key with `:` replaced by `_`, plus `.json` extension
+**New well-known metadata key** (Phase 5 follow-up): `last_compaction_at` (RFC3339 string)
+
+This timestamp is written to `sessions.metadata` JSONB after successful message compaction (context pruning). Both execution paths update it:
+- **V3 pipeline**: `PruneStage.CompactMessages()` after successful compaction
+- **V2 legacy**: `maybeSummarize()` goroutine after successful summarization
+
+Operators can read this via `GetSessionMetadata()` to understand when a session was last compacted. The web UI optionally displays this timestamp in a context-usage tooltip.
+
+Go constant export: `agent.SessionMetaKeyLastCompactionAt = "last_compaction_at"`
 
 ---
 
 ## 4. Agent Access Control
 
-In managed mode, agent access is checked via a 4-step pipeline.
+Agent access is checked via a 4-step pipeline.
 
 ```mermaid
 flowchart TD
@@ -164,14 +245,14 @@ flowchart TD
 
 When FTS returns no results (e.g., cross-language queries), a `likeSearch()` fallback runs ILIKE queries using up to 5 keywords (minimum 3 characters each), scoped to the agent's index.
 
-### Standalone vs Managed
+### Search Implementation
 
-| Aspect | Standalone | Managed |
-|--------|-----------|---------|
-| FTS engine | SQLite FTS5 | PostgreSQL tsvector |
-| Vector | Embedding cache | pgvector extension |
-| Search function | `plainto_tsquery('simple', ...)` | Same |
-| Distance operator | N/A | `<=>` (cosine) |
+| Aspect | Detail |
+|--------|--------|
+| FTS engine | PostgreSQL tsvector |
+| Vector | pgvector extension |
+| Search function | `plainto_tsquery('simple', ...)` |
+| Distance operator | `<=>` (cosine) |
 
 ---
 
@@ -190,8 +271,8 @@ Context files are stored in two tables and routed based on agent type.
 
 | Agent Type | Agent-Level Files | Per-User Files |
 |------------|-------------------|----------------|
-| `open` | Template fallback only | All 7 files (SOUL, IDENTITY, AGENTS, TOOLS, HEARTBEAT, BOOTSTRAP, USER) |
-| `predefined` | 6 files (SOUL, IDENTITY, AGENTS, TOOLS, HEARTBEAT, BOOTSTRAP) | Only USER.md |
+| `open` | Template fallback only | All files (SOUL, IDENTITY, AGENTS, TOOLS, BOOTSTRAP, USER) |
+| `predefined` | Agent-level files (SOUL, IDENTITY, AGENTS, TOOLS, BOOTSTRAP) | Only USER.md |
 
 The `ContextFileInterceptor` checks agent type from context and routes read/write operations accordingly. For open agents, per-user files take priority with agent-level as fallback.
 
@@ -246,7 +327,212 @@ Dynamic tool definitions stored in PostgreSQL. Each tool defines a shell command
 
 ---
 
-## 10. Database Schema
+## 10. Delegation History
+
+### Table: `delegation_history`
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | UUID v7 | Primary key |
+| `source_agent_id` | UUID | Delegating agent |
+| `target_agent_id` | UUID | Target agent |
+| `team_id` | UUID | Team context (nullable) |
+| `team_task_id` | UUID | Related team task (nullable) |
+| `user_id` | VARCHAR | User who triggered the delegation |
+| `task` | TEXT | Task description sent to target |
+| `mode` | VARCHAR(10) | `sync` or `async` |
+| `status` | VARCHAR(20) | `completed`, `failed`, `cancelled` |
+| `result` | TEXT | Target agent's response |
+| `error` | TEXT | Error message on failure |
+| `iterations` | INT | Number of LLM iterations |
+| `trace_id` | UUID | Linked trace for observability |
+| `duration_ms` | INT | Wall-clock duration |
+| `completed_at` | TIMESTAMPTZ | Completion timestamp |
+
+Every sync and async delegation is persisted here automatically via `SaveDelegationHistory()`. Results are truncated for WS transport (500 runes for list, 8000 runes for detail).
+
+---
+
+## 11. Team Store
+
+The team store manages collaborative multi-agent teams with a shared task board and peer-to-peer mailbox.
+
+### Tables
+
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `agent_teams` | Team definitions | `name`, `lead_agent_id` (FK → agents), `status`, `settings` (JSONB) |
+| `agent_team_members` | Team membership | PK `(team_id, agent_id)`, `role` (lead/member) |
+| `team_tasks` | Shared task board | `subject`, `status` (pending/in_progress/completed/blocked), `owner_agent_id`, `blocked_by` (UUID[]), `priority`, `result`, `tsv` (FTS) |
+| `team_messages` | Peer-to-peer mailbox | `from_agent_id`, `to_agent_id` (NULL = broadcast), `content`, `message_type` (chat/broadcast), `read` |
+
+### TeamStore Interface (22 methods)
+
+**Team CRUD**: `CreateTeam`, `GetTeam`, `DeleteTeam`, `ListTeams`
+
+**Members**: `AddMember`, `RemoveMember`, `ListMembers`, `GetTeamForAgent` (find team by agent)
+
+**Tasks**: `CreateTask`, `UpdateTask`, `ListTasks` (orderBy: priority/newest, statusFilter: active/completed/all), `GetTask`, `SearchTasks` (FTS on subject+description), `ClaimTask`, `CompleteTask`
+
+**Delegation History**: `SaveDelegationHistory`, `ListDelegationHistory` (with filter opts), `GetDelegationHistory`
+
+**Messages**: `SendMessage`, `GetUnread`, `MarkRead`
+
+### Atomic Task Claiming
+
+Two agents grabbing the same task is prevented at the database level:
+
+```sql
+UPDATE team_tasks
+SET status = 'in_progress', owner_agent_id = $1
+WHERE id = $2 AND status = 'pending' AND owner_agent_id IS NULL
+```
+
+One row updated = claimed. Zero rows = someone else got it. Row-level locking, no distributed mutex needed.
+
+### Task Dependencies
+
+Tasks can declare `blocked_by` (UUID array) pointing to prerequisite tasks. When a task is completed via `CompleteTask`, all dependent tasks whose blockers are now all completed are automatically unblocked (status transitions from `blocked` to `pending`).
+
+---
+
+## 12. Additional Store Interfaces
+
+### BuiltinToolStore
+
+System tool metadata storage. Built-in tools are seeded at startup with category, settings, and dependency metadata. Only `enabled` and `settings` are user-editable.
+
+| Method | Purpose |
+|--------|---------|
+| `List()` | Return all tool definitions |
+| `Get(name)` | Fetch tool by name |
+| `Update(name, updates)` | Modify settings or enabled status |
+| `Seed(tools)` | Populate tools at startup |
+| `ListEnabled()` | Return only enabled tools |
+| `GetSettings(name)` | Fetch settings JSON for a tool |
+
+### PendingMessageStore
+
+Offline message queue for group chats. Buffers messages when the bot is not actively listening, auto-compacts into summaries to prevent unbounded growth.
+
+| Method | Purpose |
+|--------|---------|
+| `AppendBatch(msgs)` | Insert multiple messages in one query |
+| `ListByKey(channelName, historyKey)` | Retrieve buffered messages for a group |
+| `DeleteByKey(channelName, historyKey)` | Clear messages after processing (archives first) |
+| `Compact(deleteIDs, summary)` | Atomically archive + delete old messages, insert summary |
+| `DeleteStale(olderThan)` | Prune messages older than duration (archives first) |
+| `ListArchivedByKey(channelName, historyKey, since, limit)` | Replay archived messages for a group |
+| `ListGroups()` | Return distinct channel+key groups with counts |
+| `CountAll()` | Total pending messages across all groups |
+| `ResolveGroupTitles(groups)` | Look up chat titles from session metadata |
+
+**`channel_pending_messages` is a buffer, not an archive.** Rows leave it on two
+paths: the bot being mentioned hands the buffer to the agent and clears the key,
+and compaction replaces old rows with an LLM summary. Both are deletes, and for
+group capture the buffer is the only place the raw text is stored — a mention or
+a compaction pass used to destroy days of messages that nothing had read yet.
+
+Every row is therefore copied into `channel_message_archive` inside the same
+transaction as the delete, tagged with `archive_reason` (`consumed`, `compacted`,
+`stale`). Archived rows keep their original `id`, so a replayed delete is a
+no-op. Reads go through `ListArchivedByKey`, which is tenant-scoped like every
+other store read. Anything that needs the full group history — digest pipelines,
+exports, audits — must read the archive, not the buffer.
+
+### KnowledgeGraphStore
+
+Entity-relationship graph storage for AI inference and knowledge extraction. Supports graph traversal, confidence pruning, and bulk ingestion.
+
+| Method | Purpose |
+|--------|---------|
+| `UpsertEntity(entity)` | Create or update entity node |
+| `GetEntity(agentID, userID, entityID)` | Fetch single entity |
+| `DeleteEntity(agentID, userID, entityID)` | Remove entity (cascades relations) |
+| `ListEntities(agentID, userID, opts)` | List with pagination and type filter |
+| `SearchEntities(agentID, userID, query, limit)` | Full-text search entities |
+| `UpsertRelation(relation)` | Create or update edge |
+| `DeleteRelation(agentID, userID, relationID)` | Remove edge |
+| `ListRelations(agentID, userID, entityID)` | Get edges connected to an entity |
+| `Traverse(agentID, userID, startEntityID, maxDepth)` | Breadth-first graph traversal |
+| `IngestExtraction(agentID, userID, entities, relations)` | Bulk insert from LLM extraction |
+| `PruneByConfidence(agentID, userID, minConfidence)` | Remove low-confidence nodes/edges |
+| `Stats(agentID, userID)` | Aggregate entity and relation counts |
+
+### ContactStore
+
+Auto-collected channel contact registry. Tracks users across platforms and supports cross-channel deduplication (merge contacts as same person).
+
+| Method | Purpose |
+|--------|---------|
+| `UpsertContact(...)` | Create or update contact; on conflict (channel_type, sender_id) updates metadata |
+| `ListContacts(opts)` | Search with pagination and filters (ILIKE on name/username/sender_id) |
+| `CountContacts(opts)` | Count matching contacts |
+| `GetContactsBySenderIDs(senderIDs)` | Batch lookup contacts by sender IDs |
+| `MergeContacts(contactIDs)` | Link multiple contacts as same person (set merged_id) |
+
+### ActivityStore
+
+Audit logging for compliance and troubleshooting. Logs all significant actions with actor, entity, and optional details.
+
+| Method | Purpose |
+|--------|---------|
+| `Log(entry)` | Record a single audit entry |
+| `List(opts)` | Retrieve audit logs with filters (actor_type, action, entity_type, etc.) |
+| `Count(opts)` | Count matching audit entries |
+
+### SnapshotStore
+
+Pre-computed usage snapshots (hourly aggregations) for analytics dashboards. Tracks token usage, cost, request counts, and tool utilization.
+
+| Method | Purpose |
+|--------|---------|
+| `UpsertSnapshots(snapshots)` | Insert or replace batch of hourly aggregations |
+| `GetTimeSeries(query)` | Fetch hourly or daily time series for charting |
+| `GetBreakdown(query)` | Aggregate by dimension (provider, model, channel, agent) |
+| `GetLatestBucket()` | Return most recent bucket_hour (worker resume point) |
+
+### SecureCLIStore
+
+CLI binary credential configuration with encrypted environment variable
+injection. Credentials are auto-injected into child processes without exposing
+them to command output.
+
+Credential rows can live at binary, agent, channel/context, or user scope.
+Runtime resolution prefers user overrides, then context credentials, then agent
+credentials, then binary defaults. The `secure_cli_agent_credentials` table
+stores one encrypted PAT/SSH/env payload per `(binary_id, agent_id, tenant_id)`.
+
+| Method | Purpose |
+|--------|---------|
+| `Create(binary)` | Register new CLI binary config |
+| `Get(id)` | Fetch config by ID |
+| `Update(id, updates)` | Modify settings (enable/disable, denyArgs, etc.) |
+| `Delete(id)` | Remove config |
+| `List()` | Return all configs |
+| `ListByAgent(agentID)` | Return configs for a specific agent |
+| `LookupByBinary(binaryName, agentID)` | Find best-matching config (agent-specific > global) |
+| `ListEnabled()` | Return enabled configs for TOOLS.md generation |
+| `ListAgentCredentials(binaryID)` | Return masked agent credential metadata |
+| `SetAgentCredentialsTyped(binaryID, agentID, env, type, hostScope)` | Store agent-scoped PAT/SSH/env payload |
+| `DeleteAgentCredentials(binaryID, agentID)` | Remove an agent-scoped credential |
+
+### APIKeyStore
+
+Gateway API key management. Keys are SHA-256 hashed at rest; validation compares hash to incoming key. Supports scopes, expiration, and revocation.
+
+| Method | Purpose |
+|--------|---------|
+| `Create(key)` | Insert new API key record |
+| `GetByHash(keyHash)` | Lookup active (non-revoked, non-expired) key by hash |
+| `List()` | Return all keys for admin display (hashes omitted) |
+| `Revoke(id)` | Mark key as revoked |
+| `Delete(id)` | Permanently remove key |
+| `TouchLastUsed(id)` | Update last_used_at timestamp |
+
+---
+
+## 14. Database Schema
 
 All tables use UUID v7 (time-ordered) as primary keys via `GenNewID()`.
 
@@ -261,6 +547,12 @@ flowchart TD
         AG --> ACF["agent_context_files"]
         AG --> UCF["user_context_files"]
         AG --> UAP["user_agent_profiles"]
+    end
+
+    subgraph Teams
+        AT["agent_teams"] --> ATM["agent_team_members"]
+        AT --> TT["team_tasks"]
+        AT --> TM["team_messages"]
     end
 
     subgraph Sessions
@@ -304,21 +596,36 @@ flowchart TD
 
 | Table | Purpose | Key Columns |
 |-------|---------|-------------|
-| `agents` | Agent definitions | `agent_key` (UNIQUE), `owner_id`, `agent_type` (open/predefined), `is_default`, soft delete via `deleted_at` |
+| `agents` | Agent definitions | `agent_key` (UNIQUE), `owner_id`, `agent_type` (open/predefined), `is_default`, `frontmatter`, `tsv`, `embedding`, soft delete via `deleted_at` |
 | `agent_shares` | Agent RBAC sharing | UNIQUE(agent_id, user_id), `role` (user/admin/operator) |
 | `agent_context_files` | Agent-level context | UNIQUE(agent_id, file_name) |
 | `user_context_files` | Per-user context | UNIQUE(agent_id, user_id, file_name) |
 | `user_agent_profiles` | User tracking | `first_seen_at`, `last_seen_at`, `workspace` |
+| `agent_teams` | Team definitions | `name`, `lead_agent_id`, `status`, `settings` (JSONB) |
+| `agent_team_members` | Team membership | PK(team_id, agent_id), `role` (lead/member) |
+| `team_tasks` | Shared task board | `subject`, `status`, `owner_agent_id`, `blocked_by` (UUID[]), `tsv` (FTS) |
+| `team_messages` | Peer-to-peer mailbox | `from_agent_id`, `to_agent_id`, `message_type`, `read` |
+| `delegation_history` | Persisted delegation records | `source_agent_id`, `target_agent_id`, `mode`, `status`, `result`, `trace_id` |
 | `sessions` | Conversation history | `session_key` (UNIQUE), `messages` (JSONB), `summary`, token counts |
 | `memory_documents` | Memory docs | UNIQUE(agent_id, COALESCE(user_id, ''), path) |
 | `memory_chunks` | Chunked + embedded text | `embedding` (VECTOR), `tsv` (TSVECTOR) |
 | `llm_providers` | Provider configuration | `api_key` (AES-256-GCM encrypted) |
-| `traces` | LLM call traces | `agent_id`, `user_id`, `status`, aggregated token counts |
+| `traces` | LLM call traces | `agent_id`, `user_id`, `status`, `parent_trace_id`, aggregated token counts |
 | `spans` | Individual operations | `span_type` (llm_call, tool_call, agent, embedding), `parent_span_id` |
 | `skills` | Skill definitions | Content, metadata, grants |
 | `cron_jobs` | Scheduled tasks | `schedule_kind` (at/every/cron), `payload` (JSONB) |
 | `mcp_servers` | MCP server configs | `transport`, `api_key` (encrypted), `tool_prefix` |
 | `custom_tools` | Dynamic tool definitions | `command` (template), `agent_id` (NULL = global), `env` (encrypted) |
+
+### Migrations
+
+| Migration | Purpose |
+|-----------|---------|
+| `000001_init_schema` | Core tables (agents, sessions, providers, memory, cron, pairing, skills, traces, MCP, custom tools) |
+| `000002_agent_links` | `agent_links` table + `frontmatter`, `tsv`, `embedding` on agents + `parent_trace_id` on traces |
+| `000003_agent_teams` | `agent_teams`, `agent_team_members`, `team_tasks`, `team_messages` + `team_id` on agent_links |
+| `000004_teams_v2` | FTS on `team_tasks` (tsv column) + `delegation_history` table |
+| `000005_phase4` | Additional team and delegation features |
 
 ### Required PostgreSQL Extensions
 
@@ -327,7 +634,7 @@ flowchart TD
 
 ---
 
-## 11. Context Propagation
+## 15. Context Propagation
 
 Metadata flows through `context.Context` instead of mutable state, ensuring thread safety across concurrent agent runs.
 
@@ -343,8 +650,9 @@ flowchart TD
 | Key | Type | Purpose |
 |-----|------|---------|
 | `goclaw_user_id` | string | External user ID (e.g., Telegram user ID) |
-| `goclaw_agent_id` | uuid.UUID | Agent UUID (managed mode) |
+| `goclaw_agent_id` | uuid.UUID | Agent UUID |
 | `goclaw_agent_type` | string | Agent type: `"open"` or `"predefined"` |
+| `goclaw_sender_id` | string | Original individual sender ID (in group chats, `user_id` is group-scoped but `sender_id` preserves the actual person) |
 
 ### Tool Context Keys
 
@@ -355,10 +663,11 @@ flowchart TD
 | `tool_peer_kind` | Peer type: `"direct"` or `"group"` |
 | `tool_sandbox_key` | Docker sandbox scope key |
 | `tool_async_cb` | Callback for async tool execution |
+| `tool_workspace` | Per-user workspace directory (injected by agent loop, read by filesystem/shell tools) |
 
 ---
 
-## 12. Key PostgreSQL Patterns
+## 16. Key PostgreSQL Patterns
 
 ### Database Driver
 
@@ -396,35 +705,186 @@ All "create or update" operations use `INSERT ... ON CONFLICT DO UPDATE`, ensuri
 
 ---
 
-## File Reference
+## 17. V3 Memory & Evolution System (New in v3)
 
-| File | Purpose |
-|------|---------|
-| `internal/store/stores.go` | `Stores` container struct (all 9 store interfaces) |
-| `internal/store/types.go` | `BaseModel`, `StoreConfig`, `GenNewID()` |
-| `internal/store/context.go` | Context propagation: `WithUserID`, `WithAgentID`, `WithAgentType` |
-| `internal/store/session_store.go` | `SessionStore` interface, `SessionData`, `SessionInfo` |
-| `internal/store/memory_store.go` | `MemoryStore` interface, `MemorySearchResult`, `EmbeddingProvider` |
-| `internal/store/skill_store.go` | `SkillStore` interface |
-| `internal/store/agent_store.go` | `AgentStore` interface |
-| `internal/store/provider_store.go` | `ProviderStore` interface |
-| `internal/store/tracing_store.go` | `TracingStore` interface, `TraceData`, `SpanData` |
-| `internal/store/mcp_store.go` | `MCPServerStore` interface, grant types, access request types |
-| `internal/store/pairing_store.go` | `PairingStore` interface |
-| `internal/store/cron_store.go` | `CronStore` interface |
-| `internal/store/custom_tool_store.go` | `CustomToolStore` interface |
-| `internal/store/pg/factory.go` | PG store factory: creates all PG store instances from a connection pool |
-| `internal/store/pg/sessions.go` | `PGSessionStore`: session cache, Save, GetOrCreate |
-| `internal/store/pg/agents.go` | `PGAgentStore`: CRUD, soft delete, access control |
-| `internal/store/pg/agents_context.go` | Agent and user context file operations |
-| `internal/store/pg/memory_docs.go` | `PGMemoryStore`: document CRUD, indexing, chunking |
-| `internal/store/pg/memory_search.go` | Hybrid search: FTS, vector, ILIKE fallback, merge |
-| `internal/store/pg/skills.go` | `PGSkillStore`: skill CRUD and grants |
-| `internal/store/pg/skills_grants.go` | Skill agent and user grants |
-| `internal/store/pg/mcp_servers.go` | `PGMCPServerStore`: server CRUD, grants, access requests |
-| `internal/store/pg/custom_tools.go` | `PGCustomToolStore`: custom tool CRUD with encrypted env |
-| `internal/store/pg/providers.go` | `PGProviderStore`: provider CRUD with encrypted keys |
-| `internal/store/pg/tracing.go` | `PGTracingStore`: traces and spans with batch insert |
-| `internal/store/pg/pool.go` | Connection pool management |
-| `internal/store/pg/helpers.go` | Nullable helpers, JSON helpers, `execMapUpdate()` |
-| `internal/store/validate.go` | Input validation utilities |
+GoClaw v3 introduces a 3-tier memory architecture with event-driven consolidation.
+
+### 3-Tier Memory Model
+
+```
+L0 (Working Memory)           L1 (Episodic Memory)        L2 (Semantic Memory)
+┌─────────────────────────┐  ┌──────────────────────┐     ┌──────────────────────┐
+│ Current conversation    │  │ Session summaries    │     │ Knowledge graph      │
+│ messages in session     │  │ w/ embeddings        │     │ entities & relations │
+│ High context window     │  │ Auto-injected via    │     │ Temporal validity    │
+└─────────────────────────┘  │ memory search tool   │     │ Long-term recall     │
+                             │ 90-day retention     │     └──────────────────────┘
+                             │ Query via hybrid     │
+                             │ search (FTS + vec)   │
+                             └──────────────────────┘
+```
+
+**L0 (Working Memory):** Current session messages stored in `sessions` table. Auto-compacted via summarization at context window threshold.
+
+**L1 (Episodic Memory):** Session summaries extracted after `run.completed` events. Stored in `episodic_summaries` with L0 abstracts (~50 tokens each) for fast auto-inject. Hybrid search returns top results as context for memory_search/memory_expand tools.
+
+**L2 (Semantic Memory):** Knowledge Graph with temporal validity windows (`valid_from`, `valid_until`). Supports long-term facts, relationships, and inference. Queried via kg_entities/kg_relations with current-only filters.
+
+### New Store Interfaces
+
+| Interface | Purpose | Key Methods |
+|-----------|---------|-------------|
+| `EpisodicStore` | Tier 1.5 memory CRUD + hybrid search | `Create`, `Search`, `ExistsBySourceID`, `GetBySourceID`, `ListUnpromoted`, `MarkPromoted` |
+| `EvolutionMetricsStore` | Stage 1: record metrics (retrieval, tool, feedback) | `RecordMetric`, `AggregateToolMetrics`, `AggregateRetrievalMetrics` |
+| `EvolutionSuggestionStore` | Stage 2: generate & track improvement suggestions | `CreateSuggestion`, `ListSuggestions`, `UpdateSuggestionStatus` |
+| `VaultStore` | Knowledge Vault: document registry + links | `UpsertDocument`, `Search`, `CreateLink`, `GetOutLinks`, `GetBacklinks` |
+| `AgentLinkStore` | Inter-agent delegation links (replaces v2 `agent_links` in teams context) | `CreateLink`, `CanDelegate`, `DelegateTargets`, `SearchDelegateTargets` |
+
+### New Tables
+
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `episodic_summaries` | Session conversation summaries | `agent_id`, `user_id`, `session_key`, `summary`, `l0_abstract`, `key_topics` (TEXT[]), `embedding` (vector), `source_id` (dedup), `expires_at`, `recall_count` (INT), `recall_score` (FLOAT), `last_recalled_at` (TIMESTAMPTZ) |
+| `agent_evolution_metrics` | Self-evolution performance data | `agent_id`, `session_key`, `metric_type` (retrieval/tool/feedback), `metric_key`, `value` (JSONB) |
+| `agent_evolution_suggestions` | Data-driven improvement suggestions | `agent_id`, `suggestion_type`, `suggestion`, `rationale`, `parameters` (JSONB), `status` (pending/approved/rejected/applied) |
+| `vault_documents` | Knowledge Vault document registry | `agent_id`, `scope` (personal/team/shared), `path`, `title`, `doc_type`, `content_hash`, `embedding` (vector), `metadata` (JSONB) |
+| `vault_links` | Wikilinks between vault documents | `from_doc_id`, `to_doc_id`, `link_type`, `context` (snippet) |
+| `vault_versions` | Document version history (prepared for v3.1) | `doc_id`, `version`, `content`, `changed_by`, `created_at` |
+| `kg_entities` | Extended with temporal columns | `valid_from` (TIMESTAMPTZ), `valid_until` (TIMESTAMPTZ) for temporal facts |
+| `kg_relations` | Extended with temporal columns | `valid_from` (TIMESTAMPTZ), `valid_until` (TIMESTAMPTZ) for temporal edges |
+| `channel_memory_extraction_runs` | Passive channel extraction run log | `tenant_id`, `channel_instance_id`, `history_key`, `trigger`, `status`, source range, counts, redaction metadata |
+| `channel_memory_extraction_items` | Review queue for passive channel memory candidates | `tenant_id`, `run_id`, `channel_instance_id`, `item_hash`, `item_type`, `summary`, `topics`, `entities`, `status`, approval/write timestamps |
+
+`ChannelMemoryExtractionStore` is implemented for PostgreSQL and SQLite. It is
+tenant-scoped, stores no raw message bodies, and uses deterministic hashes to
+deduplicate the same channel/history/type/summary candidate across repeated
+runs for the same channel instance.
+
+### 12 Promoted Agent Columns
+
+Migration 000037 moves 12 config fields from `agents.other_config` JSONB to dedicated columns:
+
+**Scalar columns:**
+- `emoji` (VARCHAR) — agent emoji/icon
+- `agent_description` (VARCHAR) — human-friendly description
+- `thinking_level` (VARCHAR) — extended thinking depth
+- `max_tokens` (INT) — context window limit
+- `self_evolve` (BOOLEAN) — enable self-evolution metrics
+- `skill_evolve` (BOOLEAN) — enable skill evolution
+- `skill_nudge_interval` (INT) — suggestion frequency (days)
+
+**JSONB columns (structures stay JSON-shaped):**
+- `reasoning_config` (JSONB) — reasoning model settings
+- `workspace_sharing` (JSONB) — workspace access config
+- `chatgpt_oauth_routing` (JSONB) — ChatGPT OAuth fallback rules
+- `shell_deny_groups` (JSONB) — shell command deny patterns
+- `kg_dedup_config` (JSONB) — KG deduplication thresholds
+
+---
+
+## 18. Progressive Memory Loading (L0/L1/L2)
+
+Three-stage memory loading strategy minimizes token cost while maximizing relevance.
+
+```mermaid
+flowchart TD
+    MSG["User message arrives"] --> INJECT["L0: AutoInjector"]
+    INJECT -->|"Not relevant"| SKIP["Skip injection"]
+    INJECT -->|"Relevant"| L0OUT["Inject L0 summaries<br/>to system prompt"]
+    L0OUT --> TOOL1["Tool available: memory_search"]
+    TOOL1 -->|"Agent uses tool"| L1["L1: Unified search<br/>BM25 + vector hybrid<br/>across episodic + KG"]
+    L1 --> L1RES["Return top K results"]
+    TOOL1 -->|"Agent needs details"| TOOL2["Tool: memory_expand"]
+    TOOL2 --> L2["L2: Deep retrieval<br/>Load full summary +<br/>linked KG edges"]
+    L2 --> L2RES["Return full context"]
+```
+
+### L0: Auto-Injection
+
+Runs in ContextStage (once per turn). Checks user message relevance against episodic summaries and KG. Returns formatted section (~200 tokens max) for system prompt. Disabled if agent has `auto_inject_enabled: false`.
+
+| Parameter | Default |
+|-----------|---------|
+| `MaxEntries` | 5 |
+| `MaxTokens` | 200 |
+| `Threshold` | 0.3 (relevance) |
+
+### L1: Unified Search
+
+Agent calls `memory_search(query)` tool. Hybrid search across:
+- **Episodic (L0 abstracts)** — fast (~50 token summaries) with FTS + vector
+- **Knowledge Graph** — current entities/relations (temporal `valid_until IS NULL`)
+
+Weights: FTS 0.3, vector 0.7. Returns top K results within score threshold.
+
+### L2: Memory Expansion
+
+Agent calls `memory_expand(episodic_id)` for deep retrieval. Returns full summary + linked KG edges. Used when agent needs comprehensive context from a specific episodic entry.
+
+---
+
+## 19. Consolidation Pipeline (Event-Driven)
+
+Event bus fires workers asynchronously to extract and build long-term memory.
+
+```mermaid
+flowchart TD
+    RUN["run.completed event"]
+    RUN --> EP["EpisodicWorker"]
+    EP -->|"Extract summary + L0"| ES["Create episodic_summary"]
+    ES -->|"episodic.created event"| SW["SemanticWorker"]
+    SW -->|"Extract entities/relations<br/>from summary"| KG["Create KG entities<br/>& relations"]
+    KG -->|"entity.upserted event"| DW["DedupWorker"]
+    DW -->|"Merge duplicates<br/>via embeddings"| DEDUP["Consolidate nodes"]
+    ES -->|"episodic.created event"| DREAM["DreamingWorker<br/>(10m debounce)"]
+    DREAM -->|"Batch synthesis"| SYNTH["LLM synthesis pass<br/>→ long-term memory"]
+```
+
+### Workers
+
+| Worker | Triggers | Responsibility |
+|--------|----------|-----------------|
+| **EpisodicWorker** | `run.completed` | Extract session summary via LLM or compaction summary. Generate L0 abstract. Store in `episodic_summaries`. Emit `episodic.created` |
+| **SemanticWorker** | `episodic.created` | Parse summary for entity mentions and relationships. Extract via regex/NER. Insert into KG tables (`kg_entities`, `kg_relations`). Emit `entity.upserted` |
+| **DedupWorker** | `entity.upserted` | Check for duplicate entities via embedding similarity. Merge duplicate nodes by redirecting relations. Update timestamps to reflect consolidation |
+| **DreamingWorker** | `episodic.created` (debounced 10m) | Batch collect unpromoted episodic summaries scored by usefulness (recall signal). Call LLM for synthesis/insight pass. Write results to long-term memory (update KG, write to vault, etc.) |
+
+### Dreaming Weighted Scoring (Phase 10, Migration 000045)
+
+The DreamingWorker prioritizes unpromoted episodic summaries by usefulness via a 4-component running-average score:
+
+**ComputeRecallScore formula** (14-day half-life):
+```
+score = 0.30 * frequency + 0.35 * relevance + 0.20 * recency + 0.15 * freshness
+```
+
+**Tracking columns** (added to `episodic_summaries`):
+- `recall_count INT DEFAULT 0` — Number of times this summary was returned in memory searches
+- `recall_score DOUBLE PRECISION DEFAULT 0` — Weighted average score (0 to 1)
+- `last_recalled_at TIMESTAMPTZ` — Timestamp of most recent search hit
+
+**Index for DreamingWorker**: `idx_episodic_recall_unpromoted` on `(agent_id, user_id, recall_score DESC) WHERE promoted_at IS NULL`. Enables efficient `ListUnpromotedScored()` queries to fetch highest-scoring summaries first.
+
+**Integration with memory_search tool**: After search results are returned to agent, a fire-and-forget task increments `recall_count`, updates `recall_score` via running average, and sets `last_recalled_at`. No blocking — search returns immediately.
+
+### Configuration
+
+| Parameter | Default |
+|-----------|---------|
+| `ConsolidationEnabled` | true |
+| `EpisodicTTLDays` | 90 |
+
+Workers subscribe on startup via `consolidation.Register()`.
+
+---
+
+## 18. File Reference
+
+| Module | Path | Purpose |
+|---|---|---|
+| Store interfaces | `internal/store/` | All 22+ store interfaces (`SessionStore`, `AgentStore`, `TeamStore`, etc.), `Stores` container, context propagation helpers, v3 stores (episodic, vault, evolution, agent links) |
+| PostgreSQL implementations | `internal/store/pg/` | PG factory, `PGSessionStore`, `PGAgentStore`, `PGTeamStore`, `PGMemoryStore`, and all other PG-backed implementations; connection pool; helpers |
+| SQLite implementations | `internal/store/sqlitestore/` | SQLite-backed stores for desktop/Lite edition |
+| Tool context keys | `internal/tools/context_keys.go` | Tool context keys including `WithToolWorkspace` |
+
+Use `grep` or your editor's symbol search for specific files.

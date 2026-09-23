@@ -1,0 +1,89 @@
+{
+  "title": "미션",
+  "description": "에이전트에게 목표와 인수 검사를 부여합니다. 성공 여부는 에이전트의 주장이 아니라 검사 결과로 판단합니다.",
+  "newMission": "새 미션",
+  "disabledTitle": "이 게이트웨이에서 미션이 비활성화되어 있습니다",
+  "disabledHint": "GOCLAW_MISSIONS=1(및 GOCLAW_MISSIONS_SOURCE_ROOT)을 설정하고 게이트웨이를 다시 시작하세요. 검증 명령은 호스트 실행기에서 실행됩니다.",
+  "emptyTitle": "아직 미션이 없습니다",
+  "emptyDescription": "계약으로 미션을 만들면 검증된 결과가 여기에 표시됩니다.",
+  "col": {
+    "status": "상태",
+    "title": "미션",
+    "agent": "에이전트",
+    "created": "생성",
+    "cost": "비용"
+  },
+  "costUnknown": "알 수 없음",
+  "status": {
+    "planned": "계획됨",
+    "preparing": "준비 중",
+    "running": "실행 중",
+    "verifying": "검증 중",
+    "succeeded": "성공",
+    "partial": "부분 완료",
+    "failed": "실패",
+    "blocked": "차단됨",
+    "cancelled": "취소됨"
+  },
+  "result": {
+    "pass": "통과",
+    "fail": "실패",
+    "error": "오류"
+  },
+  "create": {
+    "title": "새 미션",
+    "hint": "미션 계약(JSON)을 붙여넣거나 편집하세요. 경로는 게이트웨이의 미션 소스 루트 기준입니다.",
+    "contractLabel": "미션 계약 JSON",
+    "invalidJson": "유효하지 않은 JSON: {{error}}",
+    "created": "미션이 시작되었습니다",
+    "creating": "시작 중…",
+    "submit": "미션 시작"
+  },
+  "common": {
+    "cancel": "취소",
+    "back": "뒤로"
+  },
+  "detail": {
+    "back": "모든 미션",
+    "notFound": "미션을 찾을 수 없습니다",
+    "inProgress": "진행 중",
+    "cancel": "미션 취소",
+    "tokens": "토큰 (입력 / 출력)",
+    "cost": "비용",
+    "executor": "검증 실행기",
+    "finished": "완료",
+    "criteria": "인수 기준",
+    "criteriaPending": "에이전트가 끝난 후 검사가 실행됩니다.",
+    "criteriaNone": "평가된 검사가 없습니다.",
+    "changedFiles": "변경된 파일",
+    "noChanges": "파일 변경 없음.",
+    "diff": "Diff",
+    "diffTruncated": "Diff가 잘렸습니다 (256 KiB 제한).",
+    "summary": "에이전트 요약",
+    "summaryHint": "에이전트 자신의 설명이며 증거가 아닙니다. 위의 검사가 증거입니다.",
+    "events": "타임라인",
+    "confirmCancel": "이 미션을 취소할까요?",
+    "confirmCancelHint": "에이전트 실행이 중지되고 미션은 취소됨으로 표시됩니다.",
+    "cancelled": "미션이 취소되었습니다",
+    "provesChange": "변경 증명",
+    "baseline": "기준: {{status}}",
+    "expectedTest": "필수 테스트 {{name}}: {{status}}",
+    "attempt": "시도",
+    "usageIncomplete": "사용량을 보고하지 못하고 끝난 시도가 있어(예: 게이트웨이 재시작) 토큰과 비용 합계는 하한값입니다.",
+    "toolCalls": "도구 호출",
+    "toolCallsHint": "각 호출이 실행되기 전에 기록됩니다. 결과 없이 \"시작됨\"이면 결과가 확인되지 않은 것입니다.",
+    "noToolCalls": "기록된 도구 호출이 없습니다.",
+    "receiptAttempt": "#",
+    "receiptTool": "도구",
+    "receiptClass": "분류",
+    "receiptStatus": "결과",
+    "receiptDuration": "소요 시간"
+  },
+  "costAtLeast": "최소 {{value}}",
+  "receipt": {
+    "denied": "거부됨",
+    "started": "시작됨(결과 없음)",
+    "ok": "성공",
+    "error": "오류"
+  }
+}

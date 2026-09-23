@@ -54,6 +54,7 @@ export const Methods = {
   CHAT_HISTORY: "chat.history",
   CHAT_ABORT: "chat.abort",
   CHAT_INJECT: "chat.inject",
+  CHAT_SESSION_STATUS: "chat.session.status",
 
   // Agents management
   AGENTS_LIST: "agents.list",
@@ -69,6 +70,8 @@ export const Methods = {
   CONFIG_APPLY: "config.apply",
   CONFIG_PATCH: "config.patch",
   CONFIG_SCHEMA: "config.schema",
+  CONFIG_DEFAULTS: "config.defaults",
+  CHAT_BEHAVIOR_PREVIEW: "chat_behavior.preview",
 
   // Sessions
   SESSIONS_LIST: "sessions.list",
@@ -76,6 +79,7 @@ export const Methods = {
   SESSIONS_PATCH: "sessions.patch",
   SESSIONS_DELETE: "sessions.delete",
   SESSIONS_RESET: "sessions.reset",
+  RUN_TIMELINE_GET: "run.timeline.get",
 
   // Phase 2 - NEEDED
   SKILLS_LIST: "skills.list",
@@ -95,7 +99,7 @@ export const Methods = {
   CHANNELS_STATUS: "channels.status",
   CHANNELS_TOGGLE: "channels.toggle",
 
-  // Channel instances (managed mode)
+  // Channel instances
   CHANNEL_INSTANCES_LIST: "channels.instances.list",
   CHANNEL_INSTANCES_CREATE: "channels.instances.create",
   CHANNEL_INSTANCES_UPDATE: "channels.instances.update",
@@ -103,6 +107,7 @@ export const Methods = {
 
   PAIRING_REQUEST: "device.pair.request",
   PAIRING_APPROVE: "device.pair.approve",
+  PAIRING_DENY: "device.pair.deny",
   PAIRING_LIST: "device.pair.list",
   PAIRING_REVOKE: "device.pair.revoke",
 
@@ -115,6 +120,10 @@ export const Methods = {
   USAGE_GET: "usage.get",
   USAGE_SUMMARY: "usage.summary",
 
+  QUOTA_USAGE: "quota.usage",
+
+  LLM_COMPLETE: "llm.complete",
+
   SEND: "send",
 
   // Agent links (delegation)
@@ -123,20 +132,81 @@ export const Methods = {
   AGENTS_LINKS_UPDATE: "agents.links.update",
   AGENTS_LINKS_DELETE: "agents.links.delete",
 
-  // Agent teams (managed mode)
+  // Agent teams
   TEAMS_LIST: "teams.list",
   TEAMS_CREATE: "teams.create",
   TEAMS_GET: "teams.get",
   TEAMS_DELETE: "teams.delete",
   TEAMS_TASK_LIST: "teams.tasks.list",
+  TEAMS_TASK_GET: "teams.tasks.get",
+  TEAMS_TASK_GET_LIGHT: "teams.tasks.get-light",
+  TEAMS_TASK_APPROVE: "teams.tasks.approve",
+  TEAMS_TASK_REJECT: "teams.tasks.reject",
+  TEAMS_TASK_COMMENT: "teams.tasks.comment",
+  TEAMS_TASK_COMMENTS: "teams.tasks.comments",
+  TEAMS_TASK_EVENTS: "teams.tasks.events",
+  TEAMS_TASK_CREATE: "teams.tasks.create",
+  TEAMS_TASK_DELETE: "teams.tasks.delete",
+  TEAMS_TASK_DELETE_BULK: "teams.tasks.delete-bulk",
+  TEAMS_TASK_ASSIGN: "teams.tasks.assign",
+  TEAMS_TASK_CANCEL: "teams.tasks.cancel",
+  TEAMS_TASK_RETRY: "teams.tasks.retry",
+  TEAMS_TASK_ACTIVE_BY_SESSION: "teams.tasks.active-by-session",
+  TEAMS_MEMBERS_ADD: "teams.members.add",
+  TEAMS_MEMBERS_REMOVE: "teams.members.remove",
+  TEAMS_UPDATE: "teams.update",
+  TEAMS_KNOWN_USERS: "teams.known_users",
+  TEAMS_SCOPES: "teams.scopes",
+  TEAMS_WORKSPACE_LIST: "teams.workspace.list",
+  TEAMS_WORKSPACE_READ: "teams.workspace.read",
+  TEAMS_WORKSPACE_DELETE: "teams.workspace.delete",
+  TEAMS_EVENTS_LIST: "teams.events.list",
 
-  // Delegation history (managed mode)
-  DELEGATIONS_LIST: "delegations.list",
-  DELEGATIONS_GET: "delegations.get",
+  // Heartbeat
+  HEARTBEAT_GET: "heartbeat.get",
+  HEARTBEAT_SET: "heartbeat.set",
+  HEARTBEAT_TOGGLE: "heartbeat.toggle",
+  HEARTBEAT_TEST: "heartbeat.test",
+  HEARTBEAT_LOGS: "heartbeat.logs",
+  HEARTBEAT_CHECKLIST_GET: "heartbeat.checklist.get",
+  HEARTBEAT_CHECKLIST_SET: "heartbeat.checklist.set",
+  HEARTBEAT_TARGETS: "heartbeat.targets",
+
+  // Config permissions
+  CONFIG_PERMISSIONS_LIST: "config.permissions.list",
+  CONFIG_PERMISSIONS_CHECK: "config.permissions.check",
+  CONFIG_PERMISSIONS_GRANT: "config.permissions.grant",
+  CONFIG_PERMISSIONS_REVOKE: "config.permissions.revoke",
+
+  // Tenants (multi-tenant)
+  TENANTS_MINE: "tenants.mine",
+  TENANTS_LIST: "tenants.list",
+  TENANTS_GET: "tenants.get",
+  TENANTS_CREATE: "tenants.create",
+  TENANTS_UPDATE: "tenants.update",
+  TENANTS_USERS_LIST: "tenants.users.list",
+  TENANTS_USERS_ADD: "tenants.users.add",
+  TENANTS_USERS_REMOVE: "tenants.users.remove",
+
+  // Workstations (Standard edition only)
+  WORKSTATIONS_LIST: "workstations.list",
+  WORKSTATIONS_GET: "workstations.get",
+  WORKSTATIONS_CREATE: "workstations.create",
+  WORKSTATIONS_UPDATE: "workstations.update",
+  WORKSTATIONS_DELETE: "workstations.delete",
+  WORKSTATIONS_TEST: "workstations.test",
+  WORKSTATIONS_LINK_AGENT: "workstations.link_agent",
+  WORKSTATIONS_UNLINK_AGENT: "workstations.unlink_agent",
+  // Phase 6: permissions
+  WORKSTATIONS_PERMS_LIST: "workstations.permissions.list",
+  WORKSTATIONS_PERMS_ADD: "workstations.permissions.add",
+  WORKSTATIONS_PERMS_REMOVE: "workstations.permissions.remove",
+  WORKSTATIONS_PERMS_TOGGLE: "workstations.permissions.toggle",
+  // Phase 7: activity audit log
+  WORKSTATIONS_LIST_ACTIVITY: "workstations.activity.list",
 
   // Phase 3+ - NICE TO HAVE
   LOGS_TAIL: "logs.tail",
-  HEARTBEAT: "heartbeat",
 } as const;
 
 // --- Event names (from pkg/protocol/events.go) ---
@@ -157,18 +227,89 @@ export const Events = {
   DEVICE_PAIR_RESOLVED: "device.pair.resolved",
   VOICEWAKE_CHANGED: "voicewake.changed",
   CONNECT_CHALLENGE: "connect.challenge",
-  HEARTBEAT: "heartbeat",
   TALK_MODE: "talk.mode",
-  HANDOFF: "handoff",
+
+  // Team tasks
+  TEAM_TASK_CREATED: "team.task.created",
+  TEAM_TASK_CLAIMED: "team.task.claimed",
+  TEAM_TASK_COMPLETED: "team.task.completed",
+  TEAM_TASK_CANCELLED: "team.task.cancelled",
+  TEAM_TASK_FAILED: "team.task.failed",
+  TEAM_TASK_REVIEWED: "team.task.reviewed",
+  TEAM_TASK_APPROVED: "team.task.approved",
+  TEAM_TASK_REJECTED: "team.task.rejected",
+  TEAM_TASK_PROGRESS: "team.task.progress",
+  TEAM_TASK_COMMENTED: "team.task.commented",
+  TEAM_TASK_ASSIGNED: "team.task.assigned",
+  TEAM_TASK_DISPATCHED: "team.task.dispatched",
+  TEAM_TASK_DELETED: "team.task.deleted",
+  TEAM_TASK_ATTACHMENT_ADDED: "team.task.attachment_added",
+
+  // Team leader processing (bridges gap between last task.completed and announce run.started)
+  TEAM_LEADER_PROCESSING: "team.leader.processing",
+
+  // Team messages
+  TEAM_MESSAGE_SENT: "team.message.sent",
+
+  // Team CRUD
+  TEAM_CREATED: "team.created",
+  TEAM_UPDATED: "team.updated",
+  TEAM_DELETED: "team.deleted",
+  TEAM_MEMBER_ADDED: "team.member.added",
+  TEAM_MEMBER_REMOVED: "team.member.removed",
+
+  // Workspace
+  WORKSPACE_FILE_CHANGED: "workspace.file.changed",
+
+  // Agent links
+  AGENT_LINK_CREATED: "agent_link.created",
+  AGENT_LINK_UPDATED: "agent_link.updated",
+  AGENT_LINK_DELETED: "agent_link.deleted",
+
+  // Session lifecycle
+  SESSION_UPDATED: "session.updated",
+
+  // Trace lifecycle
+  TRACE_UPDATED: "trace.updated",
+  // Immediate status change (not flush-buffered; fired on every status write).
+  TRACE_STATUS: "trace.status",
+
+  // Skill dependency check (realtime progress during startup/rescan)
+  SKILL_DEPS_CHECKED: "skill.deps.checked",
+  SKILL_DEPS_COMPLETE: "skill.deps.complete",
+
+  // Skill dependency install (triggered by POST /v1/skills/install-deps)
+  SKILL_DEPS_INSTALLING: "skill.deps.installing",
+  SKILL_DEPS_INSTALLED: "skill.deps.installed",
+
+  HEARTBEAT: "heartbeat",
 } as const;
+
+/** All event names relevant to team debug view */
+export const TEAM_RELATED_EVENTS: Set<string> = new Set([
+  Events.TEAM_TASK_CREATED, Events.TEAM_TASK_CLAIMED,
+  Events.TEAM_TASK_COMPLETED, Events.TEAM_TASK_CANCELLED,
+  Events.TEAM_TASK_REVIEWED, Events.TEAM_TASK_APPROVED,
+  Events.TEAM_TASK_REJECTED, Events.TEAM_TASK_PROGRESS,
+  Events.TEAM_TASK_COMMENTED, Events.TEAM_TASK_ASSIGNED, Events.TEAM_TASK_DISPATCHED, Events.TEAM_TASK_DELETED, Events.TEAM_TASK_ATTACHMENT_ADDED,
+  Events.TEAM_MESSAGE_SENT,
+  Events.TEAM_CREATED, Events.TEAM_UPDATED, Events.TEAM_DELETED,
+  Events.TEAM_MEMBER_ADDED, Events.TEAM_MEMBER_REMOVED,
+  Events.AGENT_LINK_CREATED, Events.AGENT_LINK_UPDATED,
+  Events.AGENT_LINK_DELETED,
+  Events.AGENT,
+  Events.WORKSPACE_FILE_CHANGED,
+]);
 
 // Agent event subtypes (in payload.type)
 export const AgentEventTypes = {
   RUN_STARTED: "run.started",
   RUN_COMPLETED: "run.completed",
   RUN_FAILED: "run.failed",
+  RUN_CANCELLED: "run.cancelled",
   TOOL_CALL: "tool.call",
   TOOL_RESULT: "tool.result",
+  BLOCK_REPLY: "block.reply",
 } as const;
 
 // Chat event subtypes (in payload.type)

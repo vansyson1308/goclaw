@@ -1,0 +1,94 @@
+//go:build sqlite || sqliteonly
+
+package sqlitestore
+
+import (
+	"fmt"
+	"log/slog"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+)
+
+// NewSQLiteStores creates all stores backed by SQLite.
+// Mirrors pg.NewPGStores() — returns the same *store.Stores struct.
+func NewSQLiteStores(cfg store.StoreConfig) (*store.Stores, error) {
+	db, err := OpenDB(cfg.SQLitePath)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+
+	// Apply schema (create tables on first run, migrate on upgrade).
+	if err := EnsureSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ensure schema: %w", err)
+	}
+
+	initSqlx(db)
+
+	slog.Info("sqlite stores initialized", "path", cfg.SQLitePath)
+
+	// F15: SecureCLI requires encryption key — skip if empty.
+	var secureCLI store.SecureCLIStore
+	if cfg.EncryptionKey != "" {
+		secureCLI = NewSQLiteSecureCLIStore(db, cfg.EncryptionKey)
+	} else {
+		slog.Warn("securecli: encryption key empty, store disabled")
+	}
+	subagentTasks := NewSQLiteSubagentTaskStore(db)
+
+	sqliteStores := &store.Stores{
+		DB:                     db,
+		Sessions:               NewSQLiteSessionStore(db),
+		Agents:                 NewSQLiteAgentStore(db),
+		Providers:              NewSQLiteProviderStore(db, cfg.EncryptionKey),
+		Tracing:                NewSQLiteTracingStore(db),
+		RunTimeline:            NewSQLiteRunTimelineStore(db),
+		ConfigSecrets:          NewSQLiteConfigSecretsStore(db, cfg.EncryptionKey),
+		BuiltinTools:           NewSQLiteBuiltinToolStore(db),
+		Heartbeats:             NewSQLiteHeartbeatStore(db),
+		Tenants:                NewSQLiteTenantStore(db),
+		BuiltinToolTenantCfgs:  NewSQLiteBuiltinToolTenantConfigStore(db),
+		SkillTenantCfgs:        NewSQLiteSkillTenantConfigStore(db),
+		SkillEvolution:         NewSQLiteSkillEvolutionStore(db),
+		SystemConfigs:          NewSQLiteSystemConfigStore(db),
+		Snapshots:              NewSQLiteSnapshotStore(db),
+		UsageEvents:            NewSQLiteUsageEventStore(db),
+		Cron:                   NewSQLiteCronStore(db),
+		ChannelInstances:       NewSQLiteChannelInstanceStore(db, cfg.EncryptionKey),
+		Pairing:                NewSQLitePairingStore(db),
+		PendingMessages:        NewSQLitePendingMessageStore(db),
+		ChannelMemory:          NewSQLiteChannelMemoryExtractionStore(db),
+		Contacts:               NewSQLiteContactStore(db),
+		Teams:                  NewSQLiteTeamStore(db),
+		Skills:                 NewSQLiteSkillStore(db, cfg.SkillsStorageDir),
+		MCP:                    NewSQLiteMCPServerStore(db, cfg.EncryptionKey),
+		MCPOAuthTokens:         NewSQLiteMCPOAuthTokenStore(db, cfg.EncryptionKey),
+		Activity:               NewSQLiteActivityStore(db),
+		APIKeys:                NewSQLiteAPIKeyStore(db),
+		ConfigPermissions:      NewSQLiteConfigPermissionStore(db),
+		BrowserCookies:         NewSQLiteBrowserCookieStore(db, cfg.EncryptionKey),
+		Memory:                 NewSQLiteMemoryStore(db),
+		SubagentTasks:          subagentTasks,
+		SubagentTaskRecovery:   subagentTasks,
+		AgentLinks:             NewSQLiteAgentLinkStore(db),
+		SecureCLI:              secureCLI,
+		SecureCLIGrants:        NewSQLiteSecureCLIAgentGrantStore(db, cfg.EncryptionKey),
+		Episodic:               NewSQLiteEpisodicStore(db),
+		EvolutionMetrics:       NewSQLiteEvolutionMetricsStore(db),
+		EvolutionSuggestions:   NewSQLiteEvolutionSuggestionStore(db),
+		Missions:               NewSQLiteMissionStore(db),
+		KnowledgeGraph:         NewSQLiteKnowledgeGraphStore(db),
+		Vault:                  NewSQLiteVaultStore(db),
+		BitrixPortals:          NewSQLiteBitrixPortalStore(db, cfg.EncryptionKey),
+		Hooks:                  NewSQLiteHookStore(db),
+		Webhooks:               NewSQLiteWebhookStore(db),
+		WebhookCalls:           NewSQLiteWebhookCallStore(db),
+		Workstations:           NewSQLiteWorkstationStore(db, cfg.EncryptionKey),
+		WorkstationLinks:       NewSQLiteAgentWorkstationLinkStore(db),
+		WorkstationPermissions: NewSQLiteWorkstationPermissionStore(db),
+		WorkstationActivity:    NewSQLiteWorkstationActivityStore(db),
+	}
+	// Wire permStore into WorkstationStore so Create seeds allowlist atomically (H5 fix).
+	sqliteStores.Workstations.(*SQLiteWorkstationStore).SetPermStore(sqliteStores.WorkstationPermissions)
+	return sqliteStores, nil
+}

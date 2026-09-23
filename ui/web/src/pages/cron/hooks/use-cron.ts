@@ -1,6 +1,11 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import i18next from "i18next";
 import { useWs } from "@/hooks/use-ws";
+import { useAuthStore } from "@/stores/use-auth-store";
 import { Methods } from "@/api/protocol";
+import { queryKeys } from "@/lib/query-keys";
+import { toast } from "@/stores/use-toast-store";
 
 export interface CronSchedule {
   kind: "at" | "every" | "cron";
@@ -10,12 +15,35 @@ export interface CronSchedule {
   tz?: string;
 }
 
+export interface CronCommandSpec {
+  argv?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  input?: string;
+  timeoutSeconds?: number;
+  noOutputTimeoutSeconds?: number;
+  outputMaxBytes?: number;
+}
+
 export interface CronPayload {
   kind: string;
   message: string;
-  deliver: boolean;
-  channel: string;
-  to: string;
+  command?: CronCommandSpec;
+}
+
+export interface CronJobPatch {
+  name?: string;
+  agentId?: string;
+  enabled?: boolean;
+  schedule?: CronSchedule;
+  message?: string;
+  command?: CronCommandSpec;
+  deliver?: boolean;
+  deliverChannel?: string;
+  deliverTo?: string;
+  deleteAfterRun?: boolean;
+  wakeHeartbeat?: boolean;
+  stateless?: boolean;
 }
 
 export interface CronJob {
@@ -25,6 +53,11 @@ export interface CronJob {
   enabled: boolean;
   schedule: CronSchedule;
   payload: CronPayload;
+  deliver?: boolean;
+  deliverChannel?: string;
+  deliverTo?: string;
+  wakeHeartbeat?: boolean;
+  stateless?: boolean;
   createdAtMs: number;
   updatedAtMs: number;
   deleteAfterRun?: boolean;
@@ -42,82 +75,126 @@ export interface CronRunLogEntry {
   status?: string;
   error?: string;
   summary?: string;
+  durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export function useCron() {
   const ws = useWs();
-  const [jobs, setJobs] = useState<CronJob[]>([]);
-  const [loading, setLoading] = useState(false);
+  const connected = useAuthStore((s) => s.connected);
+  const queryClient = useQueryClient();
 
-  const load = useCallback(async () => {
-    if (!ws.isConnected) return;
-    setLoading(true);
-    try {
+  const { data: jobs = [], isPending: loading, isFetching: refreshing } = useQuery({
+    queryKey: queryKeys.cron.all,
+    queryFn: async () => {
       const res = await ws.call<{ jobs: CronJob[] }>(Methods.CRON_LIST, {
         includeDisabled: true,
       });
-      setJobs(res.jobs ?? []);
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
-  }, [ws]);
+      return res.jobs ?? [];
+    },
+    staleTime: 60_000,
+    enabled: connected,
+  });
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  const invalidate = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: queryKeys.cron.all }),
+    [queryClient],
+  );
 
   const createJob = useCallback(
     async (params: {
       name: string;
       schedule: CronSchedule;
-      message: string;
+      message?: string;
+      command?: CronCommandSpec;
       agentId?: string;
       deliver?: boolean;
       channel?: string;
       to?: string;
     }) => {
-      await ws.call(Methods.CRON_CREATE, params);
-      load();
+      try {
+        await ws.call(Methods.CRON_CREATE, params);
+        await invalidate();
+        toast.success(i18next.t("cron:toast.created"), i18next.t("cron:toast.createdDesc", { name: params.name }));
+      } catch (err) {
+        toast.error(i18next.t("cron:toast.failedCreate"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
-    [ws, load],
+    [ws, invalidate],
   );
 
   const toggleJob = useCallback(
     async (jobId: string, enabled: boolean) => {
-      await ws.call(Methods.CRON_TOGGLE, { jobId, enabled });
-      load();
+      try {
+        queryClient.setQueryData<CronJob[]>(queryKeys.cron.all, (old) =>
+          old?.map((j) => (j.id === jobId ? { ...j, enabled } : j)),
+        );
+        await ws.call(Methods.CRON_TOGGLE, { jobId, enabled });
+        await invalidate();
+        toast.success(enabled ? i18next.t("cron:toast.enabled") : i18next.t("cron:toast.disabled"));
+      } catch (err) {
+        toast.error(i18next.t("cron:toast.failedToggle"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
-    [ws, load],
+    [ws, invalidate],
   );
 
   const deleteJob = useCallback(
     async (jobId: string) => {
-      await ws.call(Methods.CRON_DELETE, { jobId });
-      load();
+      try {
+        await ws.call(Methods.CRON_DELETE, { jobId });
+        await invalidate();
+        toast.success(i18next.t("cron:toast.deleted"));
+      } catch (err) {
+        toast.error(i18next.t("cron:toast.failedDelete"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
-    [ws, load],
+    [ws, invalidate],
   );
 
   const runJob = useCallback(
     async (jobId: string) => {
-      await ws.call(Methods.CRON_RUN, { jobId, mode: "force" });
+      try {
+        await ws.call(Methods.CRON_RUN, { jobId, mode: "force" });
+        toast.success(i18next.t("cron:toast.triggered"));
+      } catch (err) {
+        toast.error(i18next.t("cron:toast.failedRun"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
     [ws],
   );
 
   const getRunLog = useCallback(
-    async (jobId: string, limit = 20): Promise<CronRunLogEntry[]> => {
-      if (!ws.isConnected) return [];
-      const res = await ws.call<{ entries: CronRunLogEntry[] }>(Methods.CRON_RUNS, {
+    async (jobId: string, limit = 20, offset = 0): Promise<{ entries: CronRunLogEntry[]; total: number }> => {
+      if (!ws.isConnected) return { entries: [], total: 0 };
+      const res = await ws.call<{ entries: CronRunLogEntry[]; total: number }>(Methods.CRON_RUNS, {
         jobId,
         limit,
+        offset,
       });
-      return res.entries ?? [];
+      return { entries: res.entries ?? [], total: res.total ?? 0 };
     },
     [ws],
   );
 
-  return { jobs, loading, refresh: load, createJob, toggleJob, deleteJob, runJob, getRunLog };
+  const updateJob = useCallback(
+    async (jobId: string, params: CronJobPatch) => {
+      try {
+        await ws.call(Methods.CRON_UPDATE, { jobId, patch: params });
+        await invalidate();
+        toast.success(i18next.t("cron:toast.updated"));
+      } catch (err) {
+        toast.error(i18next.t("cron:toast.failedUpdate"), err instanceof Error ? err.message : "");
+        throw err;
+      }
+    },
+    [ws, invalidate],
+  );
+
+  return { jobs, loading, refreshing, refresh: invalidate, createJob, toggleJob, deleteJob, runJob, getRunLog, updateJob };
 }

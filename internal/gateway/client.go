@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
-	"sync"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,21 +23,53 @@ type Client struct {
 	role          permissions.Role
 	userID        string // external user ID (TEXT, free-form), set during connect
 	send          chan []byte
-	mu            sync.Mutex
+
+	connectedAt time.Time // when the client connected
+	remoteAddr  string    // peer IP (extracted from proxy headers or RemoteAddr)
+
+	locale string              // user's preferred locale (e.g. "en", "vi", "zh")
+	scopes []permissions.Scope // API key scopes (empty = role-based auth, no scope restriction)
 
 	// Browser pairing state
 	pairingCode    string // 8-char code if pending approval
 	pairingPending bool   // true while waiting for admin approval
+	pairedSenderID string // senderID used for browser pairing auth (for revocation lookup)
+	pairedChannel  string // channel used for pairing auth (e.g., "browser")
+
+	// Team access cache for event filtering (lazily populated).
+	teamIDs map[string]bool
+
+	tenantID   uuid.UUID // resolved tenant; always concrete after connect
+	tenantName string    // resolved tenant display name (set during connect)
+	tenantSlug string    // resolved tenant URL slug (set during connect)
+
+	// upgradeURL is the public-facing URL derived from the HTTP upgrade
+	// request that started this WS connection. Captured pre-auth but only
+	// trusted (i.e. propagated into server-wide state) AFTER the client
+	// authenticates — see MethodRouter.handleConnect. Empty when upgrade
+	// request lacked Host headers.
+	upgradeURL string
 }
 
-func NewClient(conn *websocket.Conn, server *Server) *Client {
+func NewClient(conn *websocket.Conn, server *Server, remoteIP string) *Client {
 	return &Client{
-		id:     uuid.NewString(),
-		conn:   conn,
-		server: server,
-		send:   make(chan []byte, 256),
+		id:          uuid.NewString(),
+		conn:        conn,
+		server:      server,
+		send:        make(chan []byte, 256),
+		connectedAt: time.Now(),
+		remoteAddr:  remoteIP,
 	}
 }
+
+// setUpgradeURL records the public URL derived from the HTTP upgrade request.
+// Called once during handleWebSocket before Run(); never trust this value
+// before client.authenticated == true.
+func (c *Client) setUpgradeURL(url string) { c.upgradeURL = url }
+
+// UpgradeURL returns the public URL the client used to reach the gateway.
+// Only meaningful after authentication.
+func (c *Client) UpgradeURL() string { return c.upgradeURL }
 
 // Run starts the read and write pumps for this client.
 func (c *Client) Run(ctx context.Context) {
@@ -144,6 +176,11 @@ func (c *Client) SendResponse(resp *protocol.ResponseFrame) {
 		slog.Error("marshal response failed", "error", err)
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("client gone, dropping response", "client", c.id)
+		}
+	}()
 	select {
 	case c.send <- data:
 	default:
@@ -158,6 +195,11 @@ func (c *Client) SendEvent(event protocol.EventFrame) {
 		slog.Error("marshal event failed", "error", err)
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("client gone, dropping event", "client", c.id)
+		}
+	}()
 	select {
 	case c.send <- data:
 	default:
@@ -177,6 +219,47 @@ func (c *Client) Role() permissions.Role { return c.role }
 
 // UserID returns the external user ID set during connect.
 func (c *Client) UserID() string { return c.userID }
+
+// ConnectedAt returns when the client connected.
+func (c *Client) ConnectedAt() time.Time { return c.connectedAt }
+
+// RemoteAddr returns the peer IP:port.
+func (c *Client) RemoteAddr() string { return c.remoteAddr }
+
+// TenantID returns the resolved tenant UUID (uuid.Nil means cross-tenant).
+func (c *Client) TenantID() uuid.UUID { return c.tenantID }
+
+// TenantSlug returns the resolved tenant URL slug (set during connect).
+func (c *Client) TenantSlug() string { return c.tenantSlug }
+
+// IsOwner returns true if the client has the owner role (tenant management + full access).
+func (c *Client) IsOwner() bool { return c.role == permissions.RoleOwner }
+
+// HasScope reports whether the client has the given scope.
+func (c *Client) HasScope(scope permissions.Scope) bool {
+	return slices.Contains(c.scopes, scope)
+}
+
+// hasTeamAccess checks if the client has access to a team (for event filtering).
+// Returns true for admin role. For others, checks the lazily-populated teamIDs cache.
+// TODO: populate teamIDs from team_user_grants on connect or first team event.
+func (c *Client) hasTeamAccess(teamID string) bool {
+	if permissions.HasMinRole(c.role, permissions.RoleAdmin) {
+		return true
+	}
+	if c.teamIDs == nil {
+		return false
+	}
+	return c.teamIDs[teamID]
+}
+
+// SetTeamAccess sets the team access cache for this client.
+func (c *Client) SetTeamAccess(teamIDs []string) {
+	c.teamIDs = make(map[string]bool, len(teamIDs))
+	for _, id := range teamIDs {
+		c.teamIDs[id] = true
+	}
+}
 
 // Close shuts down the client connection.
 func (c *Client) Close() {

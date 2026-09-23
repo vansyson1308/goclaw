@@ -1,0 +1,39 @@
+{
+  "model": "scripted-research",
+  "steps": [
+    {
+      "tool_calls": [
+        {
+          "name": "list_files",
+          "arguments": {
+            "path": "docs"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "name": "read_file",
+          "arguments": {
+            "path": "docs/history.md"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "name": "write_file",
+          "arguments": {
+            "path": "ANSWER.md",
+            "content": "Zephyr was retired in 2019 and replaced by the Aurora bus (docs/history.md).\n"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Zephyr was retired in 2019; the answer is in ANSWER.md."
+    }
+  ]
+}

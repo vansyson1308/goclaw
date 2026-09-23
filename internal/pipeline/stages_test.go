@@ -1,0 +1,3683 @@
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/hooks"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/workspace"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
+)
+
+// --- shared test helpers ---
+
+func minimalInput() *RunInput {
+	return &RunInput{
+		SessionKey: "sess-1",
+		RunID:      "run-1",
+		UserID:     "user-1",
+	}
+}
+
+func stateWithInput(input *RunInput) *RunState {
+	ws := &workspace.WorkspaceContext{ActivePath: "/tmp"}
+	return NewRunState(input, ws, "claude-3", nil)
+}
+
+func defaultState() *RunState {
+	return stateWithInput(minimalInput())
+}
+
+type toolStageHookDispatcher struct {
+	fire func(context.Context, hooks.Event) (hooks.FireResult, error)
+}
+
+func (d toolStageHookDispatcher) Fire(ctx context.Context, ev hooks.Event) (hooks.FireResult, error) {
+	if d.fire == nil {
+		return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+	}
+	return d.fire(ctx, ev)
+}
+
+// mockTokenCounter returns a fixed count for every call.
+type mockTokenCounter struct {
+	countPerMessage int
+}
+
+func (m *mockTokenCounter) Count(_ string, _ string) int { return m.countPerMessage }
+func (m *mockTokenCounter) CountMessages(_ string, msgs []providers.Message) int {
+	return len(msgs) * m.countPerMessage
+}
+func (m *mockTokenCounter) CountToolSchemas(_ string, _ []providers.ToolDefinition) int { return 0 }
+func (m *mockTokenCounter) ModelContextWindow(_ string) int                             { return 200_000 }
+
+// --- ThinkStage tests ---
+
+func TestThinkStage_NoToolCalls_ReturnsBreakLoop(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "final answer",
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != BreakLoop {
+		t.Errorf("Result() = %v, want BreakLoop", stage.Result())
+	}
+	// Final answer skips AppendPending (FinalizeStage builds the definitive message).
+	pending := state.Messages.Pending()
+	if len(pending) != 0 {
+		t.Errorf("pending = %v, want empty (FinalizeStage builds the definitive message)", pending)
+	}
+}
+
+func TestThinkStage_WithToolCalls_ReturnsContinue(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				FinishReason: "tool_calls",
+				ToolCalls: []providers.ToolCall{
+					{ID: "tc1", Name: "read_file"},
+				},
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v, want Continue", stage.Result())
+	}
+	if state.Think.LastResponse == nil {
+		t.Fatal("LastResponse is nil")
+	}
+	if len(state.Think.LastResponse.ToolCalls) != 1 {
+		t.Errorf("ToolCalls len = %d, want 1", len(state.Think.LastResponse.ToolCalls))
+	}
+}
+
+func TestThinkStage_EmptyToolCallContent_DoesNotEmitTemplateAnnouncement(t *testing.T) {
+	t.Parallel()
+	var gotContent, gotSource string
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				FinishReason: "tool_calls",
+				ToolCalls: []providers.ToolCall{{
+					ID:        "tc1",
+					Name:      "search\n`secret`",
+					Arguments: map[string]any{"api_key": "must-not-leak"},
+				}},
+			}, nil
+		},
+		EmitBlockReplyWithSource: func(content, source string) {
+			gotContent = content
+			gotSource = source
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if gotContent != "" || gotSource != "" {
+		t.Fatalf("empty tool-call content emitted template block reply: content=%q source=%q", gotContent, gotSource)
+	}
+}
+
+func TestThinkStage_EmptyMultiToolCallContent_DoesNotEmitRawToolNames(t *testing.T) {
+	t.Parallel()
+	var gotContent, gotSource string
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				FinishReason: "tool_calls",
+				ToolCalls: []providers.ToolCall{
+					{ID: "tc1", Name: "skill_search"},
+					{ID: "tc2", Name: "read_file", Arguments: map[string]any{"path": "notes.md"}},
+					{ID: "tc3", Name: "web_fetch", Arguments: map[string]any{"url": "https://example.test"}},
+				},
+			}, nil
+		},
+		EmitBlockReplyWithSource: func(content, source string) {
+			gotContent = content
+			gotSource = source
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if gotContent != "" || gotSource != "" {
+		t.Fatalf("empty multi-tool content emitted template block reply: content=%q source=%q", gotContent, gotSource)
+	}
+}
+
+func TestThinkStage_GeneratedToolCallContent_PreservesNaturalProgress(t *testing.T) {
+	t.Parallel()
+	var gotContent, gotSource string
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "Tôi sẽ tìm trong kho kỹ năng trước.",
+				FinishReason: "tool_calls",
+				ToolCalls:    []providers.ToolCall{{ID: "tc1", Name: "skill_search"}},
+			}, nil
+		},
+		EmitBlockReplyWithSource: func(content, source string) {
+			gotContent = content
+			gotSource = source
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	ctx := store.WithLocale(context.Background(), "vi")
+
+	err := stage.Execute(ctx, state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := "Tôi sẽ tìm trong kho kỹ năng trước."
+	if gotContent != want {
+		t.Fatalf("block reply content = %q", gotContent)
+	}
+	if gotSource != protocol.BlockReplySourceToolAnnouncement {
+		t.Fatalf("block reply source = %q, want %q", gotSource, protocol.BlockReplySourceToolAnnouncement)
+	}
+}
+
+func TestThinkStage_GeneratedToolCallContent_DoesNotDuplicateNamedTool(t *testing.T) {
+	t.Parallel()
+	var gotContent, gotSource string
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "Tôi sẽ dùng `skill_search` để tìm capability phù hợp trước.",
+				FinishReason: "tool_calls",
+				ToolCalls:    []providers.ToolCall{{ID: "tc1", Name: "skill_search"}},
+			}, nil
+		},
+		EmitBlockReplyWithSource: func(content, source string) {
+			gotContent = content
+			gotSource = source
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if gotContent != "Tôi sẽ dùng `skill_search` để tìm capability phù hợp trước." {
+		t.Fatalf("block reply content = %q", gotContent)
+	}
+	if gotSource != protocol.BlockReplySourceToolAnnouncement {
+		t.Fatalf("block reply source = %q, want %q", gotSource, protocol.BlockReplySourceToolAnnouncement)
+	}
+}
+
+func TestThinkStage_Truncation_FirstRetry_AppendsContinueMessage(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			// Truncation only triggers when tool calls are present (args truncated).
+			return &providers.ChatResponse{
+				FinishReason: "length",
+				ToolCalls:    []providers.ToolCall{{ID: "tc1", Name: "write_file"}},
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v after first truncation, want Continue", stage.Result())
+	}
+	if state.Think.TruncRetries != 1 {
+		t.Errorf("TruncRetries = %d, want 1", state.Think.TruncRetries)
+	}
+	// retry messages appended: assistant (partial) + user (hint)
+	pending := state.Messages.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("pending len = %d, want 2", len(pending))
+	}
+	if pending[0].Role != "assistant" {
+		t.Errorf("pending[0] role = %q, want assistant", pending[0].Role)
+	}
+	if pending[1].Role != "user" {
+		t.Errorf("pending[1] role = %q, want user", pending[1].Role)
+	}
+}
+
+func TestThinkStage_Truncation_ThirdRetry_ReturnsAbortRun(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				FinishReason: "length",
+				ToolCalls:    []providers.ToolCall{{ID: "tc1", Name: "write_file"}},
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	// simulate 2 prior retries
+	state.Think.TruncRetries = 2
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != AbortRun {
+		t.Errorf("Result() = %v after 3rd truncation, want AbortRun", stage.Result())
+	}
+}
+
+func TestThinkStage_TruncationReset_OnSuccess(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "ok",
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Think.TruncRetries = 2 // had retries before this success
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Think.TruncRetries != 0 {
+		t.Errorf("TruncRetries = %d after success, want 0", state.Think.TruncRetries)
+	}
+}
+
+func TestThinkStage_UsageAccumulation(t *testing.T) {
+	t.Parallel()
+	callCount := 0
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			callCount++
+			return &providers.ChatResponse{
+				Content:      "hello",
+				FinishReason: "stop",
+				Usage: &providers.Usage{
+					PromptTokens:                      10 * callCount,
+					CompletionTokens:                  5,
+					TotalTokens:                       10*callCount + 5,
+					CacheCreationTokens:               2,
+					CacheReadTokens:                   3,
+					PromptTokensIncludeCachedSegments: callCount == 2,
+					ThinkingTokens:                    4,
+					RequestCount:                      1,
+					ImageCount:                        1,
+					WebSearchCount:                    1,
+				},
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	// call twice
+	_ = stage.Execute(context.Background(), state)
+	_ = stage.Execute(context.Background(), state)
+
+	if state.Think.TotalUsage.PromptTokens != 30 {
+		t.Errorf("PromptTokens = %d, want 30", state.Think.TotalUsage.PromptTokens)
+	}
+	if state.Think.TotalUsage.CompletionTokens != 10 {
+		t.Errorf("CompletionTokens = %d, want 10", state.Think.TotalUsage.CompletionTokens)
+	}
+	if state.Think.TotalUsage.TotalTokens != 40 {
+		t.Errorf("TotalTokens = %d, want 40", state.Think.TotalUsage.TotalTokens)
+	}
+	if state.Think.TotalUsage.CacheCreationTokens != 4 || state.Think.TotalUsage.CacheReadTokens != 6 {
+		t.Errorf("cache tokens = %d/%d, want 4/6", state.Think.TotalUsage.CacheCreationTokens, state.Think.TotalUsage.CacheReadTokens)
+	}
+	if !state.Think.TotalUsage.PromptTokensIncludeCachedSegments {
+		t.Error("PromptTokensIncludeCachedSegments = false, want true")
+	}
+	if state.Think.TotalUsage.ThinkingTokens != 8 || state.Think.TotalUsage.RequestCount != 2 ||
+		state.Think.TotalUsage.ImageCount != 2 || state.Think.TotalUsage.WebSearchCount != 2 {
+		t.Errorf("extended usage = %+v, want thinking/request/image/web = 8/2/2/2", state.Think.TotalUsage)
+	}
+	if state.Think.LastUsage.PromptTokens != 20 || state.Think.LastUsage.TotalTokens != 25 {
+		t.Errorf("LastUsage = %+v, want last prompt=20 total=25", state.Think.LastUsage)
+	}
+}
+
+func TestThinkStage_Nudge70_FiresOnce(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{FinishReason: "stop", Content: "ok"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	// iteration 7 out of 10 = 70%
+	state.Iteration = 7
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !state.Evolution.Nudge70Sent {
+		t.Error("Nudge70Sent should be true at 70%")
+	}
+	if state.Evolution.Nudge90Sent {
+		t.Error("Nudge90Sent should be false at 70%")
+	}
+
+	// second call at same iteration — nudge should NOT fire again
+	pendingBefore := len(state.Messages.Pending())
+	_ = stage.Execute(context.Background(), state)
+	// pending grew by 1 (only the assistant message), not 2
+	pendingAfter := len(state.Messages.Pending())
+	if pendingAfter-pendingBefore > 1 {
+		t.Errorf("nudge fired again: pending grew by %d, want ≤1", pendingAfter-pendingBefore)
+	}
+}
+
+func TestThinkStage_Nudge90_FiresOnce(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{FinishReason: "stop", Content: "ok"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	// iteration 9 out of 10 = 90%
+	state.Iteration = 9
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !state.Evolution.Nudge90Sent {
+		t.Error("Nudge90Sent should be true at 90%")
+	}
+}
+
+func TestThinkStage_Nudge70_NotBeforeThreshold(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{FinishReason: "stop", Content: "ok"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Iteration = 5 // 50%, below threshold
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Evolution.Nudge70Sent {
+		t.Error("Nudge70Sent should be false at 50%")
+	}
+}
+
+func TestThinkStage_CallLLMNil_ReturnsError(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error when CallLLM is nil")
+	}
+}
+
+func TestThinkStage_LLMError_Propagates(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, errors.New("rate limited")
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error from LLM, got nil")
+	}
+}
+
+// Issue 958: Context overflow triggers emergency compaction + retry
+
+func TestThinkStage_ContextOverflow_TriggersCompaction(t *testing.T) {
+	t.Parallel()
+	callCount := 0
+	compacted := false
+
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			callCount++
+			if callCount == 1 {
+				return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+			}
+			return &providers.ChatResponse{Content: "success after compact", FinishReason: "stop"}, nil
+		},
+		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			return []providers.Message{{Role: "user", Content: "[Summary]"}}, nil
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: "test"}})
+
+	// First call: overflow → compact → retry
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("first Execute() should trigger retry, got error: %v", err)
+	}
+	if !compacted {
+		t.Error("expected compaction to be triggered")
+	}
+	if state.Think.OverflowRetries != 1 {
+		t.Errorf("expected OverflowRetries=1, got %d", state.Think.OverflowRetries)
+	}
+	// Stage returns Continue (nil error) to signal retry this iteration
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v after compaction, want Continue", stage.Result())
+	}
+}
+
+func TestThinkStage_EmptyLengthResponse_TriggersCompaction(t *testing.T) {
+	t.Parallel()
+	compacted := false
+
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				FinishReason: "length",
+				Usage: &providers.Usage{
+					PromptTokens:     271_343,
+					CompletionTokens: 203,
+					TotalTokens:      271_546,
+					ThinkingTokens:   203,
+				},
+			}, nil
+		},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			return []providers.Message{{Role: "user", Content: "[Summary]"}}, nil
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: "long history"}})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected empty length response to trigger compaction")
+	}
+	if state.Think.LastResponse != nil {
+		t.Fatal("LastResponse should stay nil so ObserveStage does not finalize empty content")
+	}
+	if state.Think.OverflowRetries != 1 {
+		t.Errorf("OverflowRetries = %d, want 1", state.Think.OverflowRetries)
+	}
+	if state.Think.TotalUsage.TotalTokens != 271_546 {
+		t.Errorf("TotalTokens = %d, want failed-call usage recorded", state.Think.TotalUsage.TotalTokens)
+	}
+	if got := state.Messages.History(); len(got) != 1 || got[0].Content != "[Summary]" {
+		t.Fatalf("history after compaction = %#v", got)
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v, want Continue", stage.Result())
+	}
+}
+
+func TestThinkStage_EmptyLengthResponse_FailsAfterOneRetry(t *testing.T) {
+	t.Parallel()
+
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{FinishReason: "length"}, nil
+		},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return []providers.Message{{Role: "user", Content: "[Summary]"}}, nil
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Think.OverflowRetries = 1
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error after repeated empty length response")
+	}
+	if !strings.Contains(err.Error(), "truncated before content after compaction") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestThinkStage_ContextOverflow_FailsAfterOneRetry(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+		},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return []providers.Message{{Role: "user", Content: "[Summary]"}}, nil
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Think.OverflowRetries = 1 // Already retried once
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Error("expected error after second overflow")
+	}
+	if !strings.Contains(err.Error(), "context overflow after compaction") {
+		t.Errorf("expected 'context overflow after compaction' message, got %v", err)
+	}
+}
+
+func TestThinkStage_ContextOverflow_NoCompactCallback_FailsGracefully(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+		},
+		CompactMessages: nil, // No compaction available
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Error("expected error when no compaction available")
+	}
+}
+
+func TestThinkStage_ContextOverflow_CompactionFails_ReturnsOriginalError(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return nil, &providers.HTTPError{Status: 400, Body: "Prompt exceeds max length"}
+		},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return nil, errors.New("compaction failed")
+		},
+	}
+
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Error("expected error when compaction fails")
+	}
+	// Should return LLM error wrapped, not compaction error
+	if !strings.Contains(err.Error(), "llm call") {
+		t.Errorf("expected 'llm call' in error message, got %v", err)
+	}
+}
+
+// --- PruneStage tests ---
+
+func TestPruneStage_UnderBudget_NoOp(t *testing.T) {
+	t.Parallel()
+	pruneCallCount := 0
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 10000,
+			MaxTokens:     1000,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 1}, // tiny counts
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			pruneCallCount++
+			return msgs, PruneStats{}
+		},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	// add a small history
+	state.Messages.SetHistory([]providers.Message{
+		{Role: "user", Content: "hello"},
+	})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v, want Continue", stage.Result())
+	}
+	if pruneCallCount != 0 {
+		t.Errorf("PruneMessages called %d times, want 0", pruneCallCount)
+	}
+}
+
+func TestPruneStage_Over70Percent_CallsPruneMessages(t *testing.T) {
+	t.Parallel()
+	pruneCallCount := 0
+	// budget = 10000 - 0 (no overhead) - 1000 = 9000
+	// softThreshold = 9000 * 70/100 = 6300
+	// history = 100 msgs * 100 tokens each = 10000 > 6300
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 10000,
+			MaxTokens:     1000,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, budget int) ([]providers.Message, PruneStats) {
+			pruneCallCount++
+			// return trimmed history that's under budget
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+
+	history := make([]providers.Message, 100)
+	for i := range history {
+		history[i] = providers.Message{Role: "user", Content: "msg"}
+	}
+	state.Messages.SetHistory(history)
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if pruneCallCount == 0 {
+		t.Error("PruneMessages should have been called")
+	}
+}
+
+func TestPruneStage_Over100Percent_CallsCompact(t *testing.T) {
+	t.Parallel()
+	compactCallCount := 0
+	// budget = 1000 - 0 - 100 = 900
+	// 50 msgs * 100 tokens = 5000 > 900 (100%)
+	// after prune still > budget → compact
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 1000,
+			MaxTokens:     100,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			// return same size — still over budget
+			return msgs, PruneStats{}
+		},
+		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
+			compactCallCount++
+			// return 1 message (under budget)
+			return msgs[:1], nil
+		},
+	}
+	stage := NewPruneStage(deps, NewMemoryFlushStage(deps))
+	state := defaultState()
+
+	history := make([]providers.Message, 50)
+	for i := range history {
+		history[i] = providers.Message{Role: "user", Content: "msg"}
+	}
+	state.Messages.SetHistory(history)
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if compactCallCount == 0 {
+		t.Error("CompactMessages should have been called")
+	}
+	if !state.Prune.MidLoopCompacted {
+		t.Error("MidLoopCompacted should be true")
+	}
+}
+
+func TestPruneStage_StillOverAfterCompaction_ReturnsAbortRun(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 1000,
+			MaxTokens:     100,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			return msgs, PruneStats{} // no reduction
+		},
+		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
+			// compaction still returns too many messages
+			return msgs, nil
+		},
+	}
+	stage := NewPruneStage(deps, NewMemoryFlushStage(deps))
+	state := defaultState()
+
+	history := make([]providers.Message, 50)
+	for i := range history {
+		history[i] = providers.Message{Role: "user", Content: "msg"}
+	}
+	state.Messages.SetHistory(history)
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != AbortRun {
+		t.Errorf("Result() = %v, want AbortRun after compaction still over budget", stage.Result())
+	}
+}
+
+func TestPruneStage_ZeroBudget_NoOp(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 100,
+			MaxTokens:     200, // MaxTokens > ContextWindow → budget ≤ 0
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 50},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v, want Continue for zero budget", stage.Result())
+	}
+}
+
+// TestPruneStage_EffectiveContextWindow_OverridesConfig verifies that when
+// ContextStage has resolved a per-model context window (e.g. gpt-4o=128k
+// vs Config.ContextWindow=10k), PruneStage uses the resolved value.
+//
+// Without this, swapping models at session time would leave the pipeline
+// pruning against the wrong budget. Phase 4 regression gate.
+func TestPruneStage_EffectiveContextWindow_OverridesConfig(t *testing.T) {
+	t.Parallel()
+	pruneCallCount := 0
+	// Config says 10k window, but model-specific resolution says 128k.
+	// History is 60k tokens — would be over budget at 10k (fires prune),
+	// under budget at 128k (no prune should happen).
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 10_000, // stale/default — should be ignored
+			MaxTokens:     1_000,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 600},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			pruneCallCount++
+			return msgs, PruneStats{}
+		},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Context.EffectiveContextWindow = 128_000 // resolved by ContextStage
+
+	history := make([]providers.Message, 100) // 100 * 600 = 60k < budget 127k
+	for i := range history {
+		history[i] = providers.Message{Role: "user", Content: "msg"}
+	}
+	state.Messages.SetHistory(history)
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if pruneCallCount != 0 {
+		t.Errorf("PruneMessages should not fire with 128k window, called %d times", pruneCallCount)
+	}
+}
+
+// --- buildRecentContext tests (Phase 9) ---
+
+func TestBuildRecentContext_EmptyHistory(t *testing.T) {
+	t.Parallel()
+	if got := buildRecentContext(nil); got != "" {
+		t.Errorf("empty history should return empty, got %q", got)
+	}
+}
+
+func TestBuildRecentContext_SkipsNonUserMessages(t *testing.T) {
+	t.Parallel()
+	hist := []providers.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "hi back"},
+		{Role: "tool", Content: "tool output"},
+	}
+	got := buildRecentContext(hist)
+	if got != "hello" {
+		t.Errorf("should only include user messages, got %q", got)
+	}
+}
+
+func TestBuildRecentContext_CapsAtTwoTurns(t *testing.T) {
+	t.Parallel()
+	hist := []providers.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "reply"},
+		{Role: "user", Content: "second"},
+		{Role: "assistant", Content: "reply"},
+		{Role: "user", Content: "third"},
+	}
+	got := buildRecentContext(hist)
+	// Should contain last two user turns ("second" and "third"), not "first"
+	if !strings.Contains(got, "second") {
+		t.Errorf("missing second turn, got %q", got)
+	}
+	if !strings.Contains(got, "third") {
+		t.Errorf("missing third turn, got %q", got)
+	}
+	if strings.Contains(got, "first") {
+		t.Errorf("should exclude old turns, got %q", got)
+	}
+}
+
+func TestBuildRecentContext_PreservesTurnOrder(t *testing.T) {
+	t.Parallel()
+	hist := []providers.Message{
+		{Role: "user", Content: "earlier"},
+		{Role: "user", Content: "later"},
+	}
+	got := buildRecentContext(hist)
+	// "earlier" should come before "later" in the output
+	earlierIdx := strings.Index(got, "earlier")
+	laterIdx := strings.Index(got, "later")
+	if earlierIdx == -1 || laterIdx == -1 || earlierIdx >= laterIdx {
+		t.Errorf("order broken: got %q (earlier=%d, later=%d)", got, earlierIdx, laterIdx)
+	}
+}
+
+func TestBuildRecentContext_TruncatesLongMessages(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("x", 500)
+	hist := []providers.Message{
+		{Role: "user", Content: long},
+	}
+	got := buildRecentContext(hist)
+	if len(got) > 300 {
+		t.Errorf("result should be capped at 300 chars, got %d", len(got))
+	}
+}
+
+// --- Prune Stage tests continued ---
+
+// TestPruneStage_ReserveTokens_BuffersBudget verifies that ReserveTokens is
+// subtracted from the usable budget so compaction fires earlier than the hard
+// limit. Phase 5 regression gate for provider over-delivery protection.
+func TestPruneStage_ReserveTokens_BuffersBudget(t *testing.T) {
+	t.Parallel()
+	pruneCallCount := 0
+	// Without reserve: budget = 10000 - 0 - 1000 = 9000, softThreshold 6300
+	// With reserve=2000: budget = 10000 - 0 - 1000 - 2000 = 7000, softThreshold 4900
+	// 50 msgs * 100 = 5000 tokens — crosses the 4900 soft threshold only when reserve is set.
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 10_000,
+			MaxTokens:     1_000,
+			ReserveTokens: 2_000,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			pruneCallCount++
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	history := make([]providers.Message, 50)
+	for i := range history {
+		history[i] = providers.Message{Role: "user", Content: "msg"}
+	}
+	state.Messages.SetHistory(history)
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if pruneCallCount != 1 {
+		t.Errorf("ReserveTokens should have triggered early prune, called %d times", pruneCallCount)
+	}
+}
+
+// TestPruneStage_EffectiveContextWindow_ZeroFallsBackToConfig verifies
+// backward compatibility: when ContextStage hasn't resolved a model-specific
+// window (unknown model, nil resolver, no registry), PruneStage falls back
+// to Config.ContextWindow — matching pre-Phase-4 behavior.
+func TestPruneStage_EffectiveContextWindow_ZeroFallsBackToConfig(t *testing.T) {
+	t.Parallel()
+	pruneCallCount := 0
+	deps := &PipelineDeps{
+		Config: PipelineConfig{
+			ContextWindow: 10_000, // used because EffectiveContextWindow=0
+			MaxTokens:     1_000,
+		},
+		TokenCounter: &mockTokenCounter{countPerMessage: 600},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			pruneCallCount++
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	// state.Context.EffectiveContextWindow left as zero
+
+	history := make([]providers.Message, 20) // 20 * 600 = 12k > 10k → should prune
+	for i := range history {
+		history[i] = providers.Message{Role: "user", Content: "msg"}
+	}
+	state.Messages.SetHistory(history)
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if pruneCallCount == 0 {
+		t.Error("PruneMessages should fire with 10k fallback window")
+	}
+}
+
+// --- ToolStage tests ---
+
+func TestToolStage_NoToolCalls_NoOp(t *testing.T) {
+	t.Parallel()
+	execCalled := false
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			execCalled = true
+			return nil, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	// no LastResponse or empty ToolCalls
+	state.Think.LastResponse = &providers.ChatResponse{FinishReason: "stop"}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if execCalled {
+		t.Error("ExecuteToolCall should not be called when no tool calls")
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v, want Continue", stage.Result())
+	}
+}
+
+func TestToolStage_SingleTool_ExecutesSequentially(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			return []providers.Message{
+				{Role: "tool", Content: "result:" + tc.Name},
+			}, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "read_file"}},
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	pending := state.Messages.Pending()
+	if len(pending) != 1 {
+		t.Fatalf("pending len = %d, want 1", len(pending))
+	}
+	if pending[0].Content != "result:read_file" {
+		t.Errorf("pending[0].Content = %q", pending[0].Content)
+	}
+	if state.Tool.TotalToolCalls != 1 {
+		t.Errorf("TotalToolCalls = %d, want 1", state.Tool.TotalToolCalls)
+	}
+}
+
+func TestToolStage_MultipleTools_Sequential_MessagesInOrder(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			return []providers.Message{
+				{Role: "tool", Content: "result:" + tc.Name},
+			}, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "tool_a"},
+			{ID: "2", Name: "tool_b"},
+			{ID: "3", Name: "tool_c"},
+		},
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	pending := state.Messages.Pending()
+	if len(pending) != 3 {
+		t.Fatalf("pending len = %d, want 3", len(pending))
+	}
+	// messages must be in original tool call order
+	if pending[0].Content != "result:tool_a" {
+		t.Errorf("pending[0] = %q, want result:tool_a", pending[0].Content)
+	}
+	if pending[1].Content != "result:tool_b" {
+		t.Errorf("pending[1] = %q, want result:tool_b", pending[1].Content)
+	}
+	if pending[2].Content != "result:tool_c" {
+		t.Errorf("pending[2] = %q, want result:tool_c", pending[2].Content)
+	}
+	if state.Tool.TotalToolCalls != 3 {
+		t.Errorf("TotalToolCalls = %d, want 3", state.Tool.TotalToolCalls)
+	}
+}
+
+// Regression: v3 parallel path invokes ExecuteToolRaw + ProcessToolResult
+// for every tool call. If this breaks, the `tool.call` WS event emitted
+// inside makeExecuteToolRaw (loop_pipeline_tool_callbacks.go) stops firing
+// and UIs go silent during real-time tool execution.
+func TestToolStage_MultipleTools_ParallelPath_InvokesRawAndProcessForEach(t *testing.T) {
+	t.Parallel()
+	var rawMu, procMu sync.Mutex
+	rawCalls := []string{}
+	procCalls := []string{}
+	deps := &PipelineDeps{
+		// Parallel path requires all three callbacks. ExecuteToolCall is required
+		// upfront (nil-guard) even though the parallel branch won't invoke it.
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must NOT be called when parallel path is active")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			rawMu.Lock()
+			rawCalls = append(rawCalls, tc.ID)
+			rawMu.Unlock()
+			return providers.Message{Role: "tool", Content: "raw:" + tc.Name, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, tc providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			procMu.Lock()
+			procCalls = append(procCalls, tc.ID)
+			procMu.Unlock()
+			return []providers.Message{rawMsg}
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "tool_a"},
+			{ID: "2", Name: "tool_b"},
+			{ID: "3", Name: "tool_c"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	// Each tool must be passed through BOTH ExecuteToolRaw (where tool.call emits)
+	// AND ProcessToolResult (where tool.result emits). Missing either breaks UIs.
+	if len(rawCalls) != 3 {
+		t.Errorf("ExecuteToolRaw called %d times, want 3 (one per tool)", len(rawCalls))
+	}
+	if len(procCalls) != 3 {
+		t.Errorf("ProcessToolResult called %d times, want 3", len(procCalls))
+	}
+	// ProcessToolResult must run sequentially in original order (deterministic state mutation)
+	if len(procCalls) == 3 && (procCalls[0] != "1" || procCalls[1] != "2" || procCalls[2] != "3") {
+		t.Errorf("ProcessToolResult order = %v, want [1 2 3]", procCalls)
+	}
+	if state.Tool.TotalToolCalls != 3 {
+		t.Errorf("TotalToolCalls = %d, want 3", state.Tool.TotalToolCalls)
+	}
+}
+
+func TestToolStage_ParallelPath_PreservesOriginalOrderWhenRawCompletesOutOfOrder(t *testing.T) {
+	t.Parallel()
+	release := map[string]chan struct{}{
+		"1": make(chan struct{}),
+		"2": make(chan struct{}),
+		"3": make(chan struct{}),
+	}
+	started := make(chan string, 3)
+	done := make(chan error, 1)
+
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must not run for eligible parallel batch")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			started <- tc.ID
+			<-release[tc.ID]
+			return providers.Message{Role: "tool", Content: "raw:" + tc.ID, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			return []providers.Message{rawMsg}
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file"},
+		{ID: "2", Name: "read_file"},
+		{ID: "3", Name: "read_file"},
+	}}
+
+	go func() {
+		done <- stage.Execute(context.Background(), state)
+	}()
+
+	for range 3 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for raw calls to start")
+		}
+	}
+	close(release["3"])
+	close(release["2"])
+	close(release["1"])
+
+	if err := <-done; err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	got := []string{}
+	for _, msg := range state.Messages.Pending() {
+		got = append(got, msg.ToolCallID)
+	}
+	if want := []string{"1", "2", "3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending order = %v, want %v", got, want)
+	}
+}
+
+func TestToolStage_ParallelPath_RunsPreToolUseBeforeRawAndAppliesRewrite(t *testing.T) {
+	t.Parallel()
+	rawArgsByID := map[string]map[string]any{}
+	var rawMu sync.Mutex
+	deps := &PipelineDeps{
+		Hooks: toolStageHookDispatcher{fire: func(_ context.Context, ev hooks.Event) (hooks.FireResult, error) {
+			if ev.HookEvent == hooks.EventPreToolUse && ev.ToolName == "read_file" {
+				return hooks.FireResult{
+					Decision:         hooks.DecisionAllow,
+					UpdatedToolInput: map[string]any{"path": "/safe"},
+				}, nil
+			}
+			return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+		}},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must not run for eligible parallel batch")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			rawMu.Lock()
+			rawArgsByID[tc.ID] = tc.Arguments
+			rawMu.Unlock()
+			return providers.Message{Role: "tool", Content: "ok", ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			return []providers.Message{rawMsg}
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file", Arguments: map[string]any{"path": "/unsafe"}},
+		{ID: "2", Name: "web_fetch", Arguments: map[string]any{"url": "https://example.com"}},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	rawMu.Lock()
+	rawArgs := rawArgsByID["1"]
+	rawMu.Unlock()
+	if got, _ := rawArgs["path"].(string); got != "/safe" {
+		t.Fatalf("raw path = %q, want hook rewrite /safe", got)
+	}
+}
+
+func TestToolStage_ParallelPath_PreservesOriginalOrderWithDuplicateToolCallIDs(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must not run for eligible parallel batch")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			slot, _ := tc.Arguments["slot"].(string)
+			return providers.Message{Role: "tool", Content: "raw:" + slot, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			return []providers.Message{rawMsg}
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "dup", Name: "read_file", Arguments: map[string]any{"slot": "1"}},
+		{ID: "dup", Name: "read_file", Arguments: map[string]any{"slot": "2"}},
+		{ID: "dup", Name: "read_file", Arguments: map[string]any{"slot": "3"}},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	got := []string{}
+	for _, msg := range state.Messages.Pending() {
+		got = append(got, msg.Content)
+	}
+	if want := []string{"raw:1", "raw:2", "raw:3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending contents = %v, want %v", got, want)
+	}
+}
+
+func TestToolStage_ParallelPath_BlockedPreToolUseSkipsRawExecution(t *testing.T) {
+	t.Parallel()
+	rawCalls := []string{}
+	deps := &PipelineDeps{
+		Hooks: toolStageHookDispatcher{fire: func(_ context.Context, ev hooks.Event) (hooks.FireResult, error) {
+			if ev.HookEvent == hooks.EventPreToolUse && ev.ToolName == "read_file" {
+				return hooks.FireResult{Decision: hooks.DecisionBlock}, nil
+			}
+			return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+		}},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must not run when remaining calls are parallel eligible")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			rawCalls = append(rawCalls, tc.ID)
+			return providers.Message{Role: "tool", Content: "raw:" + tc.Name, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			return []providers.Message{rawMsg}
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file"},
+		{ID: "2", Name: "web_fetch"},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !reflect.DeepEqual(rawCalls, []string{"2"}) {
+		t.Fatalf("raw calls = %v, want only unblocked call 2", rawCalls)
+	}
+	pending := state.Messages.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("pending len = %d, want 2", len(pending))
+	}
+	if pending[0].ToolCallID != "1" || !strings.Contains(pending[0].Content, "Hook blocked") {
+		t.Fatalf("pending[0] = %+v, want blocked message for call 1", pending[0])
+	}
+	if pending[1].ToolCallID != "2" {
+		t.Fatalf("pending[1] = %+v, want raw result for call 2", pending[1])
+	}
+}
+
+func TestToolStage_MultipleTools_IneligibleBatchUsesSequentialExecution(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not run when any call is ineligible")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not run when any call is ineligible")
+			return nil
+		},
+		ParallelEligibleToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "read_file" || tc.Name == "web_fetch"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file"},
+		{ID: "2", Name: "write_file"},
+		{ID: "3", Name: "web_fetch"},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if want := []string{"read_file", "write_file", "web_fetch"}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+}
+
+func TestToolStage_ParallelBatchFallsBackToSequentialWhenBudgetCannotFitBatch(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 2},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.ID)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not run when full batch exceeds budget")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not run when full batch exceeds budget")
+			return nil
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Tool.TotalToolCalls = 1
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file"},
+		{ID: "2", Name: "web_fetch"},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"1"}) {
+		t.Fatalf("ExecuteToolCall calls = %v, want [1]", calls)
+	}
+	if stage.Result() != BreakLoop {
+		t.Fatalf("Result() = %v, want BreakLoop", stage.Result())
+	}
+}
+
+func TestToolStage_SequentialFallback_DoesNotPreflightCallsSkippedByBudget(t *testing.T) {
+	t.Parallel()
+	hookCalls := []string{}
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 1},
+		Hooks: toolStageHookDispatcher{fire: func(_ context.Context, ev hooks.Event) (hooks.FireResult, error) {
+			if ev.HookEvent == hooks.EventPreToolUse {
+				hookCalls = append(hookCalls, ev.ToolName)
+			}
+			return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+		}},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not run when full batch exceeds budget")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not run when full batch exceeds budget")
+			return nil
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file"},
+		{ID: "2", Name: "web_fetch"},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !reflect.DeepEqual(hookCalls, []string{"read_file"}) {
+		t.Fatalf("pre_tool_use calls = %v, want only first executable call", hookCalls)
+	}
+	if state.Tool.TotalToolCalls != 1 {
+		t.Fatalf("TotalToolCalls = %d, want 1", state.Tool.TotalToolCalls)
+	}
+	if stage.Result() != BreakLoop {
+		t.Fatalf("Result() = %v, want BreakLoop", stage.Result())
+	}
+}
+
+func TestToolStage_SequentialFallback_DoesNotOvershootBudgetWithBlockedHook(t *testing.T) {
+	t.Parallel()
+	hookCalls := []string{}
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 1},
+		Hooks: toolStageHookDispatcher{fire: func(_ context.Context, ev hooks.Event) (hooks.FireResult, error) {
+			if ev.HookEvent == hooks.EventPreToolUse {
+				hookCalls = append(hookCalls, ev.ToolName)
+				return hooks.FireResult{Decision: hooks.DecisionBlock}, nil
+			}
+			return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+		}},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must not run when hook blocks the only budgeted call")
+			return nil, nil
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: []providers.ToolCall{
+		{ID: "1", Name: "read_file"},
+		{ID: "2", Name: "web_fetch"},
+	}}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !reflect.DeepEqual(hookCalls, []string{"read_file"}) {
+		t.Fatalf("pre_tool_use calls = %v, want only first blocked call", hookCalls)
+	}
+	if state.Tool.TotalToolCalls != 1 {
+		t.Fatalf("TotalToolCalls = %d, want 1", state.Tool.TotalToolCalls)
+	}
+	pending := state.Messages.Pending()
+	if len(pending) != 1 || pending[0].ToolCallID != "1" || !strings.Contains(pending[0].Content, "Hook blocked") {
+		t.Fatalf("pending = %+v, want one blocked message for first call", pending)
+	}
+	if stage.Result() != BreakLoop {
+		t.Fatalf("Result() = %v, want BreakLoop", stage.Result())
+	}
+}
+
+func TestToolStage_ParallelPath_BoundsRawConcurrency(t *testing.T) {
+	t.Parallel()
+	const totalCalls = 8
+	started := make(chan struct{}, totalCalls)
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	var current int32
+	var peak int32
+
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must not run for eligible parallel batch")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			now := atomic.AddInt32(&current, 1)
+			for {
+				prev := atomic.LoadInt32(&peak)
+				if now <= prev || atomic.CompareAndSwapInt32(&peak, prev, now) {
+					break
+				}
+			}
+			started <- struct{}{}
+			<-release
+			atomic.AddInt32(&current, -1)
+			return providers.Message{Role: "tool", Content: "raw:" + tc.Name, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			return []providers.Message{rawMsg}
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	calls := make([]providers.ToolCall, 0, totalCalls)
+	for i := range totalCalls {
+		id := strconv.Itoa(i + 1)
+		calls = append(calls, providers.ToolCall{ID: id, Name: "read_file"})
+	}
+	state.Think.LastResponse = &providers.ChatResponse{ToolCalls: calls}
+
+	go func() {
+		done <- stage.Execute(context.Background(), state)
+	}()
+
+	for range defaultParallelToolCallLimit {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("timed out waiting for capped raw calls to start")
+		}
+	}
+	if got := atomic.LoadInt32(&peak); got > int32(defaultParallelToolCallLimit) {
+		close(release)
+		t.Fatalf("peak raw concurrency = %d, want <= %d", got, defaultParallelToolCallLimit)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if got := atomic.LoadInt32(&peak); got > int32(defaultParallelToolCallLimit) {
+		t.Fatalf("peak raw concurrency = %d, want <= %d", got, defaultParallelToolCallLimit)
+	}
+}
+
+func TestToolStage_MultipleTools_SequentialBarrierSkipsParallelRawPath(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not be called when a sequential barrier is present")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not be called when a sequential barrier is present")
+			return nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "message"},
+			{ID: "2", Name: "wait"},
+			{ID: "3", Name: "message"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"message", "wait", "message"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+}
+
+func TestToolStage_MultipleTools_PrefixedSequentialBarrierSkipsParallelRawPath(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not be called when a prefixed sequential barrier is present")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not be called when a prefixed sequential barrier is present")
+			return nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return strings.TrimPrefix(tc.Name, "proxy_") == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "proxy_message"},
+			{ID: "2", Name: "proxy_wait"},
+			{ID: "3", Name: "proxy_message"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"proxy_message", "proxy_wait", "proxy_message"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+}
+
+func TestToolStage_SequentialBatchStopsAfterContextCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			if tc.Name == "wait" {
+				cancel()
+			}
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, _ providers.ToolCall) (providers.Message, any, error) {
+			t.Fatal("ExecuteToolRaw must not be called when a sequential barrier is present")
+			return providers.Message{}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, _ providers.ToolCall, _ providers.Message, _ any) []providers.Message {
+			t.Fatal("ProcessToolResult must not be called when a sequential barrier is present")
+			return nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "message"},
+			{ID: "2", Name: "wait", Arguments: map[string]any{"timeMs": 1000}},
+			{ID: "3", Name: "message"},
+		},
+	}
+
+	if err := stage.Execute(ctx, state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"message", "wait"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+	if stage.Result() != AbortRun {
+		t.Fatalf("Result() = %v, want AbortRun", stage.Result())
+	}
+}
+
+func TestToolStage_SequentialBatchEnforcesToolBudgetBeforeEachCall(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 2},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.Name)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "message"},
+			{ID: "2", Name: "wait", Arguments: map[string]any{"timeMs": 1000}},
+			{ID: "3", Name: "message"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	want := []string{"message", "wait"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("ExecuteToolCall order = %v, want %v", calls, want)
+	}
+	if stage.Result() != BreakLoop {
+		t.Fatalf("Result() = %v, want BreakLoop", stage.Result())
+	}
+}
+
+func TestToolStage_SequentialWaitBatchEnforcesCumulativeWaitCap(t *testing.T) {
+	t.Parallel()
+	calls := []string{}
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			calls = append(calls, tc.ID)
+			return []providers.Message{{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID}}, nil
+		},
+		SequentialToolCall: func(tc providers.ToolCall) bool {
+			return tc.Name == "wait"
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "wait", Arguments: map[string]any{"timeMs": 300000}},
+			{ID: "2", Name: "wait", Arguments: map[string]any{"timeMs": 300000}},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !reflect.DeepEqual(calls, []string{"1"}) {
+		t.Fatalf("ExecuteToolCall calls = %v, want [1]", calls)
+	}
+	if stage.Result() != AbortRun {
+		t.Fatalf("Result() = %v, want AbortRun", stage.Result())
+	}
+}
+
+func TestToolStage_LoopKilled_ReturnsBreakLoop(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			return []providers.Message{{Role: "tool", Content: "ok"}}, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Tool.LoopKilled = true
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "tool_a"}},
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != BreakLoop {
+		t.Errorf("Result() = %v, want BreakLoop when LoopKilled", stage.Result())
+	}
+}
+
+func TestToolStage_ToolBudgetExceeded_ReturnsBreakLoop(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 5},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			return []providers.Message{{Role: "tool", Content: "ok"}}, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Tool.TotalToolCalls = 4 // one more puts it at 5
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "tool_a"}},
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != BreakLoop {
+		t.Errorf("Result() = %v after budget exceeded, want BreakLoop", stage.Result())
+	}
+}
+
+func TestToolStage_CheckReadOnly_ShouldBreak_ReturnsBreakLoop(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxToolCalls: 100},
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			return []providers.Message{{Role: "tool", Content: "ok"}}, nil
+		},
+		CheckReadOnly: func(_ *RunState) (*providers.Message, bool) {
+			msg := &providers.Message{Role: "user", Content: "read-only warning"}
+			return msg, true // shouldBreak = true
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "read_file"}},
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != BreakLoop {
+		t.Errorf("Result() = %v, want BreakLoop when CheckReadOnly triggers", stage.Result())
+	}
+	// warning message appended
+	pending := state.Messages.Pending()
+	found := false
+	for _, m := range pending {
+		if m.Content == "read-only warning" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("read-only warning message not found in pending")
+	}
+}
+
+func TestToolStage_ExecuteToolCallNil_ReturnsError(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "tool_a"}},
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error when ExecuteToolCall is nil")
+	}
+}
+
+func TestToolStage_NilLastResponse_NoOp(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	// LastResponse is nil
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if stage.Result() != Continue {
+		t.Errorf("Result() = %v, want Continue", stage.Result())
+	}
+}
+
+// --- ObserveStage tests ---
+
+func TestObserveStage_DrainInjectCh_AddsToPending(t *testing.T) {
+	t.Parallel()
+	injected := []providers.Message{
+		{Role: "user", Content: "injected-1"},
+		{Role: "user", Content: "injected-2"},
+	}
+	deps := &PipelineDeps{
+		DrainInjectCh: func() []providers.Message { return injected },
+	}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	pending := state.Messages.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("pending len = %d, want 2", len(pending))
+	}
+	if pending[0].Content != "injected-1" || pending[1].Content != "injected-2" {
+		t.Errorf("pending = %v", pending)
+	}
+}
+
+func TestObserveStage_LateInjectionAfterFinalContinuesRun(t *testing.T) {
+	t.Parallel()
+	injected := []providers.Message{
+		{Role: "user", Content: "answer this follow-up too"},
+	}
+	deps := &PipelineDeps{
+		DrainInjectCh: func() []providers.Message { return injected },
+	}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:      "answer to original request",
+		Thinking:     "reasoning",
+		FinishReason: "stop",
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !state.Observe.ContinueAfterFinal {
+		t.Fatal("ContinueAfterFinal = false, want true")
+	}
+	if state.Observe.FinalContent != "" {
+		t.Fatalf("FinalContent = %q, want empty until follow-up is answered", state.Observe.FinalContent)
+	}
+	pending := state.Messages.Pending()
+	if len(pending) != 2 {
+		t.Fatalf("pending len = %d, want 2", len(pending))
+	}
+	if pending[0].Role != "assistant" || pending[0].Content != "answer to original request" || !pending[0].Transient {
+		t.Fatalf("pending[0] = %#v, want assistant original answer", pending[0])
+	}
+	if pending[1].Role != "user" || pending[1].Content != "answer this follow-up too" {
+		t.Fatalf("pending[1] = %#v, want user follow-up", pending[1])
+	}
+}
+
+func TestObserveStage_MovesTaggedThinkingIntoFinalThinking(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:  "Visible <thinking>hidden reasoning</thinking> answer",
+		Thinking: "native",
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.FinalContent != "Visible  answer" {
+		t.Errorf("FinalContent = %q, want %q", state.Observe.FinalContent, "Visible  answer")
+	}
+	if state.Observe.FinalThinking != "native\nhidden reasoning" {
+		t.Errorf("FinalThinking = %q, want %q", state.Observe.FinalThinking, "native\nhidden reasoning")
+	}
+}
+
+func TestObserveStage_FinalContent_SetWhenNoToolCalls(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:      "final answer",
+		Thinking:     "my reasoning",
+		FinishReason: "stop",
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.FinalContent != "final answer" {
+		t.Errorf("FinalContent = %q, want final answer", state.Observe.FinalContent)
+	}
+	if state.Observe.FinalThinking != "my reasoning" {
+		t.Errorf("FinalThinking = %q, want my reasoning", state.Observe.FinalThinking)
+	}
+}
+
+func TestObserveStage_FinalContent_NotSetWhenToolCalls(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content: "intermediate",
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "read_file"},
+		},
+		FinishReason: "tool_calls",
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.FinalContent != "" {
+		t.Errorf("FinalContent = %q, want empty (tool calls present)", state.Observe.FinalContent)
+	}
+}
+
+func TestObserveStage_BlockReplies_IncrementedOnlyWithToolCalls(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+
+	// first tool iteration response (has tool calls → should count)
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:   "reply 1",
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "tool_a"}},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	// second tool iteration response (has tool calls → should count)
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:   "reply 2",
+		ToolCalls: []providers.ToolCall{{ID: "2", Name: "tool_b"}},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	if state.Observe.BlockReplies != 2 {
+		t.Errorf("BlockReplies = %d, want 2", state.Observe.BlockReplies)
+	}
+	if state.Observe.LastBlockReply != "reply 2" {
+		t.Errorf("LastBlockReply = %q, want reply 2", state.Observe.LastBlockReply)
+	}
+}
+
+// Regression test for #838: final answer (no tool calls) must NOT increment
+// BlockReplies, otherwise gateway dedup falsely suppresses delivery.
+func TestObserveStage_FinalAnswer_NoToolCalls_BlockRepliesNotIncremented(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+
+	// Final answer: content but NO tool calls
+	state.Think.LastResponse = &providers.ChatResponse{
+		Content:      "Here is your answer.",
+		FinishReason: "stop",
+		ToolCalls:    nil,
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	if state.Observe.BlockReplies != 0 {
+		t.Errorf("BlockReplies = %d, want 0 for final answer without tool calls", state.Observe.BlockReplies)
+	}
+	if state.Observe.LastBlockReply != "" {
+		t.Errorf("LastBlockReply = %q, want empty for final answer", state.Observe.LastBlockReply)
+	}
+	// FinalContent should still be set
+	if state.Observe.FinalContent != "Here is your answer." {
+		t.Errorf("FinalContent = %q, want answer text", state.Observe.FinalContent)
+	}
+}
+
+func TestObserveStage_NilResponse_NoOp(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+	// LastResponse stays nil
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.BlockReplies != 0 {
+		t.Errorf("BlockReplies = %d, want 0", state.Observe.BlockReplies)
+	}
+}
+
+func TestObserveStage_EmptyContent_BlockRepliesNotIncremented(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewObserveStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{Content: "", FinishReason: "tool_calls",
+		ToolCalls: []providers.ToolCall{{ID: "1", Name: "tool"}}}
+
+	_ = stage.Execute(context.Background(), state)
+
+	if state.Observe.BlockReplies != 0 {
+		t.Errorf("BlockReplies = %d, want 0 when content empty", state.Observe.BlockReplies)
+	}
+}
+
+// --- ObserveStage image accumulation (regression for mid-loop image loss) ---
+//
+// These tests cover the bug where LLM emits an image_generation_call alongside
+// a function_call in iter N, then responds text-only in iter N+1. Without
+// accumulation in Observe, FinalizeStage would only see LastResponse.Images
+// (which is empty at iter N+1) and drop the iter-N image.
+
+// Case 1: single iteration with image only → accumulated.
+func TestObserveStage_ImageAccumulation_SingleIterImageOnly(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "imgA"},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1", got)
+	}
+	if state.Observe.AssistantImages[0].Data != "imgA" {
+		t.Errorf("image data = %q, want %q", state.Observe.AssistantImages[0].Data, "imgA")
+	}
+	// Source response.Images must be cleared to prevent double-counting on re-exec.
+	if state.Think.LastResponse.Images != nil {
+		t.Error("LastResponse.Images must be cleared after draining")
+	}
+}
+
+// Case 2: image + tool_call in same iter → image accumulated, tool_call flows through think.
+func TestObserveStage_ImageAccumulation_ImagePlusToolCall(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls:    []providers.ToolCall{{ID: "1", Name: "search"}},
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "imgMid"},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1 (image must survive tool_calls path)", got)
+	}
+}
+
+// Case 3: mid-loop image in iter 1 + text-only iter 2 → image from iter 1 retained.
+//
+// This is the regression scenario that motivated the accumulator. Without the fix
+// FinalizeStage reads LastResponse (iter 2) and drops iter-1 image.
+func TestObserveStage_ImageAccumulation_MidLoopImagePreservedAcrossIterations(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+
+	// Iter 1: image + tool call.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls:    []providers.ToolCall{{ID: "1", Name: "search"}},
+		Images:       []providers.ImageContent{{MimeType: "image/png", Data: "iter1img"}},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	// Iter 2: text-only final response — no Images.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Content:      "Done.",
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1 (iter-1 image must survive)", got)
+	}
+	if state.Observe.AssistantImages[0].Data != "iter1img" {
+		t.Errorf("image data = %q, want %q", state.Observe.AssistantImages[0].Data, "iter1img")
+	}
+}
+
+// Case 4: multiple images emitted across multiple iterations → all retained in order.
+func TestObserveStage_ImageAccumulation_MultipleImagesAcrossIterations(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+
+	// Iter 1: two images + tool call.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "tool_calls",
+		ToolCalls:    []providers.ToolCall{{ID: "1", Name: "t"}},
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "A"},
+			{MimeType: "image/png", Data: "B"},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	// Iter 2: one image standalone.
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Images:       []providers.ImageContent{{MimeType: "image/png", Data: "C"}},
+	}
+	_ = stage.Execute(context.Background(), state)
+
+	if got := len(state.Observe.AssistantImages); got != 3 {
+		t.Fatalf("AssistantImages len = %d, want 3", got)
+	}
+	for i, want := range []string{"A", "B", "C"} {
+		if state.Observe.AssistantImages[i].Data != want {
+			t.Errorf("image[%d] = %q, want %q", i, state.Observe.AssistantImages[i].Data, want)
+		}
+	}
+}
+
+// Case 5: partial frames must be filtered out — only final (non-partial) images accumulate.
+func TestObserveStage_ImageAccumulation_PartialFramesFiltered(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		FinishReason: "stop",
+		Images: []providers.ImageContent{
+			{MimeType: "image/png", Data: "partial1", Partial: true},
+			{MimeType: "image/png", Data: "final1"},
+			{MimeType: "image/png", Data: "partial2", Partial: true},
+		},
+	}
+	_ = stage.Execute(context.Background(), state)
+	if got := len(state.Observe.AssistantImages); got != 1 {
+		t.Fatalf("AssistantImages len = %d, want 1 (partials filtered)", got)
+	}
+	if state.Observe.AssistantImages[0].Data != "final1" {
+		t.Errorf("image data = %q, want %q", state.Observe.AssistantImages[0].Data, "final1")
+	}
+}
+
+// Case 6: nil response → no panic, accumulator unchanged.
+func TestObserveStage_ImageAccumulation_NilResponseSafe(t *testing.T) {
+	t.Parallel()
+	stage := NewObserveStage(&PipelineDeps{})
+	state := defaultState()
+	state.Think.LastResponse = nil
+	_ = stage.Execute(context.Background(), state)
+	if state.Observe.AssistantImages != nil {
+		t.Errorf("AssistantImages = %v, want nil", state.Observe.AssistantImages)
+	}
+}
+
+// --- CheckpointStage tests ---
+
+func TestCheckpointStage_SkipsIteration0(t *testing.T) {
+	t.Parallel()
+	flushCalled := false
+	deps := &PipelineDeps{
+		Config: PipelineConfig{CheckpointInterval: 5},
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error {
+			flushCalled = true
+			return nil
+		},
+	}
+	stage := NewCheckpointStage(deps)
+	state := defaultState()
+	state.Iteration = 0
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "test"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if flushCalled {
+		t.Error("FlushMessages should not be called at iteration 0")
+	}
+}
+
+func TestCheckpointStage_FlushesAtInterval(t *testing.T) {
+	t.Parallel()
+	var flushedMsgs []providers.Message
+	deps := &PipelineDeps{
+		Config: PipelineConfig{CheckpointInterval: 5},
+		FlushMessages: func(_ context.Context, _ string, msgs []providers.Message) error {
+			flushedMsgs = msgs
+			return nil
+		},
+	}
+	stage := NewCheckpointStage(deps)
+	state := defaultState()
+	state.Iteration = 5 // 5 % 5 == 0 → flush
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "checkpoint-msg"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(flushedMsgs) != 1 {
+		t.Fatalf("flushed %d messages, want 1", len(flushedMsgs))
+	}
+	if flushedMsgs[0].Content != "checkpoint-msg" {
+		t.Errorf("flushed[0].Content = %q", flushedMsgs[0].Content)
+	}
+	if state.Compact.CheckpointFlushedMsgs != 1 {
+		t.Errorf("CheckpointFlushedMsgs = %d, want 1", state.Compact.CheckpointFlushedMsgs)
+	}
+}
+
+func TestCheckpointStage_SkipsTransientMessagesWhenPersisting(t *testing.T) {
+	t.Parallel()
+	var flushedMsgs []providers.Message
+	deps := &PipelineDeps{
+		Config: PipelineConfig{CheckpointInterval: 5},
+		FlushMessages: func(_ context.Context, _ string, msgs []providers.Message) error {
+			flushedMsgs = msgs
+			return nil
+		},
+	}
+	stage := NewCheckpointStage(deps)
+	state := defaultState()
+	state.Iteration = 5
+	state.Messages.AppendPending(providers.Message{Role: "assistant", Content: "draft", Transient: true})
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "follow-up"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(flushedMsgs) != 1 {
+		t.Fatalf("flushed %d messages, want 1", len(flushedMsgs))
+	}
+	if flushedMsgs[0].Content != "follow-up" {
+		t.Fatalf("flushed[0].Content = %q, want follow-up", flushedMsgs[0].Content)
+	}
+	if state.Compact.CheckpointFlushedMsgs != 1 {
+		t.Fatalf("CheckpointFlushedMsgs = %d, want 1", state.Compact.CheckpointFlushedMsgs)
+	}
+}
+
+func TestCheckpointStage_NonFatalOnFlushError(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{CheckpointInterval: 5},
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error {
+			return errors.New("db unavailable")
+		},
+	}
+	stage := NewCheckpointStage(deps)
+	state := defaultState()
+	state.Iteration = 5
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "msg"})
+
+	err := stage.Execute(context.Background(), state)
+	// error must be swallowed (non-fatal)
+	if err != nil {
+		t.Errorf("Execute() should swallow flush error, got: %v", err)
+	}
+}
+
+func TestCheckpointStage_DefaultInterval5(t *testing.T) {
+	t.Parallel()
+	flushCalled := false
+	deps := &PipelineDeps{
+		// CheckpointInterval = 0 → defaults to 5 internally
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error {
+			flushCalled = true
+			return nil
+		},
+	}
+	stage := NewCheckpointStage(deps)
+	state := defaultState()
+	state.Iteration = 5
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "msg"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !flushCalled {
+		t.Error("FlushMessages should be called at iteration 5 with default interval")
+	}
+}
+
+func TestCheckpointStage_SkipsNonIntervalIteration(t *testing.T) {
+	t.Parallel()
+	flushCalled := false
+	deps := &PipelineDeps{
+		Config: PipelineConfig{CheckpointInterval: 5},
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error {
+			flushCalled = true
+			return nil
+		},
+	}
+	stage := NewCheckpointStage(deps)
+	state := defaultState()
+	state.Iteration = 3 // not divisible by 5
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "msg"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if flushCalled {
+		t.Error("FlushMessages should not be called at non-interval iteration")
+	}
+}
+
+// --- FinalizeStage tests ---
+
+func TestFinalizeStage_SanitizesContent(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		SanitizeContent: func(content string) string {
+			return "sanitized:" + content
+		},
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error { return nil },
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Observe.FinalContent = "raw content"
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.FinalContent != "sanitized:raw content" {
+		t.Errorf("FinalContent = %q, want sanitized:raw content", state.Observe.FinalContent)
+	}
+}
+
+func TestFinalizeStage_SuppressesSilentReplyAfterFlush(t *testing.T) {
+	t.Parallel()
+	finalContent := "This is directed at Bảo Ly Content, not me. I should stay silent.NO_REPLY"
+	var flushed []providers.Message
+	deps := &PipelineDeps{
+		IsSilentReply: func(content string) bool {
+			return content == finalContent
+		},
+		FlushMessages: func(_ context.Context, _ string, messages []providers.Message) error {
+			flushed = append(flushed, messages...)
+			return nil
+		},
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Observe.FinalContent = finalContent
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Observe.FinalContent != "" {
+		t.Fatalf("FinalContent = %q, want empty after silent reply suppression", state.Observe.FinalContent)
+	}
+	if len(flushed) == 0 || flushed[len(flushed)-1].Content != finalContent {
+		t.Fatalf("flushed final content = %#v, want original silent reply persisted before suppression", flushed)
+	}
+}
+
+func TestFinalizeStage_DeduplicatesMediaByPath(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Tool.MediaResults = []MediaResult{
+		{Path: "/tmp/a.png", ContentType: "image/png"},
+		{Path: "/tmp/b.png", ContentType: "image/png"},
+		{Path: "/tmp/a.png", ContentType: "image/png"}, // duplicate
+	}
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(state.Tool.MediaResults) != 2 {
+		t.Errorf("MediaResults len = %d after dedup, want 2", len(state.Tool.MediaResults))
+	}
+}
+
+// TestFinalizeStage_PersistsFromObserveAccumulator verifies that FinalizeStage
+// sources assistant images from state.Observe.AssistantImages, NOT from
+// LastResponse.Images. This guards against the regression where a mid-loop
+// image_generation_call is lost when the final iteration responds text-only.
+func TestFinalizeStage_PersistsFromObserveAccumulator(t *testing.T) {
+	t.Parallel()
+	var persistedImages []providers.ImageContent
+	deps := &PipelineDeps{
+		PersistAssistantImages: func(msg *providers.Message, _ string) {
+			// Capture what was handed to the persist callback.
+			persistedImages = append([]providers.ImageContent(nil), msg.Images...)
+			// Simulate hash→MediaRef mapping.
+			for range msg.Images {
+				msg.MediaRefs = append(msg.MediaRefs, providers.MediaRef{
+					Kind: "image", MimeType: "image/png", Path: "/tmp/img.png",
+				})
+			}
+			msg.Images = nil
+		},
+		FlushMessages: func(_ context.Context, _ string, _ []providers.Message) error { return nil },
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+
+	// Observe has accumulated an image from an earlier iteration.
+	state.Observe.AssistantImages = []providers.ImageContent{
+		{MimeType: "image/png", Data: "iterMidImage"},
+	}
+	// LastResponse is the final iteration — text-only, no Images.
+	state.Think.LastResponse = &providers.ChatResponse{FinishReason: "stop", Content: "Done."}
+	state.Observe.FinalContent = "Done."
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(persistedImages) != 1 {
+		t.Fatalf("persisted images len = %d, want 1 (accumulator-sourced image must be persisted)", len(persistedImages))
+	}
+	if persistedImages[0].Data != "iterMidImage" {
+		t.Errorf("persisted image data = %q, want %q", persistedImages[0].Data, "iterMidImage")
+	}
+	// Accumulator must be drained.
+	if state.Observe.AssistantImages != nil {
+		t.Errorf("AssistantImages = %v, want nil after drain", state.Observe.AssistantImages)
+	}
+}
+
+// TestFinalizeStage_NoPersistWhenAccumulatorEmpty verifies no-op when no images
+// were emitted across any iteration. Prevents regression where a non-nil
+// LastResponse with empty Images would still call PersistAssistantImages.
+func TestFinalizeStage_NoPersistWhenAccumulatorEmpty(t *testing.T) {
+	t.Parallel()
+	persistCalled := false
+	deps := &PipelineDeps{
+		PersistAssistantImages: func(_ *providers.Message, _ string) { persistCalled = true },
+		FlushMessages:          func(_ context.Context, _ string, _ []providers.Message) error { return nil },
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{FinishReason: "stop", Content: "hi"}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if persistCalled {
+		t.Error("PersistAssistantImages must not be called when accumulator is empty")
+	}
+}
+
+func TestFinalizeStage_PopulatesFileSizes(t *testing.T) {
+	t.Parallel()
+	// create a real temp file
+	f, err := os.CreateTemp("", "finalize-test-*.bin")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+
+	content := []byte("hello world")
+	if _, err := f.Write(content); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	f.Close()
+
+	deps := &PipelineDeps{}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Tool.MediaResults = []MediaResult{
+		{Path: f.Name(), ContentType: "application/octet-stream", Size: 0},
+	}
+
+	err = stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Tool.MediaResults[0].Size != int64(len(content)) {
+		t.Errorf("Size = %d, want %d", state.Tool.MediaResults[0].Size, len(content))
+	}
+}
+
+func TestFinalizeStage_PopulatesFileSizes_SkipsNonexistent(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Tool.MediaResults = []MediaResult{
+		{Path: "/nonexistent/path/file.png", ContentType: "image/png", Size: 0},
+	}
+
+	// should not error out on missing file
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Tool.MediaResults[0].Size != 0 {
+		t.Errorf("Size = %d for nonexistent file, want 0", state.Tool.MediaResults[0].Size)
+	}
+}
+
+// --- ContextStage tests ---
+
+func TestContextStage_AppendsHookAdditionalContextToSystemPromptInput(t *testing.T) {
+	t.Parallel()
+	var capturedExtra string
+	deps := &PipelineDeps{
+		Hooks: toolStageHookDispatcher{fire: func(_ context.Context, ev hooks.Event) (hooks.FireResult, error) {
+			if ev.HookEvent == hooks.EventUserPromptSubmit {
+				return hooks.FireResult{Decision: hooks.DecisionAllow, AdditionalContext: "mandatory workflow"}, nil
+			}
+			return hooks.FireResult{Decision: hooks.DecisionAllow}, nil
+		}},
+		BuildMessages: func(_ context.Context, input *RunInput, _ []providers.Message, _ string) ([]providers.Message, error) {
+			capturedExtra = input.ExtraSystemPrompt
+			return []providers.Message{{Role: "system", Content: input.ExtraSystemPrompt}}, nil
+		},
+	}
+	state := defaultState()
+	state.Input.ExtraSystemPrompt = "existing context"
+	stage := NewContextStage(deps)
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if capturedExtra != "existing context\n\nmandatory workflow" {
+		t.Fatalf("extra system prompt=%q", capturedExtra)
+	}
+}
+
+func TestContextStage_ResolveWorkspace(t *testing.T) {
+	t.Parallel()
+	wantWS := &workspace.WorkspaceContext{ActivePath: "/resolved"}
+	deps := &PipelineDeps{
+		ResolveWorkspace: func(_ context.Context, _ *RunInput) (*workspace.WorkspaceContext, error) {
+			return wantWS, nil
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Workspace != wantWS {
+		t.Errorf("Workspace = %v, want %v", state.Workspace, wantWS)
+	}
+}
+
+func TestContextStage_ResolveWorkspaceError(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ResolveWorkspace: func(_ context.Context, _ *RunInput) (*workspace.WorkspaceContext, error) {
+			return nil, errors.New("workspace not found")
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error from ResolveWorkspace, got nil")
+	}
+}
+
+func TestContextStage_LoadContextFiles(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		LoadContextFiles: func(_ context.Context, _ string) ([]bootstrap.ContextFile, bool) {
+			return []bootstrap.ContextFile{
+				{Path: "SOUL.md", Content: "soul content"},
+			}, true
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(state.Context.ContextFiles) != 1 {
+		t.Fatalf("ContextFiles len = %d, want 1", len(state.Context.ContextFiles))
+	}
+	if !state.Context.HadBootstrap {
+		t.Error("HadBootstrap should be true")
+	}
+}
+
+func TestContextStage_BuildMessages(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		BuildMessages: func(_ context.Context, _ *RunInput, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return []providers.Message{
+				{Role: "system", Content: "system prompt"},
+				{Role: "user", Content: "history msg"},
+			}, nil
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	sys := state.Messages.System()
+	if sys.Content != "system prompt" {
+		t.Errorf("System content = %q, want system prompt", sys.Content)
+	}
+	hist := state.Messages.History()
+	if len(hist) != 1 || hist[0].Content != "history msg" {
+		t.Errorf("History = %v, want 1 history msg", hist)
+	}
+}
+
+func TestContextStage_BuildMessages_ErrorPropagates(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		BuildMessages: func(_ context.Context, _ *RunInput, _ []providers.Message, _ string) ([]providers.Message, error) {
+			return nil, errors.New("build failed")
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error from BuildMessages, got nil")
+	}
+}
+
+func TestContextStage_ComputeOverhead(t *testing.T) {
+	t.Parallel()
+	// TokenCounter returns 50 tokens per message; system msg = 1 msg → 50
+	deps := &PipelineDeps{
+		TokenCounter: &mockTokenCounter{countPerMessage: 50},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+	// put a system message so the counter has something to count
+	state.Messages.SetSystem(providers.Message{Role: "system", Content: "sys"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if state.Context.OverheadTokens != 50 {
+		t.Errorf("OverheadTokens = %d, want 50", state.Context.OverheadTokens)
+	}
+}
+
+func TestContextStage_EnrichMedia(t *testing.T) {
+	t.Parallel()
+	called := false
+	deps := &PipelineDeps{
+		EnrichMedia: func(_ context.Context, _ *RunState) error {
+			called = true
+			return nil
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !called {
+		t.Error("EnrichMedia callback was not called")
+	}
+}
+
+func TestContextStage_EnrichMedia_ErrorPropagates(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		EnrichMedia: func(_ context.Context, _ *RunState) error {
+			return errors.New("media enrichment failed")
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected error from EnrichMedia, got nil")
+	}
+}
+
+func TestContextStage_InjectReminders(t *testing.T) {
+	t.Parallel()
+	reminder := providers.Message{Role: "user", Content: "reminder msg"}
+	deps := &PipelineDeps{
+		InjectReminders: func(_ context.Context, _ *RunInput, msgs []providers.Message) []providers.Message {
+			return append(msgs, reminder)
+		},
+	}
+	stage := NewContextStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{
+		{Role: "user", Content: "existing"},
+	})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	hist := state.Messages.History()
+	if len(hist) != 2 {
+		t.Fatalf("History len = %d, want 2 (existing + reminder)", len(hist))
+	}
+	if hist[1].Content != "reminder msg" {
+		t.Errorf("hist[1].Content = %q, want reminder msg", hist[1].Content)
+	}
+}
+
+func TestContextStage_AllNilCallbacks(t *testing.T) {
+	t.Parallel()
+	// No callbacks set — should not panic
+	deps := &PipelineDeps{}
+	stage := NewContextStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+}
+
+// --- MemoryFlushStage tests ---
+
+func TestMemoryFlushStage_CallsCallback(t *testing.T) {
+	t.Parallel()
+	called := false
+	deps := &PipelineDeps{
+		RunMemoryFlush: func(_ context.Context, _ *RunState) error {
+			called = true
+			return nil
+		},
+	}
+	stage := NewMemoryFlushStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !called {
+		t.Error("RunMemoryFlush was not called")
+	}
+}
+
+func TestMemoryFlushStage_NilCallback(t *testing.T) {
+	t.Parallel()
+	// RunMemoryFlush is nil — should not panic and return nil
+	deps := &PipelineDeps{}
+	stage := NewMemoryFlushStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+}
+
+func TestMemoryFlushStage_ErrorNonFatal(t *testing.T) {
+	t.Parallel()
+	// Callback returns an error — MemoryFlushStage must swallow it (non-fatal).
+	deps := &PipelineDeps{
+		RunMemoryFlush: func(_ context.Context, _ *RunState) error {
+			return errors.New("flush db unavailable")
+		},
+	}
+	stage := NewMemoryFlushStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	// must NOT propagate the error
+	if err != nil {
+		t.Errorf("Execute() should swallow flush error, got: %v", err)
+	}
+}
+
+func TestFinalizeStage_FlushesRemainingPending(t *testing.T) {
+	t.Parallel()
+	var flushedMsgs []providers.Message
+	deps := &PipelineDeps{
+		FlushMessages: func(_ context.Context, _ string, msgs []providers.Message) error {
+			flushedMsgs = append(flushedMsgs, msgs...)
+			return nil
+		},
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Observe.FinalContent = "hello"
+	state.Messages.AppendPending(providers.Message{Role: "assistant", Content: "tool result"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	// Expect 2 flushed: the pre-existing pending + the final assistant message built by FinalizeStage
+	if len(flushedMsgs) != 2 {
+		t.Fatalf("flushed %d messages, want 2", len(flushedMsgs))
+	}
+	if flushedMsgs[0].Content != "tool result" {
+		t.Errorf("flushed[0].Content = %q, want tool result", flushedMsgs[0].Content)
+	}
+	if flushedMsgs[1].Role != "assistant" || flushedMsgs[1].Content != "hello" {
+		t.Errorf("flushed[1] = %q/%q, want assistant/hello", flushedMsgs[1].Role, flushedMsgs[1].Content)
+	}
+}
+
+func TestFinalizeStage_SkipsTransientMessagesWhenPersisting(t *testing.T) {
+	t.Parallel()
+	var flushedMsgs []providers.Message
+	deps := &PipelineDeps{
+		FlushMessages: func(_ context.Context, _ string, msgs []providers.Message) error {
+			flushedMsgs = append(flushedMsgs, msgs...)
+			return nil
+		},
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Observe.FinalContent = "final answer"
+	state.Messages.AppendPending(providers.Message{Role: "assistant", Content: "draft answer", Transient: true})
+	state.Messages.AppendPending(providers.Message{Role: "user", Content: "follow-up"})
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if len(flushedMsgs) != 2 {
+		t.Fatalf("flushed %d messages, want follow-up + final answer", len(flushedMsgs))
+	}
+	if flushedMsgs[0].Content != "follow-up" {
+		t.Fatalf("flushed[0].Content = %q, want follow-up", flushedMsgs[0].Content)
+	}
+	if flushedMsgs[1].Content != "final answer" {
+		t.Fatalf("flushed[1].Content = %q, want final answer", flushedMsgs[1].Content)
+	}
+}
+
+func TestFinalizeStage_CallsBootstrapCleanup_WhenHadBootstrap(t *testing.T) {
+	t.Parallel()
+	cleanupCalled := false
+	deps := &PipelineDeps{
+		BootstrapCleanup: func(_ context.Context, _ *RunState) error {
+			cleanupCalled = true
+			return nil
+		},
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Context.HadBootstrap = true
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !cleanupCalled {
+		t.Error("BootstrapCleanup should be called when HadBootstrap=true")
+	}
+}
+
+func TestFinalizeStage_SkipsBootstrapCleanup_WhenNoBootstrap(t *testing.T) {
+	t.Parallel()
+	cleanupCalled := false
+	deps := &PipelineDeps{
+		BootstrapCleanup: func(_ context.Context, _ *RunState) error {
+			cleanupCalled = true
+			return nil
+		},
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Context.HadBootstrap = false
+
+	_ = stage.Execute(context.Background(), state)
+	if cleanupCalled {
+		t.Error("BootstrapCleanup should NOT be called when HadBootstrap=false")
+	}
+}
+
+func TestFinalizeStage_PopulatesFileSizes_SkipsAlreadySet(t *testing.T) {
+	t.Parallel()
+	// create a real temp file to make sure stat would work
+	f, err := os.CreateTemp("", "finalize-size-set-*.bin")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer os.Remove(f.Name())
+	f.Write([]byte("data"))
+	f.Close()
+
+	deps := &PipelineDeps{}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	// Size already set — should not be overwritten
+	state.Tool.MediaResults = []MediaResult{
+		{Path: f.Name(), ContentType: "image/png", Size: 999},
+	}
+
+	err = stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	// Size=999 was already set, stat should not overwrite
+	if state.Tool.MediaResults[0].Size != 999 {
+		t.Errorf("Size = %d, want 999 (pre-set)", state.Tool.MediaResults[0].Size)
+	}
+}
+
+func TestFinalizeStage_MaybeSummarize_Called(t *testing.T) {
+	t.Parallel()
+	summarizeCalled := false
+	deps := &PipelineDeps{
+		MaybeSummarize: func(_ context.Context, sessionKey string, _ bool) {
+			if sessionKey == "sess-1" {
+				summarizeCalled = true
+			}
+		},
+	}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+
+	_ = stage.Execute(context.Background(), state)
+	if !summarizeCalled {
+		t.Error("MaybeSummarize should be called in finalize")
+	}
+}
+
+// --- integration-style: multiple stages chained ---
+
+func TestStagesChained_ThinkThenObserve_FinalContentSet(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "chain result",
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	think := NewThinkStage(deps)
+	observe := NewObserveStage(deps)
+	state := defaultState()
+
+	_ = think.Execute(context.Background(), state)
+	_ = observe.Execute(context.Background(), state)
+
+	if state.Observe.FinalContent != "chain result" {
+		t.Errorf("FinalContent = %q, want chain result", state.Observe.FinalContent)
+	}
+}
+
+func TestFinalizeStage_DeduplicatesMedia_WithRealFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "media.png")
+	if err := os.WriteFile(path, []byte("imgdata"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	deps := &PipelineDeps{}
+	stage := NewFinalizeStage(deps)
+	state := defaultState()
+	state.Tool.MediaResults = []MediaResult{
+		{Path: path, ContentType: "image/png"},
+		{Path: path, ContentType: "image/png"}, // dup
+	}
+
+	_ = stage.Execute(context.Background(), state)
+
+	if len(state.Tool.MediaResults) != 1 {
+		t.Errorf("MediaResults = %d after dedup, want 1", len(state.Tool.MediaResults))
+	}
+	if state.Tool.MediaResults[0].Size == 0 {
+		t.Error("Size should be populated from real file")
+	}
+}
+
+// ─── parseTTL (Phase 06) ─────────────────────────────────────────────────
+
+func TestParseTTL_ValidInputs(t *testing.T) {
+	cases := []struct {
+		in   string
+		want time.Duration
+	}{
+		{"", 5 * time.Minute},
+		{"5m", 5 * time.Minute},
+		{"30s", 30 * time.Second},
+		{"1h30m", 90 * time.Minute},
+		{"bogus", 5 * time.Minute}, // invalid → fallback
+		{"-1m", 5 * time.Minute},   // negative → fallback
+	}
+	for _, tc := range cases {
+		got := parseTTL(tc.in)
+		if got != tc.want {
+			t.Errorf("parseTTL(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// ─── Cache-TTL gate (Phase 06) ───────────────────────────────────────────
+
+// makePruneHistory builds history that exceeds the 70% soft threshold.
+// budget = 10000-0-1000=9000, soft=6300. 100 msgs * 100 = 10000 > 6300.
+func makePruneHistory(n int) []providers.Message {
+	h := make([]providers.Message, n)
+	for i := range h {
+		h[i] = providers.Message{Role: "tool", ToolCallID: "c1", Content: "x"}
+	}
+	return h
+}
+
+func TestPruneStage_CacheTtlGate_SkipsWithinTTL(t *testing.T) {
+	t.Parallel()
+	// cache live (1 min ago), history above soft threshold but below hard budget.
+	var pruneCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			atomic.AddInt32(&pruneCalled, 1)
+			return msgs, PruneStats{}
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: true} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Now().Add(-1 * time.Minute) }, // 1m ago, within 5m TTL
+		MarkCacheTouched: func(string) {},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(50)) // 50*100=5000 tokens; soft=6300, hard=9000; below hard
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&pruneCalled) != 0 {
+		t.Error("prune should be skipped when cache is live and below hard budget")
+	}
+}
+
+func TestPruneStage_CacheTtlGate_PrunesAfterTTL(t *testing.T) {
+	t.Parallel()
+	// touch = 6 minutes ago → TTL expired → gate allows prune
+	var pruneCalled int32
+	var touchCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			atomic.AddInt32(&pruneCalled, 1)
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: true} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Now().Add(-6 * time.Minute) }, // 6m ago, expired
+		MarkCacheTouched: func(string) { atomic.AddInt32(&touchCalled, 1) },
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(100)) // 100*100=10000; above soft threshold
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&pruneCalled) == 0 {
+		t.Error("prune should fire when TTL expired")
+	}
+	if atomic.LoadInt32(&touchCalled) == 0 {
+		t.Error("MarkCacheTouched should be called after mutation")
+	}
+}
+
+func TestPruneStage_CacheTtlGate_NoCacheSupport_Prunes(t *testing.T) {
+	t.Parallel()
+	// CacheControl=false → gate is no-op → normal prune runs
+	var pruneCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			atomic.AddInt32(&pruneCalled, 1)
+			return msgs[:1], PruneStats{ResultsTrimmed: 1}
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: false} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Now().Add(-1 * time.Minute) },
+		MarkCacheTouched: func(string) {},
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(100))
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&pruneCalled) == 0 {
+		t.Error("prune should fire when provider has no cache support")
+	}
+}
+
+func TestPruneStage_CacheTtlGate_MarkTouchedOnlyOnMutation(t *testing.T) {
+	t.Parallel()
+	// PruneMessages returns zero stats (no mutation) → MarkCacheTouched must NOT be called.
+	var touchCalled int32
+	deps := &PipelineDeps{
+		Config:       PipelineConfig{ContextWindow: 10000, MaxTokens: 1000},
+		TokenCounter: &mockTokenCounter{countPerMessage: 100},
+		PruneMessages: func(msgs []providers.Message, _ int) ([]providers.Message, PruneStats) {
+			return msgs, PruneStats{} // no mutation
+		},
+		GetProviderCaps:  func() providers.ProviderCapabilities { return providers.ProviderCapabilities{CacheControl: true} },
+		GetPruningConfig: func() *config.ContextPruningConfig { return &config.ContextPruningConfig{Mode: "cache-ttl", TTL: "5m"} },
+		GetCacheTouch:    func(string) time.Time { return time.Time{} }, // cold
+		MarkCacheTouched: func(string) { atomic.AddInt32(&touchCalled, 1) },
+	}
+	stage := NewPruneStage(deps, nil)
+	state := defaultState()
+	state.Messages.SetHistory(makePruneHistory(100))
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if atomic.LoadInt32(&touchCalled) != 0 {
+		t.Error("MarkCacheTouched should NOT be called when prune returns no mutation")
+	}
+}
+
+func TestThinkStage_AllowedTools_MixedFunctionAndNativeTools_NoPanic(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		Config: PipelineConfig{MaxIterations: 10, MaxTokens: 1000},
+		BuildFilteredTools: func(state *RunState) ([]providers.ToolDefinition, error) {
+			return []providers.ToolDefinition{
+				{
+					Type: "function",
+					Function: &providers.ToolFunctionSchema{
+						Name: "read_file",
+					},
+				},
+				{
+					Type:     "image_generation",
+					Function: nil,
+				},
+			}, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			return &providers.ChatResponse{
+				Content:      "ok",
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+
+	err := stage.Execute(context.Background(), state)
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	if state.Tool.AllowedTools == nil {
+		t.Fatal("AllowedTools should not be nil")
+	}
+	if !state.Tool.AllowedTools["read_file"] {
+		t.Error("expected read_file in AllowedTools")
+	}
+	if state.Tool.AllowedTools[""] {
+		t.Error("AllowedTools should not contain empty key for native tools")
+	}
+	if len(state.Tool.AllowedTools) != 1 {
+		t.Errorf("AllowedTools len = %d, want 1", len(state.Tool.AllowedTools))
+	}
+}
+
+// --- Issue #1177: non-tool messages deferred until all tool results emitted ---
+
+func TestToolStage_Sequential_DefersNonToolMessages(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, tc providers.ToolCall) ([]providers.Message, error) {
+			msgs := []providers.Message{
+				{Role: "tool", Content: "result:" + tc.Name, ToolCallID: tc.ID},
+			}
+			// Simulate a warning injected after first tool
+			if tc.Name == "tool_a" {
+				msgs = append(msgs, providers.Message{Role: "user", Content: "loop warning: read-only streak"})
+			}
+			return msgs, nil
+		},
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "tool_a"},
+			{ID: "2", Name: "tool_b"},
+			{ID: "3", Name: "tool_c"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	pending := state.Messages.Pending()
+	// Expect: 3 tool results first, then 1 user warning at the end
+	if len(pending) != 4 {
+		t.Fatalf("pending len = %d, want 4", len(pending))
+	}
+	// First 3 must be tool role
+	for i := 0; i < 3; i++ {
+		if pending[i].Role != "tool" {
+			t.Errorf("pending[%d].Role = %q, want tool", i, pending[i].Role)
+		}
+	}
+	// Last must be the deferred user warning
+	if pending[3].Role != "user" {
+		t.Errorf("pending[3].Role = %q, want user", pending[3].Role)
+	}
+	if !strings.Contains(pending[3].Content, "loop warning") {
+		t.Errorf("pending[3].Content = %q, want loop warning", pending[3].Content)
+	}
+}
+
+func TestToolStage_Parallel_DefersNonToolMessages(t *testing.T) {
+	t.Parallel()
+	deps := &PipelineDeps{
+		ExecuteToolCall: func(_ context.Context, _ *RunState, _ providers.ToolCall) ([]providers.Message, error) {
+			t.Fatal("ExecuteToolCall must NOT be called when parallel path is active")
+			return nil, nil
+		},
+		ExecuteToolRaw: func(_ context.Context, tc providers.ToolCall) (providers.Message, any, error) {
+			return providers.Message{Role: "tool", Content: "raw:" + tc.Name, ToolCallID: tc.ID}, nil, nil
+		},
+		ProcessToolResult: func(_ context.Context, _ *RunState, tc providers.ToolCall, rawMsg providers.Message, _ any) []providers.Message {
+			msgs := []providers.Message{rawMsg}
+			// Inject a warning after processing tool_b
+			if tc.Name == "tool_b" {
+				msgs = append(msgs, providers.Message{Role: "user", Content: "nudge: consider alternatives"})
+			}
+			return msgs
+		},
+		ParallelEligibleToolCall: func(providers.ToolCall) bool { return true },
+	}
+	stage := NewToolStage(deps)
+	state := defaultState()
+	state.Think.LastResponse = &providers.ChatResponse{
+		ToolCalls: []providers.ToolCall{
+			{ID: "1", Name: "tool_a"},
+			{ID: "2", Name: "tool_b"},
+			{ID: "3", Name: "tool_c"},
+		},
+	}
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	pending := state.Messages.Pending()
+	// Expect: 3 tool results first, then 1 user nudge at the end
+	if len(pending) != 4 {
+		t.Fatalf("pending len = %d, want 4", len(pending))
+	}
+	for i := 0; i < 3; i++ {
+		if pending[i].Role != "tool" {
+			t.Errorf("pending[%d].Role = %q, want tool", i, pending[i].Role)
+		}
+	}
+	if pending[3].Role != "user" {
+		t.Errorf("pending[3].Role = %q, want user", pending[3].Role)
+	}
+	if !strings.Contains(pending[3].Content, "nudge") {
+		t.Errorf("pending[3].Content = %q, want nudge", pending[3].Content)
+	}
+}
+
+func TestThinkStage_FinalRequestGuard_CompactsBeforeCallLLM(t *testing.T) {
+	t.Parallel()
+	compacted := false
+	called := false
+
+	deps := &PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config:       PipelineConfig{ContextWindow: 100, MaxTokens: 10, Compaction: &config.CompactionConfig{MaxRequestShare: 0.85}},
+		BuildFilteredTools: func(_ *RunState) ([]providers.ToolDefinition, error) {
+			return []providers.ToolDefinition{{
+				Type: "function",
+				Function: &providers.ToolFunctionSchema{
+					Name:        "large_tool",
+					Description: strings.Repeat("t", 50),
+					Parameters:  map[string]any{"type": "object"},
+				},
+			}}, nil
+		},
+		CompactMessages: func(_ context.Context, msgs []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			if len(msgs) != 1 || !strings.Contains(msgs[0].Content, "long-history") {
+				t.Fatalf("CompactMessages got history = %#v", msgs)
+			}
+			return []providers.Message{{Role: "user", Content: "short"}}, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, req providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			if len(req.Messages) == 0 || req.Messages[len(req.Messages)-1].Content != "short" {
+				t.Fatalf("CallLLM received un-compacted request messages = %#v", req.Messages)
+			}
+			return &providers.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: strings.Repeat("long-history", 10)}})
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if !compacted {
+		t.Fatal("expected final request guard to compact before CallLLM")
+	}
+	if !called {
+		t.Fatal("expected CallLLM after compaction")
+	}
+}
+
+type finalRequestBudgetCounter struct{}
+
+func (finalRequestBudgetCounter) Count(_ string, text string) int { return len(text) }
+func (finalRequestBudgetCounter) CountMessages(_ string, msgs []providers.Message) int {
+	total := 0
+	for _, msg := range msgs {
+		total += len(msg.Content)
+	}
+	return total
+}
+func (finalRequestBudgetCounter) CountToolSchemas(_ string, tools []providers.ToolDefinition) int {
+	total := 0
+	for _, tool := range tools {
+		if tool.Function != nil {
+			total += len(tool.Function.Name) + len(tool.Function.Description)
+		}
+	}
+	return total
+}
+func (finalRequestBudgetCounter) ModelContextWindow(_ string) int { return 100 }
+
+func TestThinkStage_FinalRequestGuard_AllowsRequestUnderLimit(t *testing.T) {
+	t.Parallel()
+	compacted := false
+	called := false
+
+	deps := &PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config:       PipelineConfig{ContextWindow: 100, MaxTokens: 10, Compaction: &config.CompactionConfig{MaxRequestShare: 0.85}},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			compacted = true
+			return nil, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			return &providers.ChatResponse{Content: "ok", FinishReason: "stop"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: "short"}})
+
+	if err := stage.Execute(context.Background(), state); err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+	if compacted {
+		t.Fatal("did not expect compaction for request under final context limit")
+	}
+	if !called {
+		t.Fatal("expected CallLLM for request under final context limit")
+	}
+}
+
+func TestThinkStage_FinalRequestGuard_AbortsWhenStillOverLimit(t *testing.T) {
+	t.Parallel()
+	called := false
+	compactCalls := 0
+
+	deps := &PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config:       PipelineConfig{ContextWindow: 100, MaxTokens: 10, Compaction: &config.CompactionConfig{MaxRequestShare: 0.85}},
+		CompactMessages: func(_ context.Context, _ []providers.Message, _ string) ([]providers.Message, error) {
+			compactCalls++
+			return []providers.Message{{Role: "user", Content: strings.Repeat("still-long", 20)}}, nil
+		},
+		CallLLM: func(_ context.Context, _ *RunState, _ providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			return &providers.ChatResponse{Content: "should not call", FinishReason: "stop"}, nil
+		},
+	}
+	stage := NewThinkStage(deps)
+	state := defaultState()
+	state.Messages.SetHistory([]providers.Message{{Role: "user", Content: strings.Repeat("long-history", 10)}})
+
+	err := stage.Execute(context.Background(), state)
+	if err == nil {
+		t.Fatal("expected final request context budget error")
+	}
+	if !strings.Contains(err.Error(), "final request context budget exceeded") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if compactCalls != 1 {
+		t.Fatalf("CompactMessages calls = %d, want 1", compactCalls)
+	}
+	if called {
+		t.Fatal("CallLLM must not run while final request remains over limit")
+	}
+}
+
+func TestFinalRequestEstimate_UsesAgentWindowBudgetMath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		window int
+		hard   int
+		target int
+	}{
+		{name: "200k", window: 200_000, hard: 191_808, target: 161_808},
+		{name: "128k", window: 128_000, hard: 119_808, target: 100_608},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deps := &PipelineDeps{
+				TokenCounter: finalRequestBudgetCounter{},
+				Config: PipelineConfig{
+					ContextWindow: tt.window,
+					MaxTokens:     8192,
+					Compaction:    &config.CompactionConfig{MaxRequestShare: 0.85},
+				},
+			}
+			stage := NewThinkStage(deps)
+			estimate, err := stage.finalRequestEstimate(defaultState(), providers.ChatRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if estimate.HardInputCapTokens != tt.hard || estimate.CompactTargetTokens != tt.target {
+				t.Fatalf("budget = hard %d target %d, want %d/%d", estimate.HardInputCapTokens, estimate.CompactTargetTokens, tt.hard, tt.target)
+			}
+		})
+	}
+}
+
+func TestThinkStage_FinalRequestGuard_RejectsUnresolvedWindow(t *testing.T) {
+	t.Parallel()
+	called := false
+	stage := NewThinkStage(&PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		CallLLM: func(context.Context, *RunState, providers.ChatRequest) (*providers.ChatResponse, error) {
+			called = true
+			return &providers.ChatResponse{}, nil
+		},
+	})
+	err := stage.Execute(context.Background(), defaultState())
+	if err == nil || !strings.Contains(err.Error(), "context_window_unresolved") {
+		t.Fatalf("Execute() error = %v, want context_window_unresolved", err)
+	}
+	if called {
+		t.Fatal("CallLLM must not run without a resolved context window")
+	}
+}
+
+// TestFinalRequestEstimate_OutputReserveIsAgentMaxTokens locks the agent-only
+// output reserve: the reserve equals the configured agent max_tokens exactly and
+// does NOT change with any provider/model reasoning transform. Model/provider
+// thinking bumps must never widen or narrow the pre-transport budget.
+func TestFinalRequestEstimate_OutputReserveIsAgentMaxTokens(t *testing.T) {
+	t.Parallel()
+	stage := NewThinkStage(&PipelineDeps{
+		TokenCounter: finalRequestBudgetCounter{},
+		Config: PipelineConfig{
+			ContextWindow: 200_000,
+			MaxTokens:     8192,
+			Compaction:    &config.CompactionConfig{MaxRequestShare: 0.85},
+		},
+	})
+
+	estimate, err := stage.finalRequestEstimate(defaultState(), stage.buildChatRequest(defaultState(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reserve == agent max_tokens (8192), independent of any reasoning transform.
+	if estimate.OutputReserveTokens != 8192 {
+		t.Fatalf("output reserve = %d, want 8192 (agent max_tokens)", estimate.OutputReserveTokens)
+	}
+	// Hard cap == window - agent max_tokens, exactly.
+	if estimate.HardInputCapTokens != 200_000-8192 {
+		t.Fatalf("hard cap = %d, want %d", estimate.HardInputCapTokens, 200_000-8192)
+	}
+}
+
+func TestInputContextTokens_CacheSemantics(t *testing.T) {
+	t.Parallel()
+	inclusive := providers.Usage{
+		PromptTokens: 100, CacheReadTokens: 80, CacheCreationTokens: 10,
+		PromptTokensIncludeCachedSegments: true,
+	}
+	if got := InputContextTokens(inclusive); got != 100 {
+		t.Fatalf("inclusive input = %d, want 100", got)
+	}
+	exclusive := inclusive
+	exclusive.PromptTokensIncludeCachedSegments = false
+	if got := InputContextTokens(exclusive); got != 190 {
+		t.Fatalf("exclusive input = %d, want 190", got)
+	}
+}
+
+func TestFinalContextActualLevel(t *testing.T) {
+	t.Parallel()
+	estimate := FinalRequestEstimate{InputTokens: 100, HardInputCapTokens: 120}
+	if level, reason := finalContextActualLevel(estimate, 100); level != slog.LevelDebug || reason != "" {
+		t.Fatalf("exact estimate = %v/%q, want debug/empty", level, reason)
+	}
+	if level, reason := finalContextActualLevel(estimate, 106); level != slog.LevelWarn || reason != "estimate_undercount" {
+		t.Fatalf("undercount = %v/%q, want warn/estimate_undercount", level, reason)
+	}
+	if level, reason := finalContextActualLevel(estimate, 121); level != slog.LevelWarn || reason != "hard_cap_exceeded" {
+		t.Fatalf("hard cap = %v/%q, want warn/hard_cap_exceeded", level, reason)
+	}
+}

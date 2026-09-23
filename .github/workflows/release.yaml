@@ -1,0 +1,312 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"   # stable only: v1.2.3 (not beta/rc)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v3.0.0). Leave empty to use latest tag on HEAD.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DOCKERHUB_IMAGE: digitop/goclaw
+
+jobs:
+  release:
+    # Fork safety: publishing is opt-in outside upstream (see docs/mission-control/RUNBOOK.md).
+    if: (github.repository == 'nextlevelbuilder/goclaw' || vars.GOCLAW_RELEASES_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.version != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version from tag
+        id: version
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if [[ -z "$TAG" || "$TAG" == "main" || "$TAG" == "dev" ]]; then
+            TAG=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
+          fi
+          if [[ -z "$TAG" ]]; then
+            echo "No tag found. Skipping release."
+            echo "version=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          echo "Releasing version: $VERSION (tag: $TAG)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: steps.version.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          gh release create "$TAG" \
+            --title "GoClaw $TAG" \
+            --generate-notes \
+            --latest \
+            2>/dev/null || echo "Release $TAG already exists, continuing..."
+
+  # Build cross-platform binaries and attach to release
+  build-binaries:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build web UI
+        run: |
+          corepack enable && corepack prepare pnpm@10.28.2 --activate
+          cd ui/web && pnpm install --frozen-lockfile && pnpm build && cd ../..
+          mkdir -p internal/webui/dist
+          cp -r ui/web/dist/* internal/webui/dist/
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: v${{ needs.release.outputs.version }}
+        run: |
+          CGO_ENABLED=0 go build -tags embedui \
+            -ldflags="-s -w -X github.com/nextlevelbuilder/goclaw/cmd.Version=${VERSION}" \
+            -o goclaw .
+          tar -czf "goclaw-${{ needs.release.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" goclaw migrations/ skills/
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "v${{ needs.release.outputs.version }}" \
+            "goclaw-${{ needs.release.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" \
+            --clobber
+
+  # Generate SHA256 checksums for all binary assets
+  checksums:
+    needs: [release, build-binaries]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download all binary assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "v${{ needs.release.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "goclaw-*.tar.gz" \
+            --dir assets
+
+      - name: Generate checksums
+        run: |
+          cd assets
+          sha256sum goclaw-*.tar.gz > CHECKSUMS.sha256
+          echo "Generated checksums:"
+          cat CHECKSUMS.sha256
+
+      - name: Upload checksums to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "v${{ needs.release.outputs.version }}" \
+            assets/CHECKSUMS.sha256 \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+  # Build Docker images per (variant × platform) on native runners (no QEMU).
+  # Each job pushes a digest-only image; the merge job combines them into a
+  # multi-arch manifest and pushes the final tags to both GHCR and Docker Hub.
+  # Variants: base (backend only), latest (+ web UI + Python), full (+ all skills).
+  # OTel and Tailscale variants are not built — users build from source if needed.
+  docker-build:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: base
+            suffix: "-base"
+            enable_embedui: "false"
+            enable_python: "false"
+            enable_full_skills: "false"
+            enable_media_probes: "false"
+          - variant: latest
+            suffix: ""
+            enable_embedui: "true"
+            enable_python: "true"
+            enable_full_skills: "false"
+            enable_media_probes: "true"
+          - variant: full
+            suffix: "-full"
+            enable_embedui: "true"
+            enable_python: "true"
+            enable_full_skills: "true"
+            enable_media_probes: "true"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
+          tags: |
+            type=raw,value=v${{ needs.release.outputs.version }},suffix=${{ matrix.suffix }}
+            type=raw,value=latest,enable=${{ matrix.suffix == '' }},suffix=
+            type=raw,value=${{ matrix.variant }},enable=${{ matrix.suffix != '' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ENABLE_OTEL=false
+            ENABLE_EMBEDUI=${{ matrix.enable_embedui }}
+            ENABLE_PYTHON=${{ matrix.enable_python }}
+            ENABLE_FULL_SKILLS=${{ matrix.enable_full_skills }}
+            ENABLE_MEDIA_PROBES=${{ matrix.enable_media_probes }}
+            VERSION=v${{ needs.release.outputs.version }}
+          cache-from: type=gha,scope=release-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.variant }}
+          provenance: false
+
+  # Build web UI Docker image.
+  docker-web-build:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}-web
+            ${{ env.DOCKERHUB_IMAGE }}-web
+          tags: |
+            type=raw,value=v${{ needs.release.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ui/web
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=release-web
+          cache-to: type=gha,mode=max,scope=release-web
+          provenance: false
+
+  # Notify Discord on new release (runs even if docker jobs fail)
+  notify-discord:
+    needs: [release, build-binaries, docker-build, docker-web-build]
+    if: always() && needs.release.outputs.released == 'true' && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send Discord notification
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          VERSION: v${{ needs.release.outputs.version }}
+        run: |
+          curl -fsSL -H "Content-Type: application/json" \
+            -d "{
+              \"embeds\": [{
+                \"title\": \"GoClaw ${VERSION} Released\",
+                \"url\": \"https://github.com/${{ github.repository }}/releases/tag/${VERSION}\",
+                \"color\": 5814783,
+                \"fields\": [
+                  {\"name\": \"Docker\", \"value\": \"\`docker pull digitop/goclaw:latest\`\", \"inline\": false},
+                  {\"name\": \"Install\", \"value\": \"\`curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | bash\`\", \"inline\": false}
+                ],
+                \"footer\": {\"text\": \"${{ github.repository }}\"},
+                \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+              }]
+            }" \
+            "$DISCORD_WEBHOOK_URL"

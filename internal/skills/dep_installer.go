@@ -1,0 +1,472 @@
+package skills
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
+// sharedLocker is the package-level PackageLocker injected by gateway wiring.
+// It serializes concurrent pip/npm install+update operations on the same package.
+// If nil (default), pip/npm branches run lock-free — backward-compatible for
+// tests and callers that don't wire a locker.
+var sharedLocker atomic.Pointer[PackageLocker]
+
+// SetSharedPackageLocker installs the package-level locker used by
+// InstallSingleDep for pip and npm operations. Wiring MUST call this before
+// the first install/update; otherwise pip/npm paths run lock-free.
+// GitHub installs lock independently via GitHubInstaller.Locker.
+func SetSharedPackageLocker(l *PackageLocker) { sharedLocker.Store(l) }
+
+// sharedPackageLocker returns the current shared PackageLocker, or nil if none
+// was installed via SetSharedPackageLocker.
+func sharedPackageLocker() *PackageLocker { return sharedLocker.Load() }
+
+// InstallTimeout is the wall-clock cap applied to a single package install.
+// Exported so HTTP handlers that bypass InstallSingleDep (e.g. the github:
+// fast path) can wrap their context with the same deadline.
+const InstallTimeout = 5 * time.Minute
+
+// pkgHelperSocket is the Unix socket path for the root-privileged pkg-helper.
+const pkgHelperSocket = "/tmp/pkg.sock"
+
+// pkgHelperBundledPath is where the Docker image copies the helper binary.
+// /app is not part of PATH, so direct-exec fallback must check it explicitly.
+const pkgHelperBundledPath = "/app/pkg-helper"
+
+// apkHelperCallFunc is the package-level hook for apkHelperCall, allowing tests
+// to inject a stub without starting a real Unix socket server. Production code
+// always uses the default value (apkHelperCall). Tests replace it per-case and
+// restore via t.Cleanup.
+var apkHelperCallFunc = apkHelperCall
+
+// InstallResult holds per-category install outcomes.
+type InstallResult struct {
+	System []string `json:"system,omitempty"`
+	Pip    []string `json:"pip,omitempty"`
+	Npm    []string `json:"npm,omitempty"`
+	GitHub []string `json:"github,omitempty"`
+	Errors []string `json:"errors,omitempty"`
+}
+
+// AggregateMissingDeps scans all provided skill directories, merges their manifests,
+// then checks which dependencies are missing.
+// skillDirs is map[slug]->dir.
+func AggregateMissingDeps(skillDirs map[string]string) (*SkillManifest, []string) {
+	var merged *SkillManifest
+	for _, dir := range skillDirs {
+		m := ScanSkillDeps(dir)
+		if m != nil {
+			merged = MergeDeps(merged, m)
+		}
+	}
+	if merged == nil || merged.IsEmpty() {
+		return nil, nil
+	}
+	_, missing := CheckSkillDeps(merged)
+	return merged, missing
+}
+
+// InstallSingleDep installs one dependency (format: "pip:pkg", "npm:pkg", or plain binary name).
+// Returns (ok, errorMessage). Logs progress via slog so the Log page can show install status.
+func InstallSingleDep(ctx context.Context, dep string) (bool, string) {
+	ctx, cancel := context.WithTimeout(ctx, InstallTimeout)
+	defer cancel()
+
+	slog.Info("skills: installing dep", "dep", dep)
+
+	switch {
+	case strings.HasPrefix(dep, "github:"):
+		gh := DefaultGitHubInstaller()
+		if gh == nil {
+			return false, "github installer not configured"
+		}
+		if _, err := gh.Install(ctx, dep); err != nil {
+			slog.Error("skills: github install failed", "dep", dep, "error", err)
+			return false, err.Error()
+		}
+		slog.Info("skills: dep installed", "dep", dep)
+		return true, ""
+	case strings.HasPrefix(dep, "pip:"):
+		pkg := strings.TrimPrefix(dep, "pip:")
+		if l := sharedPackageLocker(); l != nil {
+			release, lerr := l.Acquire(ctx, "pip", pkg)
+			if lerr != nil {
+				return false, fmt.Sprintf("lock acquire: %v", lerr)
+			}
+			defer release()
+		}
+		// pipRunInstall retries without the PEP 668 flag when pip rejects it
+		// (pip < 23.0, see issue #956).
+		out, err := pipRunInstall(ctx, []string{"install", "--no-cache-dir", pipBreakSystemPackagesFlag, pkg})
+		if err != nil {
+			msg := fmt.Sprintf("%s: %v", strings.TrimSpace(string(out)), err)
+			slog.Error("skills: dep install failed", "dep", dep, "error", msg)
+			if hint := pipBuildFailHint(pkg, string(out)); hint != "" {
+				slog.Warn("skills: dep install hint", "dep", dep, "hint", hint)
+			}
+			return false, msg
+		}
+	case strings.HasPrefix(dep, "npm:"):
+		pkg := strings.TrimPrefix(dep, "npm:")
+		if l := sharedPackageLocker(); l != nil {
+			release, lerr := l.Acquire(ctx, "npm", pkg)
+			if lerr != nil {
+				return false, fmt.Sprintf("lock acquire: %v", lerr)
+			}
+			defer release()
+		}
+		out, err := installNpmPackage(ctx, pkg)
+		if err != nil {
+			msg := fmt.Sprintf("%s: %v", strings.TrimSpace(string(out)), err)
+			slog.Error("skills: dep install failed", "dep", dep, "error", msg)
+			return false, msg
+		}
+	default:
+		ok, errMsg := installSystemPackage(ctx, dep)
+		if !ok {
+			return false, errMsg
+		}
+	}
+
+	slog.Info("skills: dep installed", "dep", dep)
+	cleanCaches(ctx)
+	return true, ""
+}
+
+// InstallDeps installs missing packages by category.
+// Uses PIP_TARGET and NPM_CONFIG_PREFIX from env (set by docker-entrypoint.sh).
+func InstallDeps(ctx context.Context, manifest *SkillManifest, missing []string) (*InstallResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, InstallTimeout)
+	defer cancel()
+
+	result := &InstallResult{}
+
+	var sysPkgs, pipPkgs, npmPkgs []string
+	for _, dep := range missing {
+		switch {
+		case strings.HasPrefix(dep, "pip:"):
+			pipPkgs = append(pipPkgs, strings.TrimPrefix(dep, "pip:"))
+		case strings.HasPrefix(dep, "npm:"):
+			npmPkgs = append(npmPkgs, strings.TrimPrefix(dep, "npm:"))
+		default:
+			sysPkgs = append(sysPkgs, dep)
+		}
+	}
+
+	// System packages: install one by one via pkg-helper.
+	if len(sysPkgs) > 0 {
+		slog.Info("skills: installing system packages", "pkgs", sysPkgs)
+		var successful []string
+		for _, pkg := range sysPkgs {
+			ok, errMsg := installSystemPackage(ctx, pkg)
+			if !ok {
+				result.Errors = append(result.Errors, fmt.Sprintf("system %s: %s", pkg, errMsg))
+			} else {
+				successful = append(successful, pkg)
+			}
+		}
+		result.System = successful
+	}
+
+	// Pip packages: install one by one for partial-success resilience.
+	if len(pipPkgs) > 0 {
+		slog.Info("skills: installing pip packages", "pkgs", pipPkgs)
+		var successful []string
+		for _, pkg := range pipPkgs {
+			// pipRunInstall retries without the PEP 668 flag when pip rejects it.
+			out, err := pipRunInstall(ctx, []string{"install", "--no-cache-dir", pipBreakSystemPackagesFlag, pkg})
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("pip %s: %s (%v)", pkg, strings.TrimSpace(string(out)), err))
+				if hint := pipBuildFailHint(pkg, string(out)); hint != "" {
+					slog.Warn("skills: dep install hint", "pkg", pkg, "hint", hint)
+				}
+			} else {
+				successful = append(successful, pkg)
+			}
+		}
+		result.Pip = successful
+	}
+
+	// Npm packages: install one by one for partial-success resilience.
+	if len(npmPkgs) > 0 {
+		slog.Info("skills: installing npm packages", "pkgs", npmPkgs)
+		if err := os.MkdirAll(npmGlobalPrefix(), 0o750); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("npm prefix setup: %v", err))
+			cleanCaches(ctx)
+			return result, nil
+		}
+		ensureNpmGlobalEnv()
+		var successful []string
+		for _, pkg := range npmPkgs {
+			if out, err := installNpmPackage(ctx, pkg); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("npm %s: %s (%v)", pkg, strings.TrimSpace(string(out)), err))
+			} else {
+				successful = append(successful, pkg)
+			}
+		}
+		result.Npm = successful
+	}
+
+	cleanCaches(ctx)
+	return result, nil
+}
+
+// UninstallPackage removes one package (format: "pip:pkg", "npm:pkg", or plain apk name).
+// Returns (ok, errorMessage).
+func UninstallPackage(ctx context.Context, dep string) (bool, string) {
+	ctx, cancel := context.WithTimeout(ctx, InstallTimeout)
+	defer cancel()
+
+	slog.Info("skills: uninstalling package", "dep", dep)
+
+	switch {
+	case strings.HasPrefix(dep, "github:"):
+		gh := DefaultGitHubInstaller()
+		if gh == nil {
+			return false, "github installer not configured"
+		}
+		// Accept either "github:name" (manifest name only) or the full
+		// "github:owner/repo[@tag]". For the full form we look up the manifest
+		// entry by owner/repo so packages whose binary name differs from the
+		// repo name (e.g. cli/cli → gh) can still be uninstalled via spec.
+		name := strings.TrimPrefix(dep, "github:")
+		if spec, err := ParseGitHubSpec(dep); err == nil {
+			name = spec.Repo
+			if entries, lerr := gh.List(); lerr == nil {
+				want := spec.Owner + "/" + spec.Repo
+				for _, e := range entries {
+					if strings.EqualFold(e.Repo, want) {
+						name = e.Name
+						break
+					}
+				}
+			}
+		} else if slash := strings.Index(name, "/"); slash >= 0 {
+			// Tolerate bare "owner/repo" without the scheme prefix.
+			name = name[slash+1:]
+			if at := strings.IndexByte(name, '@'); at >= 0 {
+				name = name[:at]
+			}
+		}
+		if err := gh.Uninstall(ctx, name); err != nil {
+			slog.Error("skills: github uninstall failed", "dep", dep, "error", err)
+			return false, err.Error()
+		}
+		slog.Info("skills: package uninstalled", "dep", dep)
+		return true, ""
+	case strings.HasPrefix(dep, "pip:"):
+		pkg := strings.TrimPrefix(dep, "pip:")
+		cmd := exec.CommandContext(ctx, "pip3", "uninstall", "-y", pkg)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			msg := fmt.Sprintf("%s: %v", strings.TrimSpace(string(out)), err)
+			slog.Error("skills: uninstall failed", "dep", dep, "error", msg)
+			return false, msg
+		}
+	case strings.HasPrefix(dep, "npm:"):
+		pkg := strings.TrimPrefix(dep, "npm:")
+		ensureNpmGlobalEnv()
+		cmd := exec.CommandContext(ctx, npmBinary, "uninstall", "-g", pkg)
+		cmd.Env = npmCommandEnv()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			msg := fmt.Sprintf("%s: %v", strings.TrimSpace(string(out)), err)
+			slog.Error("skills: uninstall failed", "dep", dep, "error", msg)
+			return false, msg
+		}
+	default:
+		ok, errMsg := uninstallSystemPackage(ctx, dep)
+		if !ok {
+			return false, errMsg
+		}
+	}
+
+	slog.Info("skills: package uninstalled", "dep", dep)
+	return true, ""
+}
+
+// apkHelperCall dials the pkg-helper v2 Unix socket and invokes action for pkg.
+// Package may be empty for read-only actions (update-index, list-outdated).
+//
+// Return values:
+//   - ok: resp.OK from helper
+//   - code: resp.Code (error classification); "helper_unavailable" on dial fail,
+//     "helper_error" on send/recv/parse failure, "system_error" if helper omits code
+//   - data: resp.Data (stdout payload for list-outdated / update-index)
+//   - errMsg: resp.Error (human-readable reason)
+//
+// Scanner buffer: 64KB initial / 1MB max (CONTRACT). list-outdated output on
+// full-skills images can approach this limit. Any NEW action returning >1MB MUST
+// raise this ceiling AND the matching helper-side write, or split into multiple
+// JSON lines. Violating silently yields helper_error "bufio.Scanner: token too long".
+func apkHelperCall(ctx context.Context, action, pkg string) (ok bool, code, data, errMsg string) {
+	conn, err := net.DialTimeout("unix", pkgHelperSocket, 5*time.Second)
+	if err != nil {
+		if path, found := findPkgHelperBinary(); found {
+			return apkHelperCallFallback(ctx, path, action, pkg)
+		}
+
+		return false, "helper_unavailable", "", fmt.Sprintf("pkg-helper unavailable: %v", err)
+	}
+	defer conn.Close()
+
+	// Bind connection lifetime to caller's context deadline (primary per-op timeout).
+	// The helper also enforces a 10-min safety ceiling independently.
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		conn.SetDeadline(deadline) //nolint:errcheck
+	}
+
+	// Send request as a newline-delimited JSON line.
+	req := map[string]string{"action": action, "package": pkg}
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return false, "helper_error", "", fmt.Sprintf("pkg-helper send failed: %v", err)
+	}
+
+	// Read single-line JSON response.
+	// Buffer ceiling documented above as a client contract.
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	if !scanner.Scan() {
+		scanErr := scanner.Err()
+		if scanErr != nil {
+			return false, "helper_error", "", fmt.Sprintf("pkg-helper: read error: %v", scanErr)
+		}
+		return false, "helper_error", "", "pkg-helper: no response"
+	}
+
+	resp, err := parsePkgHelperResponse(scanner.Bytes())
+	if err != nil {
+		return false, "helper_error", "", fmt.Sprintf("pkg-helper: invalid response: %v", err)
+	}
+
+	return resp.OK, resp.Code, resp.Data, resp.Error
+}
+
+type pkgHelperResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
+	Code  string `json:"code"`
+	Data  string `json:"data"`
+}
+
+func parsePkgHelperResponse(out []byte) (pkgHelperResponse, error) {
+	var resp pkgHelperResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return pkgHelperResponse{}, err
+	}
+	// Default missing code to system_error for v1-era helpers that omit the field.
+	if resp.Code == "" && !resp.OK {
+		resp.Code = "system_error"
+	}
+	return resp, nil
+}
+
+func apkHelperCallFallback(ctx context.Context, helperPath, action, pkg string) (ok bool, code, data, errMsg string) {
+	cmd := exec.CommandContext(ctx, helperPath, action)
+	if pkg != "" {
+		cmd.Args = append(cmd.Args, pkg)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, execErr := cmd.Output()
+
+	resp, parseErr := parsePkgHelperResponse(out)
+	if parseErr == nil {
+		if execErr != nil && resp.OK {
+			return false, "system_error", "", fmt.Sprintf("pkg-helper fallback exited after successful response: %v", execErr)
+		}
+		return resp.OK, resp.Code, resp.Data, resp.Error
+	}
+
+	detail := helperFallbackOutputDetail(out, stderr.String())
+	if execErr != nil {
+		return false, "system_error", "", fmt.Sprintf("pkg-helper fallback failed: %v%s", execErr, detail)
+	}
+	return false, "helper_error", "", fmt.Sprintf("pkg-helper fallback invalid response: %v%s", parseErr, detail)
+}
+
+func helperFallbackOutputDetail(stdout []byte, stderr string) string {
+	var parts []string
+	if trimmed := strings.TrimSpace(string(stdout)); trimmed != "" {
+		parts = append(parts, "stdout: "+trimmed)
+	}
+	if trimmed := strings.TrimSpace(stderr); trimmed != "" {
+		parts = append(parts, "stderr: "+trimmed)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(parts, "; ")
+}
+
+func findPkgHelperBinary() (string, bool) {
+	if path, err := exec.LookPath("pkg-helper"); err == nil {
+		return path, true
+	}
+	return firstExecutableFile(pkgHelperFallbackPaths())
+}
+
+func pkgHelperFallbackPaths() []string {
+	paths := []string{pkgHelperBundledPath}
+	if exe, err := os.Executable(); err == nil {
+		paths = append([]string{filepath.Join(filepath.Dir(exe), "pkg-helper")}, paths...)
+	}
+	return paths
+}
+
+func firstExecutableFile(paths []string) (string, bool) {
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() && info.Mode().Perm()&0111 != 0 {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// apkViaHelper is the legacy 2-return-value wrapper used by InstallSingleDep,
+// InstallDeps, and UninstallPackage. Delegates to apkHelperCall; callers
+// receive (ok, errMsg) and do not need the code/data fields.
+func apkViaHelper(ctx context.Context, action, pkg string) (bool, string) {
+	ok, _, _, errMsg := apkHelperCall(ctx, action, pkg)
+	return ok, errMsg
+}
+
+// cleanCaches removes pip and npm caches to save disk space.
+// Uses pipBinary so test fixtures can redirect pip3 invocations.
+func cleanCaches(ctx context.Context) {
+	exec.CommandContext(ctx, pipBinary, "cache", "purge").Run() //nolint:errcheck
+	// Remove npm temp dirs using native Go (avoid sh -c shell glob + symlink risk).
+	// Matches only direct entries in /tmp; skips symlinks to prevent attacker-pointed rm.
+	matches, _ := filepath.Glob("/tmp/npm-*")
+	for _, p := range matches {
+		info, lerr := os.Lstat(p)
+		if lerr != nil {
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			continue // skip symlinks
+		}
+		_ = os.RemoveAll(p)
+	}
+}

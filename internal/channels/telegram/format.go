@@ -11,10 +11,43 @@ import (
 // --- Markdown to Telegram HTML conversion ---
 // Adapted from PicoClaw's telegram.go, extended with table support (matching TS "code" mode).
 
+// htmlTagToMarkdown converts common HTML tags in LLM output to markdown equivalents
+// so they survive the escapeHTML step and get re-converted by the markdown pipeline.
+var htmlToMdReplacers = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	{regexp.MustCompile(`(?i)<br\s*/?>`), "\n"},
+	{regexp.MustCompile(`(?i)</?p\s*>`), "\n"},
+	{regexp.MustCompile(`(?i)<b>([\s\S]*?)</b>`), "**$1**"},
+	{regexp.MustCompile(`(?i)<strong>([\s\S]*?)</strong>`), "**$1**"},
+	// ${1}_ (not $1_) — Go regexp treats $1_ as a named group reference (identifier
+	// characters include `_`), which drops the capture. Curly braces delimit the group.
+	{regexp.MustCompile(`(?i)<i>([\s\S]*?)</i>`), "_${1}_"},
+	{regexp.MustCompile(`(?i)<em>([\s\S]*?)</em>`), "_${1}_"},
+	{regexp.MustCompile(`(?i)<s>([\s\S]*?)</s>`), "~~$1~~"},
+	{regexp.MustCompile(`(?i)<strike>([\s\S]*?)</strike>`), "~~$1~~"},
+	{regexp.MustCompile(`(?i)<del>([\s\S]*?)</del>`), "~~$1~~"},
+	{regexp.MustCompile(`(?i)<code>([\s\S]*?)</code>`), "`$1`"},
+	{regexp.MustCompile(`(?i)<a\s+href="([^"]+)"[^>]*>([\s\S]*?)</a>`), "[$2]($1)"},
+}
+
+func htmlTagToMarkdown(text string) string {
+	for _, r := range htmlToMdReplacers {
+		text = r.re.ReplaceAllString(text, r.repl)
+	}
+	return text
+}
+
 func markdownToTelegramHTML(text string) string {
 	if text == "" {
 		return ""
 	}
+
+	// Pre-process: convert any HTML tags in LLM output to markdown equivalents.
+	// LLMs sometimes output raw HTML (e.g. <b>bold</b>) which would get escaped
+	// by escapeHTML() and displayed as literal "<b>bold</b>" text.
+	text = htmlTagToMarkdown(text)
 
 	// Extract markdown tables FIRST — uses dedicated \x00TB placeholders.
 	// Tables render as <pre> (monospace block) WITHOUT <code> wrapper,
@@ -30,6 +63,17 @@ func markdownToTelegramHTML(text string) string {
 	inlineCodes := extractInlineCodes(text)
 	text = inlineCodes.text
 
+
+	// Extract and protect bare URLs from italic parsing.
+	// URLs with underscores (e.g. syngas_dailymail_2026_ai) get broken by
+	// the italic regex which matches _text_ patterns inside URLs.
+	var urlPlaceholders []string
+	reURL := regexp.MustCompile(`https?://[^\s<>\)\]]+`)
+	text = reURL.ReplaceAllStringFunc(text, func(s string) string {
+		idx := len(urlPlaceholders)
+		urlPlaceholders = append(urlPlaceholders, s)
+		return fmt.Sprintf("\x00URL%d\x00", idx)
+	})
 	// Strip markdown headers
 	text = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`).ReplaceAllString(text, "$1")
 
@@ -46,6 +90,21 @@ func markdownToTelegramHTML(text string) string {
 	text = regexp.MustCompile(`\*\*(.+?)\*\*`).ReplaceAllString(text, "<b>$1</b>")
 	text = regexp.MustCompile(`__(.+?)__`).ReplaceAllString(text, "<b>$1</b>")
 
+	// Protect @mentions from italic conversion and convert to clickable Telegram links.
+	// In HTML parse_mode, Telegram does NOT auto-link @username — we must use <a> tags.
+	// Uses (^|\W) prefix to avoid matching emails like user@domain.com.
+	var mentionPlaceholders []string
+	reMention := regexp.MustCompile(`(^|\W)(@\w+)`)
+	text = reMention.ReplaceAllStringFunc(text, func(s string) string {
+		match := reMention.FindStringSubmatch(s)
+		if len(match) < 3 {
+			return s
+		}
+		idx := len(mentionPlaceholders)
+		mentionPlaceholders = append(mentionPlaceholders, match[2])
+		return match[1] + fmt.Sprintf("\x00MN%d\x00", idx)
+	})
+
 	// Italic
 	reItalic := regexp.MustCompile(`_([^_]+)_`)
 	text = reItalic.ReplaceAllStringFunc(text, func(s string) string {
@@ -59,8 +118,21 @@ func markdownToTelegramHTML(text string) string {
 	// Strikethrough
 	text = regexp.MustCompile(`~~(.+?)~~`).ReplaceAllString(text, "<s>$1</s>")
 
+	// Restore @mentions as plain text (protected from italic conversion above).
+	// Do NOT wrap in <a href="https://t.me/..."> — LLM @mentions are not
+	// necessarily Telegram usernames and auto-linking shows unwanted profile cards.
+	for i, mention := range mentionPlaceholders {
+		text = strings.ReplaceAll(text, fmt.Sprintf("\x00MN%d\x00", i), mention)
+	}
+
 	// List items
 	text = regexp.MustCompile(`(?m)^[-*]\s+`).ReplaceAllString(text, "• ")
+
+	// Restore bare URLs (protected from italic parsing above).
+	for i, u := range urlPlaceholders {
+		escaped := escapeHTML(u)
+		text = strings.ReplaceAll(text, fmt.Sprintf("\x00URL%d\x00", i), escaped)
+	}
 
 	// Restore inline code
 	for i, code := range inlineCodes.codes {
@@ -267,12 +339,12 @@ func parseTableRow(line string) []string {
 // stripInlineMarkdown removes common inline markdown markers from text.
 // Used for table cells that render inside code blocks where formatting has no effect.
 var (
-	reStripBoldAsterisks   = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	reStripBoldUnderscores = regexp.MustCompile(`__(.+?)__`)
-	reStripItalicAsterisk  = regexp.MustCompile(`\*([^*]+)\*`)
+	reStripBoldAsterisks    = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	reStripBoldUnderscores  = regexp.MustCompile(`__(.+?)__`)
+	reStripItalicAsterisk   = regexp.MustCompile(`\*([^*]+)\*`)
 	reStripItalicUnderscore = regexp.MustCompile(`_([^_]+)_`)
-	reStripStrikethrough   = regexp.MustCompile(`~~(.+?)~~`)
-	reStripInlineCode      = regexp.MustCompile("`([^`]+)`")
+	reStripStrikethrough    = regexp.MustCompile(`~~(.+?)~~`)
+	reStripInlineCode       = regexp.MustCompile("`([^`]+)`")
 )
 
 func stripInlineMarkdown(s string) string {
@@ -294,10 +366,7 @@ func renderRow(cells []string, colWidths []int) string {
 			cell = cells[j]
 		}
 		// Pad with spaces to align columns
-		padding := w - displayWidth(cell)
-		if padding < 0 {
-			padding = 0
-		}
+		padding := max(w-displayWidth(cell), 0)
 		parts = append(parts, " "+cell+strings.Repeat(" ", padding)+" ")
 	}
 	return "|" + strings.Join(parts, "|") + "|"
@@ -337,15 +406,42 @@ func chunkHTML(text string, maxLen int) []string {
 			break
 		}
 
-		// Find best split point within maxLen
+		// Strategy: search backwards for best natural breakpoint within maxLen.
 		cutAt := maxLen
-		// Prefer paragraph boundary
+
+		// 1. Look for preferred boundaries: paragraph, then newline, then space.
 		if idx := strings.LastIndex(remaining[:cutAt], "\n\n"); idx > 0 {
-			cutAt = idx + 1 // include first newline
+			cutAt = idx + 2
 		} else if idx := strings.LastIndex(remaining[:cutAt], "\n"); idx > 0 {
 			cutAt = idx + 1
 		} else if idx := strings.LastIndex(remaining[:cutAt], " "); idx > 0 {
 			cutAt = idx + 1
+		}
+
+		// 2. Safety: ensure we don't cut in the middle of an HTML tag or entity.
+		// Tag check: find last '<' and see if it was closed before cutAt.
+		if lastOpen := strings.LastIndex(remaining[:cutAt], "<"); lastOpen != -1 {
+			lastClose := strings.LastIndex(remaining[:cutAt], ">")
+			if lastOpen > lastClose {
+				// We're inside a tag (e.g. "<a hre"). Move cutAt back to start of tag.
+				// This ensures the tag remains whole in the next chunk.
+				cutAt = lastOpen
+			}
+		}
+
+		// Entity check: find last '&' and see if it was closed before cutAt.
+		if lastOpen := strings.LastIndex(remaining[:cutAt], "&"); lastOpen != -1 {
+			lastClose := strings.LastIndex(remaining[:cutAt], ";")
+			if lastOpen > lastClose {
+				// Inside an entity (e.g. "&am"). Move cutAt back to start of entity.
+				cutAt = lastOpen
+			}
+		}
+
+		// 3. Fallback for monolithic blocks: if boundaries or safety moved cutAt to 0,
+		// force progress by using maxLen anyway. This avoids infinite loops.
+		if cutAt <= 0 {
+			cutAt = maxLen
 		}
 
 		chunks = append(chunks, strings.TrimRight(remaining[:cutAt], " \n"))

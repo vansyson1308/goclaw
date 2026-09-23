@@ -13,23 +13,35 @@ import (
 // UsageMethods handles usage.get, usage.summary.
 // Queries SessionStore for real token data (accumulated via AccumulateTokens in agent loop).
 type UsageMethods struct {
-	sessions store.SessionStore
+	sessions     store.SessionStore
+	sessionCosts sessionCostReader
+}
+
+type sessionCostReader interface {
+	GetSessionCosts(ctx context.Context, sessionKeys []string) (map[string]float64, error)
 }
 
 // UsageRecord is a single usage entry derived from session data.
 type UsageRecord struct {
-	AgentID      string `json:"agentId"`
-	SessionKey   string `json:"sessionKey"`
-	Model        string `json:"model"`
-	Provider     string `json:"provider"`
-	InputTokens  int64  `json:"inputTokens"`
-	OutputTokens int64  `json:"outputTokens"`
-	TotalTokens  int64  `json:"totalTokens"`
-	Timestamp    int64  `json:"timestamp"`
+	AgentID      string  `json:"agentId"`
+	SessionKey   string  `json:"sessionKey"`
+	Model        string  `json:"model"`
+	Provider     string  `json:"provider"`
+	InputTokens  int64   `json:"inputTokens"`
+	OutputTokens int64   `json:"outputTokens"`
+	TotalTokens  int64   `json:"totalTokens"`
+	Cost         float64 `json:"cost"`
+	Timestamp    int64   `json:"timestamp"`
 }
 
-func NewUsageMethods(sessStore store.SessionStore) *UsageMethods {
-	return &UsageMethods{sessions: sessStore}
+func NewUsageMethods(sessStore store.SessionStore, tracingStores ...store.TracingStore) *UsageMethods {
+	m := &UsageMethods{sessions: sessStore}
+	if len(tracingStores) > 0 && tracingStores[0] != nil {
+		if costs, ok := tracingStores[0].(sessionCostReader); ok {
+			m.sessionCosts = costs
+		}
+	}
+	return m
 }
 
 func (m *UsageMethods) Register(router *gateway.MethodRouter) {
@@ -37,7 +49,7 @@ func (m *UsageMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodUsageSummary, m.handleSummary)
 }
 
-func (m *UsageMethods) handleGet(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *UsageMethods) handleGet(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	var params struct {
 		AgentID string `json:"agentId"`
 		Limit   int    `json:"limit"`
@@ -50,28 +62,28 @@ func (m *UsageMethods) handleGet(_ context.Context, client *gateway.Client, req 
 		params.Limit = 20
 	}
 
-	sessions := m.sessions.List(params.AgentID)
+	// Use ListPagedRich: single query returns model, provider, tokens — no N+1 GetOrCreate loop.
+	// Fetch large batch to filter non-zero tokens, then paginate in-memory.
+	result := m.sessions.ListPagedRich(ctx, store.SessionListOpts{
+		AgentID: params.AgentID,
+		Limit:   10000,
+	})
 
-	records := make([]UsageRecord, 0, len(sessions))
-	for _, s := range sessions {
-		// Get full session data for token info
-		data := m.sessions.GetOrCreate(s.Key)
-		if data.InputTokens == 0 && data.OutputTokens == 0 {
+	records := make([]UsageRecord, 0, len(result.Sessions))
+	for _, s := range result.Sessions {
+		if s.InputTokens == 0 && s.OutputTokens == 0 {
 			continue
 		}
-
-		// Extract agentID from session key (format: "agent:<agentID>:<scopeKey>")
 		agentID := extractAgentIDFromKey(s.Key)
-
 		records = append(records, UsageRecord{
 			AgentID:      agentID,
 			SessionKey:   s.Key,
-			Model:        data.Model,
-			Provider:     data.Provider,
-			InputTokens:  data.InputTokens,
-			OutputTokens: data.OutputTokens,
-			TotalTokens:  data.InputTokens + data.OutputTokens,
-			Timestamp:    data.Updated.UnixMilli(),
+			Model:        s.Model,
+			Provider:     s.Provider,
+			InputTokens:  s.InputTokens,
+			OutputTokens: s.OutputTokens,
+			TotalTokens:  s.InputTokens + s.OutputTokens,
+			Timestamp:    s.Updated.UnixMilli(),
 		})
 	}
 
@@ -83,17 +95,22 @@ func (m *UsageMethods) handleGet(_ context.Context, client *gateway.Client, req 
 	total := len(records)
 
 	// Apply offset + limit
-	offset := params.Offset
-	if offset > total {
-		offset = total
-	}
-	end := offset + params.Limit
-	if end > total {
-		end = total
-	}
+	offset := min(params.Offset, total)
+	end := min(offset+params.Limit, total)
 	records = records[offset:end]
+	if m.sessionCosts != nil && len(records) > 0 {
+		sessionKeys := make([]string, 0, len(records))
+		for _, record := range records {
+			sessionKeys = append(sessionKeys, record.SessionKey)
+		}
+		if costs, err := m.sessionCosts.GetSessionCosts(ctx, sessionKeys); err == nil {
+			for i := range records {
+				records[i].Cost = costs[records[i].SessionKey]
+			}
+		}
+	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"records": records,
 		"total":   total,
 		"limit":   params.Limit,
@@ -101,8 +118,9 @@ func (m *UsageMethods) handleGet(_ context.Context, client *gateway.Client, req 
 	}))
 }
 
-func (m *UsageMethods) handleSummary(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	sessions := m.sessions.List("") // all agents
+func (m *UsageMethods) handleSummary(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	// Use ListPagedRich: single query returns all token data — no N+1 GetOrCreate loop.
+	result := m.sessions.ListPagedRich(ctx, store.SessionListOpts{Limit: 10000})
 
 	type agentSummary struct {
 		InputTokens  int64 `json:"inputTokens"`
@@ -114,9 +132,8 @@ func (m *UsageMethods) handleSummary(_ context.Context, client *gateway.Client, 
 	byAgent := make(map[string]*agentSummary)
 	var totalRecords int
 
-	for _, s := range sessions {
-		data := m.sessions.GetOrCreate(s.Key)
-		if data.InputTokens == 0 && data.OutputTokens == 0 {
+	for _, s := range result.Sessions {
+		if s.InputTokens == 0 && s.OutputTokens == 0 {
 			continue
 		}
 
@@ -125,14 +142,14 @@ func (m *UsageMethods) handleSummary(_ context.Context, client *gateway.Client, 
 			byAgent[agentID] = &agentSummary{}
 		}
 
-		byAgent[agentID].InputTokens += data.InputTokens
-		byAgent[agentID].OutputTokens += data.OutputTokens
-		byAgent[agentID].TotalTokens += data.InputTokens + data.OutputTokens
+		byAgent[agentID].InputTokens += s.InputTokens
+		byAgent[agentID].OutputTokens += s.OutputTokens
+		byAgent[agentID].TotalTokens += s.InputTokens + s.OutputTokens
 		byAgent[agentID].Sessions++
 		totalRecords++
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"byAgent":      byAgent,
 		"totalRecords": totalRecords,
 	}))

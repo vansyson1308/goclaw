@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import {
   Dialog,
   DialogContent,
@@ -7,7 +8,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { useHttp } from "@/hooks/use-ws";
 import { useWsEvent } from "@/hooks/use-ws-event";
 
 interface SummoningModalProps {
@@ -16,14 +16,17 @@ interface SummoningModalProps {
   agentId: string;
   agentName: string;
   onCompleted: () => void;
+  onResummon: (agentId: string) => Promise<void>;
+  onCancel?: (agentId: string) => Promise<void>;
+  hideClose?: boolean;
+  onContinue?: () => void;
 }
 
+const CANCEL_THRESHOLD_SEC = 60;
+
 const SUMMONING_FILES = [
-  { name: "SOUL.md", label: "Soul & Personality" },
-  { name: "IDENTITY.md", label: "Identity Card" },
-  { name: "AGENTS.md", label: "Operating Instructions" },
-  { name: "TOOLS.md", label: "Tool Notes" },
-  { name: "HEARTBEAT.md", label: "Heartbeat Tasks" },
+  { name: "SOUL.md", required: true },
+  { name: "IDENTITY.md", required: true },
 ];
 
 export function SummoningModal({
@@ -32,12 +35,19 @@ export function SummoningModal({
   agentId,
   agentName,
   onCompleted,
+  onResummon,
+  onCancel,
+  hideClose = false,
+  onContinue,
 }: SummoningModalProps) {
-  const http = useHttp();
+  const { t } = useTranslation("agents");
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([]);
   const [status, setStatus] = useState<"summoning" | "completed" | "failed">("summoning");
   const [errorMsg, setErrorMsg] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Reset state when modal opens
   useEffect(() => {
@@ -45,8 +55,26 @@ export function SummoningModal({
       setGeneratedFiles([]);
       setStatus("summoning");
       setErrorMsg("");
+      setElapsed(0);
     }
   }, [open]);
+
+  // Elapsed timer — runs while summoning, stops on completion/failure
+  useEffect(() => {
+    if (open && status === "summoning") {
+      timerRef.current = setInterval(() => setElapsed((prev) => prev + 1), 1000);
+    } else if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [open, status]);
+
 
   const handleSummoningEvent = useCallback(
     (payload: unknown) => {
@@ -60,24 +88,40 @@ export function SummoningModal({
         );
       }
       if (data.type === "completed") {
+        // Mark required files as done (safety net); optional files only if actually generated
+        const required = SUMMONING_FILES.filter((f) => f.required).map((f) => f.name);
+        setGeneratedFiles((prev) => [...new Set([...prev, ...required])]);
         setStatus("completed");
         onCompleted();
       }
       if (data.type === "failed") {
         setStatus("failed");
-        setErrorMsg(data.error || "Summoning failed");
+        setErrorMsg(data.error || t("summoning.failed"));
         onCompleted();
       }
     },
-    [agentId, onCompleted],
+    [agentId, onCompleted, t],
   );
 
   useWsEvent("agent.summoning", handleSummoningEvent);
 
+  const handleCancel = async () => {
+    if (!onCancel) return;
+    setCancelling(true);
+    try {
+      await onCancel(agentId);
+      // BE emits WS type=failed → existing handler closes modal
+    } catch {
+      // keep modal open
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   const handleRetry = async () => {
     setRetrying(true);
     try {
-      await http.post(`/v1/agents/${agentId}/resummon`);
+      await onResummon(agentId);
       setGeneratedFiles([]);
       setStatus("summoning");
       setErrorMsg("");
@@ -90,14 +134,14 @@ export function SummoningModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md" overlayTransparent onInteractOutside={(e) => { if (status === "summoning") e.preventDefault(); }}>
+      <DialogContent className="sm:max-w-md" showCloseButton={!hideClose} overlayTransparent onInteractOutside={(e) => { if (hideClose || status === "summoning") e.preventDefault(); }}>
         <DialogHeader>
           <DialogTitle className="text-center">
             {status === "completed"
-              ? "Summoning Complete!"
+              ? t("summoning.completed")
               : status === "failed"
-                ? "Summoning Failed"
-                : "Summoning Your Agent..."}
+                ? t("summoning.failed")
+                : t("summoning.title")}
           </DialogTitle>
         </DialogHeader>
 
@@ -107,12 +151,12 @@ export function SummoningModal({
             {status === "summoning" && (
               <>
                 <motion.div
-                  className="absolute inset-0 rounded-full bg-violet-500/20"
+                  className="absolute inset-0 rounded-full bg-orange-500/20"
                   animate={{ scale: [1, 1.3, 1], opacity: [0.3, 0.1, 0.3] }}
                   transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
                 />
                 <motion.div
-                  className="absolute inset-2 rounded-full bg-violet-500/30"
+                  className="absolute inset-2 rounded-full bg-orange-500/30"
                   animate={{ scale: [1, 1.15, 1], opacity: [0.5, 0.2, 0.5] }}
                   transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut", delay: 0.3 }}
                 />
@@ -124,7 +168,7 @@ export function SummoningModal({
                   ? "bg-emerald-100 dark:bg-emerald-900/30"
                   : status === "failed"
                     ? "bg-red-100 dark:bg-red-900/30"
-                    : "bg-violet-100 dark:bg-violet-900/30"
+                    : "bg-orange-100 dark:bg-orange-900/30"
               }`}
               animate={
                 status === "summoning"
@@ -147,14 +191,14 @@ export function SummoningModal({
           <p className="text-sm text-foreground">
             {status === "completed" ? (
               <span className="font-medium text-emerald-600 dark:text-emerald-400">
-                {agentName} is ready!
+                {t("summoning.agentReady", { name: agentName })}
               </span>
             ) : status === "failed" ? (
               <span className="font-medium text-red-600 dark:text-red-400">
-                {errorMsg || "Using template files as fallback."}
+                {errorMsg || t("summoning.failed")}
               </span>
             ) : (
-              <>Weaving the soul of <span className="font-semibold text-foreground">{agentName}</span>...</>
+              <>{t("summoning.weavingSoul")} <span className="font-semibold text-foreground">{agentName}</span>...</>
             )}
           </p>
 
@@ -174,7 +218,7 @@ export function SummoningModal({
                     <motion.div
                       className={`flex h-5 w-5 items-center justify-center rounded-full text-xs ${
                         done
-                          ? "bg-violet-100 text-violet-600 dark:bg-violet-900/40 dark:text-violet-400"
+                          ? "bg-orange-100 text-orange-600 dark:bg-orange-900/40 dark:text-orange-400"
                           : "bg-muted text-muted-foreground"
                       }`}
                       animate={done ? { scale: [0.8, 1.2, 1] } : {}}
@@ -186,15 +230,15 @@ export function SummoningModal({
                       <span className={`text-sm text-foreground ${done ? "font-medium" : ""}`}>
                         {file.name}
                       </span>
-                      <span className="ml-2 text-xs text-muted-foreground">{file.label}</span>
+                      <span className="ml-2 text-xs text-muted-foreground">{t(`summoning.fileLabel${file.name.replace(".md", "")}`)}</span>
                     </div>
                     {done && (
                       <motion.span
                         initial={{ opacity: 0, scale: 0.5 }}
                         animate={{ opacity: 1, scale: 1 }}
-                        className="text-xs text-violet-600 dark:text-violet-400"
+                        className="text-xs text-orange-600 dark:text-orange-400"
                       >
-                        done
+                        {t("summoning.done")}
                       </motion.span>
                     )}
                   </motion.div>
@@ -204,14 +248,29 @@ export function SummoningModal({
           </div>
 
           {status === "summoning" && (
-            <p className="text-center text-xs text-muted-foreground">
-              This usually takes few minutes. Please wait...
+            <p className="text-center text-xs text-muted-foreground tabular-nums">
+              {t("summoning.wait")} ({Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")})
             </p>
+          )}
+
+          {status === "summoning" && elapsed >= CANCEL_THRESHOLD_SEC && onCancel && (
+            <div className="flex flex-col items-center gap-1">
+              <p className="text-xs text-muted-foreground">{t("summoning.takingTooLong")}</p>
+              <Button variant="ghost" size="sm" onClick={handleCancel} disabled={cancelling}>
+                {cancelling ? t("summoning.cancelling") : t("summoning.cancel")}
+              </Button>
+            </div>
+          )}
+
+          {status === "completed" && onContinue && (
+            <Button size="sm" onClick={onContinue}>
+              {t("summoning.continue")}
+            </Button>
           )}
 
           {status === "failed" && (
             <Button variant="outline" size="sm" onClick={handleRetry} disabled={retrying}>
-              {retrying ? "Retrying..." : "Retry"}
+              {retrying ? t("summoning.retrying") : t("summoning.retry")}
             </Button>
           )}
         </div>

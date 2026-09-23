@@ -2,21 +2,22 @@ package tools
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
 // mockTool is a minimal tool for testing the registry.
 type mockTool struct {
 	name   string
-	execFn func(ctx context.Context, args map[string]interface{}) *Result
+	execFn func(ctx context.Context, args map[string]any) *Result
 }
 
 func (m *mockTool) Name() string        { return m.name }
 func (m *mockTool) Description() string { return "mock tool" }
-func (m *mockTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}
+func (m *mockTool) Parameters() map[string]any {
+	return map[string]any{"type": "object", "properties": map[string]any{}}
 }
-func (m *mockTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (m *mockTool) Execute(ctx context.Context, args map[string]any) *Result {
 	if m.execFn != nil {
 		return m.execFn(ctx, args)
 	}
@@ -79,7 +80,7 @@ func TestRegistry_ExecuteWithContext_InjectsContextValues(t *testing.T) {
 
 	reg.Register(&mockTool{
 		name: "ctx_tool",
-		execFn: func(ctx context.Context, args map[string]interface{}) *Result {
+		execFn: func(ctx context.Context, args map[string]any) *Result {
 			gotChannel = ToolChannelFromCtx(ctx)
 			gotChatID = ToolChatIDFromCtx(ctx)
 			gotPeerKind = ToolPeerKindFromCtx(ctx)
@@ -120,7 +121,7 @@ func TestRegistry_ExecuteWithContext_ScrubsCredentials(t *testing.T) {
 	reg := NewRegistry()
 	reg.Register(&mockTool{
 		name: "leaky_tool",
-		execFn: func(ctx context.Context, args map[string]interface{}) *Result {
+		execFn: func(ctx context.Context, args map[string]any) *Result {
 			return &Result{
 				ForLLM:  "key is sk-abcdefghijklmnopqrstuvwxyz1234567890",
 				ForUser: "token: ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij",
@@ -144,7 +145,7 @@ func TestRegistry_ExecuteWithContext_RateLimiting(t *testing.T) {
 	reg.Register(&mockTool{name: "rl_tool"})
 
 	// First 2 calls allowed
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		result := reg.ExecuteWithContext(context.Background(), "rl_tool", nil,
 			"", "", "", "session-1", nil)
 		if result.IsError {
@@ -167,13 +168,49 @@ func TestRegistry_ExecuteWithContext_RateLimiting(t *testing.T) {
 	}
 }
 
+// SetRateLimiter must be re-callable so that startup code can swap the limiter
+// after DB-overlaid config is applied (cmd/gateway.go re-applies once
+// system_configs has overlaid the JSON5 default).
+func TestRegistry_SetRateLimiter_ReplacesPriorLimiter(t *testing.T) {
+	reg := NewRegistry()
+	reg.SetRateLimiter(NewToolRateLimiter(1)) // simulate JSON5 default
+	reg.Register(&mockTool{name: "tool"})
+
+	// Replace with higher limit (simulates DB overlay = 5)
+	reg.SetRateLimiter(NewToolRateLimiter(5))
+
+	for i := range 5 {
+		result := reg.ExecuteWithContext(context.Background(), "tool", nil,
+			"", "", "", "session-replace", nil)
+		if result.IsError {
+			t.Errorf("call %d should succeed under new 5/h limit: %s", i, result.ForLLM)
+		}
+	}
+	result := reg.ExecuteWithContext(context.Background(), "tool", nil,
+		"", "", "", "session-replace", nil)
+	if !result.IsError {
+		t.Error("6th call should hit the 5/h limit")
+	}
+
+	// Disable rate limiting via nil — verifies the gateway path that disables
+	// the limiter when cfg.Tools.RateLimitPerHour <= 0.
+	reg.SetRateLimiter(nil)
+	for i := range 10 {
+		result := reg.ExecuteWithContext(context.Background(), "tool", nil,
+			"", "", "", "session-replace", nil)
+		if result.IsError {
+			t.Errorf("call %d after nil limiter should be unbounded", i)
+		}
+	}
+}
+
 func TestRegistry_ExecuteWithContext_NoRateLimitWithoutSessionKey(t *testing.T) {
 	reg := NewRegistry()
 	reg.SetRateLimiter(NewToolRateLimiter(1))
 	reg.Register(&mockTool{name: "tool"})
 
 	// Without sessionKey, rate limiting is skipped
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		result := reg.ExecuteWithContext(context.Background(), "tool", nil,
 			"", "", "", "", nil)
 		if result.IsError {
@@ -188,7 +225,7 @@ func TestRegistry_ExecuteWithContext_EmptyContextValues(t *testing.T) {
 	var gotChannel, gotSandboxKey string
 	reg.Register(&mockTool{
 		name: "empty_ctx",
-		execFn: func(ctx context.Context, args map[string]interface{}) *Result {
+		execFn: func(ctx context.Context, args map[string]any) *Result {
 			gotChannel = ToolChannelFromCtx(ctx)
 			gotSandboxKey = ToolSandboxKeyFromCtx(ctx)
 			return NewResult("ok")
@@ -204,5 +241,175 @@ func TestRegistry_ExecuteWithContext_EmptyContextValues(t *testing.T) {
 	}
 	if gotSandboxKey != "" {
 		t.Errorf("empty sandboxKey should not be injected, got %q", gotSandboxKey)
+	}
+}
+
+// --- Panic recovery tests ---
+
+func TestRegistry_ExecuteWithContext_PanicRecovery(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(&mockTool{
+		name: "panicking_tool",
+		execFn: func(ctx context.Context, args map[string]any) *Result {
+			panic("unexpected nil pointer")
+		},
+	})
+
+	// Without panic recovery this would crash the test process.
+	result := reg.ExecuteWithContext(context.Background(), "panicking_tool", nil,
+		"", "", "", "", nil)
+
+	if !result.IsError {
+		t.Fatal("expected error result from panicking tool")
+	}
+	if !strings.Contains(result.ForLLM, "panicked") {
+		t.Errorf("error should mention panic, got: %s", result.ForLLM)
+	}
+	if !strings.Contains(result.ForLLM, "panicking_tool") {
+		t.Errorf("error should mention tool name, got: %s", result.ForLLM)
+	}
+}
+
+func TestRegistry_Execute_PanicRecovery(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(&mockTool{
+		name: "panic_via_execute",
+		execFn: func(ctx context.Context, args map[string]any) *Result {
+			var s []int
+			_ = s[10] // index out of range panic
+			return NewResult("unreachable")
+		},
+	})
+
+	result := reg.Execute(context.Background(), "panic_via_execute", nil)
+	if !result.IsError {
+		t.Fatal("expected error result from panicking tool")
+	}
+}
+
+func TestRegistry_ExecuteWithContext_PanicRecovery_Concurrent(t *testing.T) {
+	reg := NewRegistry()
+	reg.Register(&mockTool{
+		name: "concurrent_panic",
+		execFn: func(ctx context.Context, args map[string]any) *Result {
+			panic("boom")
+		},
+	})
+
+	const goroutines = 20
+	results := make(chan *Result, goroutines)
+	for range goroutines {
+		go func() {
+			results <- reg.ExecuteWithContext(context.Background(), "concurrent_panic", nil,
+				"", "", "", "session-1", nil)
+		}()
+	}
+
+	for range goroutines {
+		r := <-results
+		if !r.IsError {
+			t.Error("expected error result from panicking tool in concurrent execution")
+		}
+	}
+}
+
+// --- TryActivateDeferred / SetDeferredActivator tests ---
+
+func TestRegistry_TryActivateDeferred_NoActivator(t *testing.T) {
+	reg := NewRegistry()
+	// No activator set — must return false without panicking.
+	if reg.TryActivateDeferred("any_tool") {
+		t.Error("expected false when no activator is set")
+	}
+}
+
+func TestRegistry_TryActivateDeferred_ActivatorCalledWithCorrectName(t *testing.T) {
+	reg := NewRegistry()
+	var called string
+	reg.SetDeferredActivator(func(name string) bool {
+		called = name
+		return false
+	})
+	reg.TryActivateDeferred("mcp_foo__bar")
+	if called != "mcp_foo__bar" {
+		t.Errorf("activator called with %q, want %q", called, "mcp_foo__bar")
+	}
+}
+
+func TestRegistry_TryActivateDeferred_ReturnsTrueWhenActivated(t *testing.T) {
+	reg := NewRegistry()
+	reg.SetDeferredActivator(func(name string) bool {
+		// Simulate activating: register the tool in the registry
+		if name == "mcp_svc__get_data" {
+			reg.Register(&mockTool{name: name})
+			return true
+		}
+		return false
+	})
+
+	if !reg.TryActivateDeferred("mcp_svc__get_data") {
+		t.Error("expected true for activatable tool")
+	}
+	if _, ok := reg.Get("mcp_svc__get_data"); !ok {
+		t.Error("tool should be in registry after activation")
+	}
+}
+
+func TestRegistry_TryActivateDeferred_ReturnsFalseForUnknown(t *testing.T) {
+	reg := NewRegistry()
+	reg.SetDeferredActivator(func(name string) bool { return false })
+
+	if reg.TryActivateDeferred("nonexistent_tool") {
+		t.Error("expected false for unknown tool")
+	}
+	if _, ok := reg.Get("nonexistent_tool"); ok {
+		t.Error("tool should not appear in registry")
+	}
+}
+
+func TestRegistry_SetDeferredActivator_OverwritesPrevious(t *testing.T) {
+	reg := NewRegistry()
+	calls := 0
+	reg.SetDeferredActivator(func(name string) bool { calls++; return false })
+	reg.SetDeferredActivator(func(name string) bool { calls += 10; return false })
+
+	reg.TryActivateDeferred("any")
+	if calls != 10 {
+		t.Errorf("expected only the second activator to run (calls=10), got %d", calls)
+	}
+}
+
+func TestRegistry_TryActivateDeferred_Concurrent(t *testing.T) {
+	// Verify no data race when many goroutines call TryActivateDeferred simultaneously.
+	reg := NewRegistry()
+	reg.SetDeferredActivator(func(name string) bool {
+		reg.Register(&mockTool{name: name})
+		return true
+	})
+
+	const goroutines = 50
+	done := make(chan struct{}, goroutines)
+	for i := range goroutines {
+		toolName := "mcp_server__tool"
+		if i%2 == 0 {
+			toolName = "mcp_other__tool"
+		}
+		go func(n string) {
+			reg.TryActivateDeferred(n)
+			done <- struct{}{}
+		}(toolName)
+	}
+	for range goroutines {
+		<-done
+	}
+}
+
+func TestRegistry_TryActivateDeferred_NilActivatorAfterSet(t *testing.T) {
+	reg := NewRegistry()
+	reg.SetDeferredActivator(func(name string) bool { return true })
+	// Overwrite with nil — should behave as if no activator.
+	reg.SetDeferredActivator(nil)
+	if reg.TryActivateDeferred("any") {
+		t.Error("expected false after setting nil activator")
 	}
 }

@@ -1,0 +1,44 @@
+# PostgreSQL overlay — pgvector for multi-tenant storage.
+#
+# Usage (web dashboard built-in by default):
+#   make up
+#   # or: docker compose -f docker-compose.yml -f docker-compose.postgres.yml up -d --build
+#
+# Required env vars (set in .env or shell):
+#   GOCLAW_OPENROUTER_API_KEY (or another provider key)
+#   POSTGRES_PASSWORD (defaults to "goclaw" for dev)
+#
+# If host port 5432 is already in use, set POSTGRES_PORT (e.g. 5433) in .env.
+# The goclaw container still connects via postgres:5432 on the Docker network.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-goclaw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-goclaw}
+      POSTGRES_DB: ${POSTGRES_DB:-goclaw}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-goclaw} -d ${POSTGRES_DB:-goclaw}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  goclaw:
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - GOCLAW_POSTGRES_DSN=postgres://${POSTGRES_USER:-goclaw}:${POSTGRES_PASSWORD:-goclaw}@postgres:5432/${POSTGRES_DB:-goclaw}?sslmode=disable
+    volumes:
+      - goclaw-skills:/app/skills
+      - goclaw-workspace:/app/.goclaw
+
+volumes:
+  postgres-data:
+  goclaw-skills:

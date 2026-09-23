@@ -1,0 +1,87 @@
+{
+  "title": "API Keys",
+  "description": "Quản lý khóa API gateway với phân quyền chi tiết.",
+  "addKey": "Tạo API Key",
+  "searchPlaceholder": "Tìm khóa...",
+  "emptyTitle": "Chưa có API key",
+  "emptyDescription": "Tạo API key đầu tiên để xác thực với gateway.",
+  "columns": {
+    "name": "Tên",
+    "prefix": "Khóa",
+    "scopes": "Phạm vi",
+    "lastUsed": "Lần dùng cuối",
+    "created": "Ngày tạo",
+    "status": "Trạng thái",
+    "actions": "Thao tác"
+  },
+  "status": {
+    "active": "Hoạt động",
+    "revoked": "Đã thu hồi",
+    "expired": "Hết hạn"
+  },
+  "form": {
+    "title": "Tạo API Key",
+    "name": "Tên",
+    "namePlaceholder": "vd. ci-deploy, dashboard-readonly",
+    "scopes": "Phạm vi quyền",
+    "scopeDescriptions": {
+      "operator.admin": "Toàn quyền quản trị",
+      "operator.read": "Chỉ đọc",
+      "operator.write": "Đọc + ghi",
+      "operator.approvals": "Quản lý phê duyệt",
+      "operator.pairing": "Quản lý ghép nối",
+      "operator.provision": "Cấp phát tenant mới"
+    },
+    "tenant": "Tenant",
+    "tenantSystem": "Hệ thống (tất cả tenant)",
+    "expiry": "Hạn sử dụng",
+    "expiryOptions": {
+      "never": "Không giới hạn",
+      "7d": "7 ngày",
+      "30d": "30 ngày",
+      "90d": "90 ngày"
+    },
+    "cancel": "Hủy",
+    "create": "Tạo",
+    "creating": "Đang tạo..."
+  },
+  "created": {
+    "title": "Đã tạo API Key",
+    "description": "Sao chép khóa ngay — sẽ không hiển thị lại.",
+    "copied": "Đã sao chép!",
+    "copy": "Sao chép",
+    "done": "Xong"
+  },
+  "revoke": {
+    "title": "Thu hồi API Key",
+    "description": "Bạn chắc chắn muốn thu hồi \"{{name}}\"? Không thể hoàn tác.",
+    "confirmLabel": "Thu hồi"
+  },
+  "toast": {
+    "created": "Đã tạo API key",
+    "revoked": "Đã thu hồi API key",
+    "failedCreate": "Không thể tạo API key",
+    "failedRevoke": "Không thể thu hồi API key"
+  },
+  "never": "Không giới hạn",
+  "neverUsed": "Chưa dùng",
+  "tenantBadgeSystem": "Hệ thống",
+  "tenantBadgeUnknown": "Không xác định",
+  "columns.expiry": "Hạn dùng",
+  "codeDialog": {
+    "title": "Hướng dẫn sử dụng API Key",
+    "description": "Dùng API key này để xác thực với gateway HTTP API.",
+    "copy": "Sao chép",
+    "copied": "Đã sao chép!",
+    "tabs": {
+      "curl": "cURL",
+      "typescript": "TypeScript",
+      "go": "Go"
+    },
+    "comments": {
+      "chat": "Chat với agent (tương thích OpenAI)",
+      "listAgents": "Danh sách agent",
+      "listSessions": "Danh sách phiên"
+    }
+  }
+}

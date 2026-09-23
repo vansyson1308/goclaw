@@ -13,6 +13,11 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
+// providerSelectCols maps nullable text columns to "" so a single legacy row
+// with NULL display_name/api_base/api_key (allowed by the schema since v1)
+// cannot fail the whole list scan and hide every provider.
+const providerSelectCols = `id, name, COALESCE(display_name, '') AS display_name, provider_type, COALESCE(api_base, '') AS api_base, COALESCE(api_key, '') AS api_key, enabled, settings, created_at, updated_at, tenant_id`
+
 // PGProviderStore implements store.ProviderStore backed by Postgres.
 type PGProviderStore struct {
 	db     *sql.DB
@@ -42,49 +47,100 @@ func (s *PGProviderStore) CreateProvider(ctx context.Context, p *store.LLMProvid
 		apiKey = encrypted
 	}
 
+	settings := p.Settings
+	if len(settings) == 0 {
+		settings = []byte("{}")
+	}
+
 	now := time.Now()
 	p.CreatedAt = now
 	p.UpdatedAt = now
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO llm_providers (id, name, display_name, provider_type, api_base, api_key, enabled, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		p.ID, p.Name, p.DisplayName, p.ProviderType, p.APIBase, apiKey, p.Enabled, now, now,
-	)
+	tid := tenantIDForInsert(ctx)
+	p.TenantID = tid
+	// UPSERT: if provider with same (tenant_id, name) exists, update it and return its ID.
+	// This handles orphaned providers left after agent deletion (#295).
+	var actualID uuid.UUID
+	err := s.db.QueryRowContext(ctx,
+		`INSERT INTO llm_providers (id, name, display_name, provider_type, api_base, api_key, enabled, settings, created_at, updated_at, tenant_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		 ON CONFLICT (tenant_id, name) DO UPDATE SET
+			display_name = EXCLUDED.display_name, provider_type = EXCLUDED.provider_type,
+			api_base = EXCLUDED.api_base, api_key = EXCLUDED.api_key,
+			enabled = EXCLUDED.enabled, settings = EXCLUDED.settings, updated_at = EXCLUDED.updated_at
+		 RETURNING id`,
+		p.ID, p.Name, p.DisplayName, p.ProviderType, p.APIBase, apiKey, p.Enabled, settings, now, now, tid,
+	).Scan(&actualID)
+	if err == nil {
+		p.ID = actualID // sync in-memory ID with actual DB row
+	}
 	return err
 }
 
 func (s *PGProviderStore) GetProvider(ctx context.Context, id uuid.UUID) (*store.LLMProviderData, error) {
+	tClause, tArgs, _, err := scopeClause(ctx, 2)
+	if err != nil {
+		return nil, err
+	}
 	var p store.LLMProviderData
-	var apiKey string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, display_name, provider_type, api_base, api_key, enabled, created_at, updated_at
-		 FROM llm_providers WHERE id = $1`, id,
-	).Scan(&p.ID, &p.Name, &p.DisplayName, &p.ProviderType, &p.APIBase, &apiKey, &p.Enabled, &p.CreatedAt, &p.UpdatedAt)
+	err = pkgSqlxDB.GetContext(ctx, &p,
+		`SELECT `+providerSelectCols+`
+		 FROM llm_providers WHERE id = $1`+tClause,
+		append([]any{id}, tArgs...)...,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("provider not found: %s", id)
 	}
-	p.APIKey = s.decryptKey(apiKey, p.Name)
+	p.APIKey = s.decryptKey(p.APIKey, p.Name)
+	return &p, nil
+}
+
+func (s *PGProviderStore) GetProviderByName(ctx context.Context, name string) (*store.LLMProviderData, error) {
+	tClause, tArgs, _, err := scopeClause(ctx, 2)
+	if err != nil {
+		return nil, err
+	}
+	var p store.LLMProviderData
+	err = pkgSqlxDB.GetContext(ctx, &p,
+		`SELECT `+providerSelectCols+`
+		 FROM llm_providers WHERE name = $1`+tClause,
+		append([]any{name}, tArgs...)...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("provider not found: %s", name)
+	}
+	p.APIKey = s.decryptKey(p.APIKey, p.Name)
 	return &p, nil
 }
 
 func (s *PGProviderStore) ListProviders(ctx context.Context) ([]store.LLMProviderData, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, display_name, provider_type, api_base, api_key, enabled, created_at, updated_at
-		 FROM llm_providers ORDER BY name`)
+	tClause, tArgs, _, err := scopeClause(ctx, 1)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	var result []store.LLMProviderData
-	for rows.Next() {
-		var p store.LLMProviderData
-		var apiKey string
-		if err := rows.Scan(&p.ID, &p.Name, &p.DisplayName, &p.ProviderType, &p.APIBase, &apiKey, &p.Enabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
-			continue
-		}
-		p.APIKey = s.decryptKey(apiKey, p.Name)
-		result = append(result, p)
+	err = pkgSqlxDB.SelectContext(ctx, &result,
+		`SELECT `+providerSelectCols+`
+		 FROM llm_providers WHERE true`+tClause+` ORDER BY name`, tArgs...)
+	if err != nil {
+		return nil, err
+	}
+	for i := range result {
+		result[i].APIKey = s.decryptKey(result[i].APIKey, result[i].Name)
+	}
+	return result, nil
+}
+
+// ListAllProviders returns all providers across all tenants. Server-internal only.
+func (s *PGProviderStore) ListAllProviders(ctx context.Context) ([]store.LLMProviderData, error) {
+	var result []store.LLMProviderData
+	err := pkgSqlxDB.SelectContext(ctx, &result,
+		`SELECT `+providerSelectCols+`
+		 FROM llm_providers WHERE true ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	for i := range result {
+		result[i].APIKey = s.decryptKey(result[i].APIKey, result[i].Name)
 	}
 	return result, nil
 }
@@ -99,12 +155,62 @@ func (s *PGProviderStore) UpdateProvider(ctx context.Context, id uuid.UUID, upda
 			updates["api_key"] = encrypted
 		}
 	}
-	return execMapUpdate(ctx, s.db, "llm_providers", id, updates)
+	if store.IsCrossTenant(ctx) {
+		return execMapUpdate(ctx, s.db, "llm_providers", id, updates)
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("tenant_id required")
+	}
+	return execMapUpdateWhereTenant(ctx, s.db, "llm_providers", updates, id, tid)
 }
 
 func (s *PGProviderStore) DeleteProvider(ctx context.Context, id uuid.UUID) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM llm_providers WHERE id = $1", id)
-	return err
+	tClause, tArgs, _, err := scopeClause(ctx, 2)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	// Safe no-op after Commit (returns sql.ErrTxDone, ignored).
+	defer tx.Rollback()
+
+	// Defensive: disable heartbeats so the next scheduler tick after delete
+	// cannot fire stale config. FK ON DELETE SET NULL clears provider_id auto.
+	// Tenant-scope the UPDATE through agents to prevent cross-tenant side effects:
+	// even though provider IDs are UUIDs (globally unique), an attacker who guessed
+	// or leaked one could otherwise disable another tenant's heartbeats.
+	// IsCrossTenant (master scope) bypasses scoping for legitimate cross-tenant admin.
+	var updateQuery string
+	var updateArgs []any
+	if store.IsCrossTenant(ctx) {
+		updateQuery = "UPDATE agent_heartbeats SET enabled = false WHERE provider_id = $1"
+		updateArgs = []any{id}
+	} else {
+		tid := store.TenantIDFromContext(ctx)
+		updateQuery = `UPDATE agent_heartbeats SET enabled = false
+		               WHERE provider_id = $1
+		                 AND agent_id IN (SELECT id FROM agents WHERE tenant_id = $2)`
+		updateArgs = []any{id, tid}
+	}
+	res, err := tx.ExecContext(ctx, updateQuery, updateArgs...)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		slog.Warn("heartbeat.provider_cleared",
+			"provider_id", id, "heartbeats_disabled", n)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM llm_providers WHERE id = $1"+tClause,
+		append([]any{id}, tArgs...)...,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *PGProviderStore) decryptKey(apiKey, providerName string) string {
@@ -118,4 +224,3 @@ func (s *PGProviderStore) decryptKey(apiKey, providerName string) string {
 	}
 	return apiKey
 }
-

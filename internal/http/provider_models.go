@@ -2,21 +2,27 @@ package http
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // ModelInfo is a normalized model entry returned by the list-models endpoint.
 type ModelInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name,omitempty"`
+	ID        string                         `json:"id"`
+	Name      string                         `json:"name,omitempty"`
+	Reasoning *providers.ReasoningCapability `json:"reasoning,omitempty"`
+}
+
+type ProviderModelsResponse struct {
+	Models            []ModelInfo                    `json:"models"`
+	ReasoningDefaults *store.ProviderReasoningConfig `json:"reasoning_defaults,omitempty"`
 }
 
 // handleListProviderModels proxies to the upstream provider API to list
@@ -24,121 +30,159 @@ type ModelInfo struct {
 //
 //	GET /v1/providers/{id}/models
 func (h *ProvidersHandler) handleListProviderModels(w http.ResponseWriter, r *http.Request) {
+	locale := extractLocale(r)
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid provider ID"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "provider")})
 		return
 	}
 
 	p, err := h.store.GetProvider(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "provider not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "provider", id.String())})
+		return
+	}
+
+	respond := func(models []ModelInfo) {
+		writeJSON(w, http.StatusOK, ProviderModelsResponse{
+			Models:            models,
+			ReasoningDefaults: reasoningDefaultsForModels(p.Settings, models),
+		})
+	}
+
+	// Claude CLI doesn't need an API key — return hardcoded models
+	if p.ProviderType == store.ProviderClaudeCLI {
+		respond(claudeCLIModels())
+		return
+	}
+
+	if p.ProviderType == store.ProviderChatGPTOAuth {
+		respond(chatGPTOAuthModels())
+		return
+	}
+
+	// ACP agents don't need an API key — return hardcoded models
+	if p.ProviderType == store.ProviderACP {
+		respond(acpModels())
+		return
+	}
+
+	// Ollama: use native /api/tags for richer metadata (parameter size, quantization, family).
+	// ProviderOllama has no API key; ProviderOllamaCloud requires one but both use the same endpoint.
+	if p.ProviderType == store.ProviderOllama || p.ProviderType == store.ProviderOllamaCloud {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(loadProviderRequestTimeoutSec(r.Context(), h.sysConfigStore))*time.Second)
+		defer cancel()
+		apiBase := h.resolveAPIBase(p)
+		if apiBase == "" {
+			apiBase = "http://localhost:11434"
+		}
+		models, err := h.fetchOllamaModels(ctx, apiBase, p.APIKey)
+		if err != nil {
+			slog.Warn("providers.models.ollama", "provider", p.Name, "error", err)
+			respond([]ModelInfo{})
+			return
+		}
+		respond(models)
 		return
 	}
 
 	if p.APIKey == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provider has no API key configured"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "API key")})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(loadProviderRequestTimeoutSec(r.Context(), h.sysConfigStore))*time.Second)
 	defer cancel()
 
 	var models []ModelInfo
 
 	switch p.ProviderType {
-	case "anthropic_native":
-		models, err = fetchAnthropicModels(ctx, p.APIKey)
-	case "openai_compat":
-		apiBase := strings.TrimRight(p.APIBase, "/")
-		if apiBase == "" {
-			apiBase = "https://api.openai.com/v1"
-		}
-		models, err = fetchOpenAIModels(ctx, apiBase, p.APIKey)
+	case store.ProviderAnthropicNative:
+		models, err = fetchAnthropicModels(ctx, p.APIKey, h.resolveAPIBase(p))
+	case store.ProviderGeminiNative:
+		models, err = fetchGeminiModels(ctx, p.APIKey)
+	case store.ProviderBailian:
+		models = bailianModels()
+	case store.ProviderDashScope:
+		models = dashScopeModels()
+	case store.ProviderMiniMax:
+		models = minimaxModels()
+	case store.ProviderZai, store.ProviderZaiCoding:
+		models = zaiModels()
+	case store.ProviderAIMLAPI:
+		models = aimlapiModels()
 	default:
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("unsupported provider type: %s", p.ProviderType)})
-		return
+		// All other types use OpenAI-compatible /models endpoint
+		apiBase := openAIModelsAPIBase(p.ProviderType, h.resolveAPIBase(p))
+		models, err = fetchOpenAIModels(ctx, apiBase, p.APIKey, openAIModelsExtraHeaders(p.ProviderType))
 	}
 
 	if err != nil {
 		slog.Warn("providers.models", "provider", p.Name, "error", err)
 		// Return empty list instead of error — provider may not support /models
-		writeJSON(w, http.StatusOK, map[string]interface{}{"models": []ModelInfo{}})
+		respond([]ModelInfo{})
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{"models": models})
+	respond(withReasoningCapabilities(models))
 }
 
-// fetchAnthropicModels calls the Anthropic models API.
-func fetchAnthropicModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/v1/models", nil)
-	if err != nil {
-		return nil, err
+func aimlapiModels() []ModelInfo {
+	models := providers.AIMLAPIChatModels()
+	result := make([]ModelInfo, 0, len(models))
+	for _, model := range models {
+		result = append(result, ModelInfo{ID: model, Name: model})
 	}
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("anthropic API returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Data []struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode anthropic response: %w", err)
-	}
-
-	models := make([]ModelInfo, 0, len(result.Data))
-	for _, m := range result.Data {
-		models = append(models, ModelInfo{ID: m.ID, Name: m.DisplayName})
-	}
-	return models, nil
+	return result
 }
 
-// fetchOpenAIModels calls an OpenAI-compatible /models endpoint.
-func fetchOpenAIModels(ctx context.Context, apiBase, apiKey string) ([]ModelInfo, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", apiBase+"/models", nil)
-	if err != nil {
-		return nil, err
+func openAIModelsAPIBase(providerType, apiBase string) string {
+	base := strings.TrimRight(apiBase, "/")
+	if base != "" {
+		return base
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	switch providerType {
+	case store.ProviderAtlasCloud:
+		return store.AtlasCloudDefaultAPIBase
+	case store.ProviderAPIRoute:
+		return store.APIRouteDefaultAPIBase
+	case store.ProviderKimiCoding:
+		return store.KimiCodingDefaultAPIBase
+	default:
+		return "https://api.openai.com/v1"
+	}
+}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
+func openAIModelsExtraHeaders(providerType string) map[string]string {
+	if providerType != store.ProviderKimiCoding {
+		return nil
 	}
-	defer resp.Body.Close()
+	return map[string]string{
+		"User-Agent": store.KimiCodingRequiredUserAgent,
+	}
+}
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return nil, fmt.Errorf("provider API returned %d: %s", resp.StatusCode, string(body))
+func reasoningDefaultsForModels(
+	settings []byte,
+	models []ModelInfo,
+) *store.ProviderReasoningConfig {
+	if len(models) == 0 {
+		return nil
 	}
+	for _, model := range models {
+		if model.Reasoning != nil {
+			return store.ParseProviderReasoningConfig(settings)
+		}
+	}
+	return nil
+}
 
-	var result struct {
-		Data []struct {
-			ID      string `json:"id"`
-			OwnedBy string `json:"owned_by"`
-		} `json:"data"`
+func withReasoningCapabilities(models []ModelInfo) []ModelInfo {
+	result := make([]ModelInfo, 0, len(models))
+	for _, model := range models {
+		next := model
+		next.Reasoning = providers.LookupReasoningCapability(model.ID)
+		result = append(result, next)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode provider response: %w", err)
-	}
-
-	models := make([]ModelInfo, 0, len(result.Data))
-	for _, m := range result.Data {
-		models = append(models, ModelInfo{ID: m.ID, Name: m.OwnedBy})
-	}
-	return models, nil
+	return result
 }

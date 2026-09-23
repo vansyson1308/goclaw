@@ -68,15 +68,15 @@ func configValidateCmd() *cobra.Command {
 }
 
 // redactConfig returns a JSON-safe copy with secrets masked.
-func redactConfig(cfg *config.Config) interface{} {
+func redactConfig(cfg *config.Config) any {
 	data, _ := json.Marshal(cfg)
-	var raw map[string]interface{}
+	var raw map[string]any
 	json.Unmarshal(data, &raw)
 	redactMap(raw)
 	return raw
 }
 
-func redactMap(m map[string]interface{}) {
+func redactMap(m map[string]any) {
 	secretKeys := map[string]bool{
 		"apiKey": true, "api_key": true, "token": true,
 		"botToken": true, "bot_token": true, "secret": true,
@@ -89,7 +89,7 @@ func redactMap(m map[string]interface{}) {
 			} else if s, ok := v.(string); ok && s != "" {
 				m[k] = "****"
 			}
-		} else if sub, ok := v.(map[string]interface{}); ok {
+		} else if sub, ok := v.(map[string]any); ok {
 			redactMap(sub)
 		}
 	}

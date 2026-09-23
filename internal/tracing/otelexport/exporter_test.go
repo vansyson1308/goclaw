@@ -33,7 +33,7 @@ func TestUUIDToSpanID(t *testing.T) {
 		t.Errorf("expected 8 bytes, got %d", len(sid))
 	}
 	// Verify it uses the last 8 bytes
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if sid[i] != id[8+i] {
 			t.Errorf("byte %d: expected %02x, got %02x", i, id[8+i], sid[i])
 		}

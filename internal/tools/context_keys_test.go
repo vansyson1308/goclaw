@@ -3,7 +3,39 @@ package tools
 import (
 	"context"
 	"testing"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
+
+func TestWithDelegationID_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	if got := DelegationIDFromCtx(ctx); got != "" {
+		t.Errorf("empty context: want empty, got %q", got)
+	}
+
+	ctx = WithDelegationID(ctx, "deleg-123")
+	if got := DelegationIDFromCtx(ctx); got != "deleg-123" {
+		t.Errorf("round-trip: want deleg-123, got %q", got)
+	}
+}
+
+func TestDelegationIDFromCtx_RunContextFallback(t *testing.T) {
+	// When ctxDelegationID is NOT set but RunContext has the ID,
+	// DelegationIDFromCtx should return the RunContext value.
+	ctx := context.Background()
+	rc := &store.RunContext{DelegationID: "from-runcontext"}
+	ctx = store.WithRunContext(ctx, rc)
+
+	if got := DelegationIDFromCtx(ctx); got != "from-runcontext" {
+		t.Errorf("fallback: want from-runcontext, got %q", got)
+	}
+
+	// Explicit value wins over RunContext fallback.
+	ctx = WithDelegationID(ctx, "explicit")
+	if got := DelegationIDFromCtx(ctx); got != "explicit" {
+		t.Errorf("explicit-wins: want explicit, got %q", got)
+	}
+}
 
 func TestToolContextKeys_Channel(t *testing.T) {
 	ctx := context.Background()
@@ -64,6 +96,18 @@ func TestToolContextKeys_AsyncCB(t *testing.T) {
 	got(ctx, nil)
 	if !called {
 		t.Error("callback was not invoked")
+	}
+}
+
+func TestToolContextKeys_LeaderAgentID(t *testing.T) {
+	ctx := context.Background()
+	if v := LeaderAgentIDFromCtx(ctx); v != "" {
+		t.Errorf("expected empty, got %q", v)
+	}
+
+	ctx = WithLeaderAgentID(ctx, "leader-uuid-123")
+	if v := LeaderAgentIDFromCtx(ctx); v != "leader-uuid-123" {
+		t.Errorf("expected leader-uuid-123, got %q", v)
 	}
 }
 

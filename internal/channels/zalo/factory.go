@@ -18,10 +18,12 @@ type zaloCreds struct {
 
 // zaloInstanceConfig maps the non-secret config JSONB from the channel_instances table.
 type zaloInstanceConfig struct {
-	DMPolicy   string   `json:"dm_policy,omitempty"`
-	WebhookURL string   `json:"webhook_url,omitempty"`
-	MediaMaxMB int      `json:"media_max_mb,omitempty"`
-	AllowFrom  []string `json:"allow_from,omitempty"`
+	DMPolicy     string                     `json:"dm_policy,omitempty"`
+	WebhookURL   string                     `json:"webhook_url,omitempty"`
+	MediaMaxMB   int                        `json:"media_max_mb,omitempty"`
+	AllowFrom    []string                   `json:"allow_from,omitempty"`
+	BlockReply   *bool                      `json:"block_reply,omitempty"`
+	ChatBehavior *config.ChatBehaviorConfig `json:"chat_behavior,omitempty"`
 }
 
 // Factory creates a Zalo OA channel from DB instance data.
@@ -53,6 +55,8 @@ func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 		WebhookURL:    ic.WebhookURL,
 		WebhookSecret: c.WebhookSecret,
 		MediaMaxMB:    ic.MediaMaxMB,
+		BlockReply:    ic.BlockReply,
+		ChatBehavior:  ic.ChatBehavior,
 	}
 
 	ch, err := New(zCfg, msgBus, pairingSvc)

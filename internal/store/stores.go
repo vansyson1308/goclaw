@@ -1,20 +1,66 @@
 package store
 
+import "database/sql"
+
 // Stores is the top-level container for all storage backends.
-// In standalone mode, managed-only stores (Agents, Providers, Tracing, MCP) are nil.
 type Stores struct {
-	Sessions  SessionStore
-	Memory    MemoryStore
-	Cron      CronStore
-	Pairing   PairingStore
-	Skills    SkillStore
-	Agents    AgentStore      // nil in standalone mode
-	Providers ProviderStore   // nil in standalone mode
-	Tracing   TracingStore    // nil in standalone mode
-	MCP              MCPServerStore       // nil in standalone mode
-	CustomTools      CustomToolStore      // nil in standalone mode
-	ChannelInstances ChannelInstanceStore // nil in standalone mode
-	ConfigSecrets    ConfigSecretsStore   // nil in standalone mode
-	AgentLinks       AgentLinkStore       // nil in standalone mode
-	Teams            TeamStore            // nil in standalone mode
+	DB                    *sql.DB // underlying connection
+	Sessions              SessionStore
+	Memory                MemoryStore
+	Cron                  CronStore
+	Pairing               PairingStore
+	Skills                SkillStore
+	Agents                AgentStore
+	Providers             ProviderStore
+	Tracing               TracingStore
+	RunTimeline           RunTimelineStore
+	MCP                   MCPServerStore
+	MCPOAuthTokens        MCPOAuthTokenStore
+	ChannelInstances      ChannelInstanceStore
+	ConfigSecrets         ConfigSecretsStore
+	AgentLinks            AgentLinkStore
+	Teams                 TeamStore
+	BuiltinTools          BuiltinToolStore
+	PendingMessages       PendingMessageStore
+	ChannelMemory         ChannelMemoryExtractionStore
+	KnowledgeGraph        KnowledgeGraphStore
+	Contacts              ContactStore
+	Activity              ActivityStore
+	Snapshots             SnapshotStore
+	UsageEvents           UsageEventStore
+	BrowserCookies        BrowserCookieStore
+	SecureCLI             SecureCLIStore
+	SecureCLIGrants       SecureCLIAgentGrantStore
+	APIKeys               APIKeyStore
+	Heartbeats            HeartbeatStore
+	ConfigPermissions     ConfigPermissionStore
+	Tenants               TenantStore
+	BuiltinToolTenantCfgs BuiltinToolTenantConfigStore
+	SkillTenantCfgs       SkillTenantConfigStore
+	SkillEvolution        SkillEvolutionStore
+	SystemConfigs         SystemConfigStore
+	SubagentTasks         SubagentTaskStore
+	SubagentTaskRecovery  SubagentTaskRecoveryStore
+	Vault                 VaultStore
+	Episodic              EpisodicStore
+	EvolutionMetrics      EvolutionMetricsStore
+	EvolutionSuggestions  EvolutionSuggestionStore
+	Missions              MissionStore
+	BitrixPortals         BitrixPortalStore
+	// Hooks is hooks.HookStore — typed as any to avoid import cycle
+	// (hooks package imports store for context helpers).
+	// Callers: type-assert to hooks.HookStore before use.
+	Hooks any
+
+	Webhooks     WebhookStore
+	WebhookCalls WebhookCallStore
+
+	// Workstations — Standard edition only (gated at router registration).
+	Workstations           WorkstationStore
+	WorkstationLinks       AgentWorkstationLinkStore
+	WorkstationPermissions WorkstationPermissionStore
+	WorkstationActivity    WorkstationActivityStore
+
+	// UsageCaps is Standard/PostgreSQL only in the first budget-control rollout.
+	UsageCaps UsageCapStore
 }

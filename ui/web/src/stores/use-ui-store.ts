@@ -1,36 +1,72 @@
 import { create } from "zustand";
-import { LOCAL_STORAGE_KEYS } from "@/lib/constants";
+import { persist } from "zustand/middleware";
+import i18n from "@/i18n";
+import { type Language } from "@/lib/constants";
 
 export type Theme = "light" | "dark" | "system";
 
 interface UiState {
   theme: Theme;
+  language: Language;
+  timezone: string; // IANA timezone or "auto"
   sidebarCollapsed: boolean;
+  mobileSidebarOpen: boolean;
+  pageSize: number; // global pagination page size preference
 
   setTheme: (theme: Theme) => void;
+  setLanguage: (language: Language) => void;
+  setTimezone: (tz: string) => void;
   toggleSidebar: () => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
+  setMobileSidebarOpen: (open: boolean) => void;
+  setPageSize: (size: number) => void;
 }
 
-export const useUiStore = create<UiState>((set) => ({
-  theme: (localStorage.getItem(LOCAL_STORAGE_KEYS.THEME) as Theme) ?? "dark",
-  sidebarCollapsed:
-    localStorage.getItem(LOCAL_STORAGE_KEYS.SIDEBAR_COLLAPSED) === "true",
+export const useUiStore = create<UiState>()(
+  persist(
+    (set, get) => ({
+      theme: "dark" as Theme,
+      language: (i18n.language as Language) ?? "en",
+      timezone: "auto",
+      sidebarCollapsed: false,
+      mobileSidebarOpen: false,
+      pageSize: 20,
 
-  setTheme: (theme) => {
-    localStorage.setItem(LOCAL_STORAGE_KEYS.THEME, theme);
-    set({ theme });
-  },
+      setTheme: (theme) => {
+        set({ theme });
+      },
 
-  toggleSidebar: () =>
-    set((state) => {
-      const next = !state.sidebarCollapsed;
-      localStorage.setItem(LOCAL_STORAGE_KEYS.SIDEBAR_COLLAPSED, String(next));
-      return { sidebarCollapsed: next };
+      setLanguage: (language) => {
+        i18n.changeLanguage(language);
+        set({ language });
+      },
+
+      setTimezone: (tz) => {
+        set({ timezone: tz });
+      },
+
+      toggleSidebar: () => {
+        set({ sidebarCollapsed: !get().sidebarCollapsed });
+      },
+
+      setSidebarCollapsed: (collapsed) => {
+        set({ sidebarCollapsed: collapsed });
+      },
+
+      setMobileSidebarOpen: (open) => set({ mobileSidebarOpen: open }),
+
+      setPageSize: (size) => set({ pageSize: size }),
     }),
-
-  setSidebarCollapsed: (collapsed) => {
-    localStorage.setItem(LOCAL_STORAGE_KEYS.SIDEBAR_COLLAPSED, String(collapsed));
-    set({ sidebarCollapsed: collapsed });
-  },
-}));
+    {
+      name: "goclaw:ui", // localStorage key
+      partialize: (state) => ({
+        // Persist user preferences — not transient UI state
+        theme: state.theme,
+        language: state.language,
+        timezone: state.timezone,
+        sidebarCollapsed: state.sidebarCollapsed,
+        pageSize: state.pageSize,
+      }),
+    }
+  )
+);

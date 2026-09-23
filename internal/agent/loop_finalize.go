@@ -1,0 +1,252 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"log/slog"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
+	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+)
+
+// isUserFilePopulated checks if USER.md has been filled with actual user data
+// beyond the blank template. The template has "- **Name:**\n" with no value.
+func isUserFilePopulated(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	// Template markers: "**Name:**" followed by newline (no value) or just whitespace
+	for line := range strings.SplitSeq(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "- **Name:**" || line == "**Name:**" {
+			return false // name field still empty
+		}
+	}
+	return true
+}
+
+// finalizeRun performs post-loop processing: sanitization, media dedup, session flush,
+// bootstrap cleanup, and builds the final RunResult.
+func (l *Loop) finalizeRun(
+	ctx context.Context,
+	rs *runState,
+	req *RunRequest,
+	history []providers.Message,
+	hadBootstrap bool,
+	toolTiming ToolTimingMap,
+) *RunResult {
+	// Extract MEDIA:<path> tokens the LLM echoed in its final response
+	// BEFORE sanitize strips them. Covers cases where a tool returned its
+	// artifact via the ForLLM MEDIA: prefix but the agent relayed it as plain
+	// text (e.g. PDF from exec/weasyprint, TTS mp3 paths the LLM quotes back).
+	if extracted := extractMediaFromContent(rs.finalContent, l.mediaEgressRoots(ctx)); len(extracted) > 0 {
+		rs.mediaResults = append(rs.mediaResults, extracted...)
+	}
+
+	// 5. Full sanitization pipeline (matching TS extractAssistantText + sanitizeUserFacingText)
+	rs.finalContent = SanitizeAssistantContent(rs.finalContent)
+
+	// 6. Handle NO_REPLY: save to session for context but mark as silent.
+	isSilent := IsSilentReply(rs.finalContent)
+
+	// 5b. Skill evolution: postscript suggestion after complex tasks.
+	if l.skillEvolve && l.skillNudgeInterval > 0 &&
+		rs.totalToolCalls >= l.skillNudgeInterval &&
+		rs.finalContent != "" && !isSilent && !rs.skillPostscriptSent {
+		rs.skillPostscriptSent = true
+		locale := store.LocaleFromContext(ctx)
+		rs.finalContent += "\n\n---\n_" + i18n.T(locale, i18n.MsgSkillNudgePostscript) + "_"
+	}
+
+	// 7. Fallback only when there is no other deliverable output. Media-only
+	// runs must remain media-only instead of gaining a visible caption. Use a
+	// meaningful localized message instead of the old meaningless "...".
+	hasDeliverableOutput := len(rs.mediaResults) > 0 ||
+		len(req.ForwardMedia) > 0 ||
+		req.ContentSuffix != ""
+	if rs.finalContent == "" && !hasDeliverableOutput {
+		rs.finalContent = i18n.T(store.LocaleFromContext(ctx), i18n.MsgEmptyReplyFallback)
+	}
+
+	// Append content suffix (e.g. image markdown for WS) before saving to session.
+	// Dedup by basename: skip suffix lines whose file already appears in the agent's text.
+	if req.ContentSuffix != "" {
+		rs.finalContent += deduplicateMediaSuffix(rs.finalContent, req.ContentSuffix)
+	}
+
+	// Collect forwarded media + dedup + populate sizes BEFORE saving to session,
+	// so we can attach output MediaRefs to the assistant message for history reload.
+	for _, mf := range req.ForwardMedia {
+		ct := mf.MimeType
+		if ct == "" {
+			ct = mimeFromExt(filepath.Ext(mf.Path))
+		}
+		rs.mediaResults = append(rs.mediaResults, MediaResult{Path: mf.Path, ContentType: ct})
+	}
+	rs.mediaResults = deduplicateMedia(rs.mediaResults)
+	for i := range rs.mediaResults {
+		if rs.mediaResults[i].Size == 0 {
+			if info, err := os.Stat(rs.mediaResults[i].Path); err == nil {
+				rs.mediaResults[i].Size = info.Size()
+			}
+		}
+	}
+
+	// Build final assistant message with output media refs for history persistence.
+	assistantMsg := providers.Message{
+		Role:     "assistant",
+		Content:  rs.finalContent,
+		Thinking: rs.finalThinking,
+	}
+	for _, mr := range rs.mediaResults {
+		kind := "document"
+		if strings.HasPrefix(mr.ContentType, "image/") {
+			kind = "image"
+		} else if strings.HasPrefix(mr.ContentType, "audio/") {
+			kind = "audio"
+		} else if strings.HasPrefix(mr.ContentType, "video/") {
+			kind = "video"
+		}
+		assistantMsg.MediaRefs = append(assistantMsg.MediaRefs, providers.MediaRef{
+			ID:       filepath.Base(mr.Path),
+			MimeType: mr.ContentType,
+			Kind:     kind,
+			Path:     mr.Path,
+		})
+	}
+	rs.pendingMsgs = append(rs.pendingMsgs, assistantMsg)
+
+	// Bootstrap nudge: if model didn't call write_file on turn 2+, inject reminder
+	// into session history so the next turn sees it.
+	if hadBootstrap && l.bootstrapCleanup != nil {
+		nudgeUserTurns := 1
+		for _, m := range history {
+			if m.Role == "user" {
+				nudgeUserTurns++
+			}
+		}
+		if !rs.bootstrapWriteDetected && nudgeUserTurns >= 2 && nudgeUserTurns < bootstrapAutoCleanupTurns {
+			rs.pendingMsgs = append(rs.pendingMsgs, providers.Message{
+				Role:    "user",
+				Content: "[System] You haven't completed onboarding yet. Please update USER.md with the user's details and clear BOOTSTRAP.md as instructed.",
+			})
+		}
+	}
+
+	// Bootstrap auto-cleanup: after enough conversation turns, remove BOOTSTRAP.md.
+	// If USER.md is still the blank template, inject a reminder so the agent fills it.
+	// Must run BEFORE session flush so the nudge message is persisted to history.
+	if hadBootstrap && l.bootstrapCleanup != nil {
+		userTurns := 1 // current user message
+		for _, m := range history {
+			if m.Role == "user" {
+				userTurns++
+			}
+		}
+		if userTurns >= bootstrapAutoCleanupTurns {
+			if cleanErr := l.bootstrapCleanup(ctx, l.agentUUID, req.UserID); cleanErr != nil {
+				slog.Warn("bootstrap auto-cleanup failed", "error", cleanErr, "agent", l.id, "user", req.UserID)
+			} else {
+				slog.Info("bootstrap auto-cleanup completed", "agent", l.id, "user", req.UserID, "turns", userTurns)
+				// Check if USER.md is still the blank template — nudge agent to fill it
+				if l.contextFileLoader != nil {
+					files := l.contextFileLoader(ctx, l.agentUUID, req.UserID, l.agentType)
+					for _, f := range files {
+						if f.Path == bootstrap.UserFile && !isUserFilePopulated(f.Content) {
+							rs.pendingMsgs = append(rs.pendingMsgs, providers.Message{
+								Role:    "user",
+								Content: "[System] You completed onboarding but USER.md is still empty. Please update USER.md with the user's name and details from this conversation using write_file.",
+							})
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Flush all buffered messages to session atomically.
+	for _, msg := range rs.pendingMsgs {
+		l.sessions.AddMessage(ctx, req.SessionKey, msg)
+	}
+
+	// Persist adaptive tool timing to session metadata.
+	if serialized := toolTiming.Serialize(); serialized != "" {
+		l.sessions.SetSessionMetadata(ctx, req.SessionKey, map[string]string{"tool_timing": serialized})
+	}
+
+	// Write session metadata (matching TS session entry updates)
+	l.sessions.UpdateMetadata(ctx, req.SessionKey, l.model, l.provider.Name(), req.Channel)
+	l.sessions.AccumulateTokens(ctx, req.SessionKey, int64(rs.totalUsage.PromptTokens), int64(rs.totalUsage.CompletionTokens))
+
+	// Calibrate token estimation using the last LLM request, not the total run.
+	if rs.lastUsage.PromptTokens > 0 && rs.lastUsageMsgCount > 0 {
+		l.sessions.SetLastPromptTokens(ctx, req.SessionKey, rs.lastUsage.PromptTokens, rs.lastUsageMsgCount)
+	}
+
+	l.sessions.Save(ctx, req.SessionKey)
+
+	// 8. Metadata Stripping: Clean internal [[...]] tags for user-facing content
+	rs.finalContent = StripMessageDirectives(rs.finalContent)
+	if isSilent {
+		slog.Info("agent loop: NO_REPLY detected, suppressing delivery",
+			"agent", l.id, "session", req.SessionKey)
+		rs.finalContent = ""
+		if req.ContentSuffix != "" {
+			rs.finalContent = deduplicateMediaSuffix("", req.ContentSuffix)
+		}
+	}
+
+	// 9. Maybe summarize
+	// Legacy v2 path has no mid-loop pressure signal (that lives in v3 RunState.Prune),
+	// so pass false — this preserves the original baseline-threshold behavior here.
+	l.maybeSummarize(ctx, req.SessionKey, false)
+
+	// V3: emit session.completed for consolidation pipeline (episodic → semantic → dreaming)
+	if l.domainBus != nil {
+		// Bug C parity: include count in SourceID so the eventbus dedup key advances
+		// per compaction cycle (matches the v3 adapter emit path). This path is
+		// currently disabled (FinalizeStage owns finalization) but kept in sync.
+		finalizeCount := l.sessions.GetCompactionCount(ctx, req.SessionKey)
+		l.domainBus.Publish(eventbus.DomainEvent{
+			Type:     eventbus.EventSessionCompleted,
+			TenantID: l.tenantID.String(),
+			AgentID:  l.agentUUID.String(),
+			UserID:   req.UserID,
+			SourceID: fmt.Sprintf("%s:%d", req.SessionKey, finalizeCount),
+			Payload: &eventbus.SessionCompletedPayload{
+				SessionKey:      req.SessionKey,
+				MessageCount:    len(history) + len(rs.pendingMsgs),
+				TokensUsed:      rs.totalUsage.PromptTokens + rs.totalUsage.CompletionTokens,
+				CompactionCount: finalizeCount,
+			},
+		})
+	}
+
+	var lastUsage *providers.Usage
+	if rs.lastUsage.PromptTokens > 0 || rs.lastUsage.CompletionTokens > 0 || rs.lastUsage.TotalTokens > 0 {
+		lastUsage = &rs.lastUsage
+	}
+
+	return &RunResult{
+		Content:        rs.finalContent,
+		Thinking:       rs.finalThinking,
+		RunID:          req.RunID,
+		Iterations:     rs.iteration,
+		Usage:          &rs.totalUsage,
+		LastUsage:      lastUsage,
+		Media:          rs.mediaResults,
+		Deliverables:   rs.deliverables,
+		BlockReplies:   rs.blockReplies,
+		LastBlockReply: rs.lastBlockReply,
+		LoopKilled:     rs.loopKilled,
+	}
+}

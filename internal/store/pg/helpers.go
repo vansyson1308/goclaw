@@ -3,85 +3,59 @@ package pg
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
+	"log/slog"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/store/base"
 )
 
-// --- Nullable helpers ---
+// --- Nullable helpers (delegated to base/) ---
 
-func nilStr(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
+var (
+	nilStr    = base.NilStr
+	nilInt    = base.NilInt
+	nilUUID   = base.NilUUID
+	nilTime   = base.NilTime
+	derefStr  = base.DerefStr
+	derefInt  = base.DerefInt
+	derefUUID = base.DerefUUID
+	derefBytes = base.DerefBytes
+)
 
-func nilInt(v int) *int {
-	if v == 0 {
-		return nil
-	}
-	return &v
-}
+// --- JSON helpers (delegated to base/) ---
 
-func nilUUID(u *uuid.UUID) *uuid.UUID {
-	if u == nil || *u == uuid.Nil {
-		return nil
-	}
-	return u
-}
+var (
+	jsonOrEmpty      = base.JsonOrEmpty
+	jsonOrEmptyArray = base.JsonOrEmptyArray
+	jsonOrNull       = base.JsonOrNull
+)
 
-func nilTime(t *time.Time) *time.Time {
-	if t == nil || t.IsZero() {
-		return nil
-	}
-	return t
-}
+// --- Column/table validation (delegated to base/) ---
 
-func derefStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
+var validColumnName = base.ValidColumnName
 
-func derefUUID(u *uuid.UUID) uuid.UUID {
-	if u == nil {
-		return uuid.Nil
-	}
-	return *u
-}
-
-// --- JSON helpers ---
-
-func jsonOrEmpty(data []byte) []byte {
-	if data == nil {
-		return []byte("{}")
-	}
-	return data
-}
-
-func jsonOrNull(data json.RawMessage) interface{} {
-	if data == nil {
-		return nil
-	}
-	return []byte(data)
-}
-
-// --- PostgreSQL array helpers ---
+// --- PostgreSQL array helpers (PG-specific) ---
 
 // pqStringArray converts a Go string slice to a PostgreSQL text[] literal.
-func pqStringArray(arr []string) interface{} {
+// Each element is double-quoted and escaped to prevent array literal injection.
+func pqStringArray(arr []string) any {
 	if arr == nil {
 		return nil
 	}
-	return "{" + strings.Join(arr, ",") + "}"
+	quoted := make([]string, len(arr))
+	for i, s := range arr {
+		escaped := strings.ReplaceAll(s, `\`, `\\`)
+		escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+		quoted[i] = `"` + escaped + `"`
+	}
+	return "{" + strings.Join(quoted, ",") + "}"
 }
 
 // scanStringArray parses a PostgreSQL text[] column (scanned as []byte) into a Go string slice.
+// Handles both quoted and unquoted elements in PostgreSQL array literal format.
 func scanStringArray(data []byte, dest *[]string) {
 	if data == nil || len(data) == 0 {
 		return
@@ -92,30 +66,117 @@ func scanStringArray(data []byte, dest *[]string) {
 	if s == "" {
 		return
 	}
-	*dest = strings.Split(s, ",")
+
+	// Parse PostgreSQL array format: {val1,"quoted,val",val3}
+	var result []string
+	i := 0
+	for i < len(s) {
+		if s[i] == '"' {
+			// Quoted element: find closing quote (handle escaped quotes)
+			i++ // skip opening quote
+			var elem strings.Builder
+			for i < len(s) {
+				if s[i] == '\\' && i+1 < len(s) {
+					elem.WriteByte(s[i+1])
+					i += 2
+				} else if s[i] == '"' {
+					i++ // skip closing quote
+					break
+				} else {
+					elem.WriteByte(s[i])
+					i++
+				}
+			}
+			result = append(result, elem.String())
+		} else {
+			// Unquoted element: read until comma
+			j := strings.IndexByte(s[i:], ',')
+			if j < 0 {
+				result = append(result, s[i:])
+				break
+			}
+			result = append(result, s[i:i+j])
+			i += j
+		}
+		// Skip comma separator
+		if i < len(s) && s[i] == ',' {
+			i++
+		}
+	}
+	*dest = result
 }
 
-// --- Dynamic UPDATE helper ---
+// --- Dynamic UPDATE helpers (using base.BuildMapUpdate) ---
 
 // execMapUpdate builds and runs a dynamic UPDATE from a column→value map.
 func execMapUpdate(ctx context.Context, db *sql.DB, table string, id uuid.UUID, updates map[string]any) error {
-	if len(updates) == 0 {
+	query, args, err := base.BuildMapUpdate(pgDialect, table, id, updates)
+	if err != nil {
+		slog.Warn("security.invalid_column_name", "table", table, "error", err)
+		return err
+	}
+	if query == "" {
 		return nil
 	}
-	var setClauses []string
-	var args []interface{}
-	i := 1
-	for col, val := range updates {
-		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col, i))
-		args = append(args, val)
-		i++
-	}
-	args = append(args, id)
-	q := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", table, strings.Join(setClauses, ", "), i)
-	_, err := db.ExecContext(ctx, q, args...)
+	_, err = db.ExecContext(ctx, query, args...)
 	return err
 }
 
-func nowUTC() time.Time {
-	return time.Now().UTC()
+// execMapUpdateWhereTenant is like execMapUpdate but appends AND tenant_id = $N filter.
+func execMapUpdateWhereTenant(ctx context.Context, db *sql.DB, table string, updates map[string]any, id, tenantID uuid.UUID) error {
+	query, args, err := base.BuildMapUpdateWhereTenant(pgDialect, table, updates, id, tenantID)
+	if err != nil {
+		slog.Warn("security.invalid_column_name", "table", table, "error", err)
+		return err
+	}
+	if query == "" {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, query, args...)
+	return err
 }
+
+// tableHasUpdatedAt returns true if the table has an updated_at column.
+var tableHasUpdatedAt = base.TableHasUpdatedAt
+
+// --- Tenant filter helpers (delegated to base/) ---
+
+// tenantIDForInsert returns the tenant UUID for INSERT operations.
+func tenantIDForInsert(ctx context.Context) uuid.UUID {
+	return base.TenantIDForInsert(store.TenantIDFromContext(ctx), store.MasterTenantID)
+}
+
+// requireTenantID returns the tenant UUID or an error if missing (fail-closed).
+func requireTenantID(ctx context.Context) (uuid.UUID, error) {
+	tid := store.TenantIDFromContext(ctx)
+	if err := base.RequireTenantID(tid); err != nil {
+		return uuid.Nil, err
+	}
+	return tid, nil
+}
+
+// --- Scope-based query helpers (thin wrappers around base/) ---
+
+// scopeClause extracts QueryScope from context and generates WHERE conditions.
+func scopeClause(ctx context.Context, startParam int) (clause string, args []any, nextParam int, err error) {
+	scope, err := store.ScopeFromContext(ctx)
+	if err != nil {
+		return "", nil, startParam, err
+	}
+	bScope := base.QueryScope{TenantID: scope.TenantID, ProjectID: scope.ProjectID}
+	clause, args, nextParam = base.BuildScopeClause(pgDialect, bScope, startParam)
+	return clause, args, nextParam, nil
+}
+
+// scopeClauseAlias is like scopeClause but qualifies columns with a table alias.
+// SECURITY: alias is interpolated into SQL — callers MUST pass hardcoded string literals only.
+func scopeClauseAlias(ctx context.Context, startParam int, alias string) (clause string, args []any, nextParam int, err error) {
+	scope, err := store.ScopeFromContext(ctx)
+	if err != nil {
+		return "", nil, startParam, err
+	}
+	bScope := base.QueryScope{TenantID: scope.TenantID, ProjectID: scope.ProjectID}
+	clause, args, nextParam = base.BuildScopeClauseAlias(pgDialect, bScope, startParam, alias)
+	return clause, args, nextParam, nil
+}
+

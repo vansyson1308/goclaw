@@ -3,22 +3,32 @@ package methods
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
+	"os"
 
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
+	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
-// SkillsMethods handles skills.list, skills.get, skills.update.
-// Uses store.SkillStore interface — PGSkillStore in managed mode, FileSkillStore in standalone.
-type SkillsMethods struct {
-	store store.SkillStore
+// skillOwnerGetter is an optional interface for stores that can return a skill's owner ID.
+type skillOwnerGetter interface {
+	GetSkillOwnerID(ctx context.Context, id uuid.UUID) (string, bool)
 }
 
-func NewSkillsMethods(s store.SkillStore) *SkillsMethods {
-	return &SkillsMethods{store: s}
+// SkillsMethods handles skills.list, skills.get, skills.update.
+type SkillsMethods struct {
+	store          store.SkillStore
+	tenantCfgStore store.SkillTenantConfigStore
+}
+
+func NewSkillsMethods(s store.SkillStore, tenantCfg store.SkillTenantConfigStore) *SkillsMethods {
+	return &SkillsMethods{store: s, tenantCfgStore: tenantCfg}
 }
 
 func (m *SkillsMethods) Register(router *gateway.MethodRouter) {
@@ -27,24 +37,82 @@ func (m *SkillsMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodSkillsUpdate, m.handleUpdate)
 }
 
-func (m *SkillsMethods) handleList(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
-	allSkills := m.store.ListSkills()
+func (m *SkillsMethods) handleList(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	allSkills := m.store.ListSkills(ctx)
 
-	result := make([]map[string]interface{}, 0, len(allSkills))
-	for _, s := range allSkills {
-		result = append(result, map[string]interface{}{
-			"name":        s.Name,
-			"description": s.Description,
-			"source":      s.Source,
-		})
+	// Visibility filter: non-admins see system skills, public skills, and
+	// their own private skills. Admins see everything in the tenant.
+	if !permissions.HasMinRole(client.Role(), permissions.RoleAdmin) {
+		allSkills = store.FilterVisibleSkills(ctx, allSkills)
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	result := make([]map[string]any, 0, len(allSkills))
+	for _, s := range allSkills {
+		entry := map[string]any{
+			"name":        s.Name,
+			"slug":        s.Slug,
+			"description": s.Description,
+			"source":      s.Source,
+			"version":     s.Version,
+			"is_system":   s.IsSystem,
+			"enabled":     s.Enabled,
+		}
+		if s.ID != "" {
+			entry["id"] = s.ID
+		}
+		if s.Visibility != "" {
+			entry["visibility"] = s.Visibility
+		}
+		if len(s.Tags) > 0 {
+			entry["tags"] = s.Tags
+		}
+		if s.Status != "" {
+			entry["status"] = s.Status
+		}
+		if s.Author != "" {
+			entry["author"] = s.Author
+		}
+		if s.CreatorAgent != nil {
+			entry["creator_agent"] = s.CreatorAgent
+		}
+		if len(s.ManagerAgents) > 0 {
+			entry["manager_agents"] = s.ManagerAgents
+		}
+		if len(s.MissingDeps) > 0 {
+			entry["missing_deps"] = s.MissingDeps
+		}
+		result = append(result, entry)
+	}
+
+	// Merge per-tenant overrides when tenant-scoped
+	tid := store.TenantIDFromContext(ctx)
+	if tid != uuid.Nil && m.tenantCfgStore != nil {
+		overrides, err := m.tenantCfgStore.ListAll(ctx, tid)
+		if err != nil {
+			slog.Warn("skill tenant config list failed", "tenant", tid, "error", err)
+		}
+		if err == nil && len(overrides) > 0 {
+			for i, entry := range result {
+				idStr, _ := entry["id"].(string)
+				if idStr == "" {
+					continue
+				}
+				if skID, err := uuid.Parse(idStr); err == nil {
+					if enabled, ok := overrides[skID]; ok {
+						result[i]["tenant_enabled"] = enabled
+					}
+				}
+			}
+		}
+	}
+
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"skills": result,
 	}))
 }
 
-func (m *SkillsMethods) handleGet(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SkillsMethods) handleGet(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		Name string `json:"name"`
 	}
@@ -52,49 +120,90 @@ func (m *SkillsMethods) handleGet(_ context.Context, client *gateway.Client, req
 		json.Unmarshal(req.Params, &params)
 	}
 	if params.Name == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "name is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "name")))
 		return
 	}
 
-	info, ok := m.store.GetSkill(params.Name)
+	info, ok := m.store.GetSkill(ctx, params.Name)
 	if !ok {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, "skill not found: "+params.Name))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "skill", params.Name)))
 		return
 	}
 
-	content, _ := m.store.LoadSkill(params.Name)
+	// Visibility gate: hide private skills from non-owners (admins bypass).
+	if !permissions.HasMinRole(client.Role(), permissions.RoleAdmin) &&
+		!store.IsSkillVisibleTo(ctx, info.OwnerID, info.Visibility, info.IsSystem) {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "skill", params.Name)))
+		return
+	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	content, ok := m.store.LoadSkill(ctx, info.Slug)
+	if !ok && info.Path != "" {
+		if b, err := os.ReadFile(info.Path); err == nil {
+			content = string(b)
+		}
+	}
+
+	resp := map[string]any{
 		"name":        info.Name,
+		"slug":        info.Slug,
 		"description": info.Description,
 		"source":      info.Source,
 		"content":     content,
-	}))
+		"version":     info.Version,
+		"enabled":     info.Enabled,
+	}
+	if info.ID != "" {
+		resp["id"] = info.ID
+	}
+	if info.Visibility != "" {
+		resp["visibility"] = info.Visibility
+	}
+	if len(info.Tags) > 0 {
+		resp["tags"] = info.Tags
+	}
+	if info.Status != "" {
+		resp["status"] = info.Status
+	}
+	if info.Author != "" {
+		resp["author"] = info.Author
+	}
+	if info.CreatorAgent != nil {
+		resp["creator_agent"] = info.CreatorAgent
+	}
+	if len(info.ManagerAgents) > 0 {
+		resp["manager_agents"] = info.ManagerAgents
+	}
+	if len(info.MissingDeps) > 0 {
+		resp["missing_deps"] = info.MissingDeps
+	}
+	client.SendResponse(protocol.NewOKResponse(req.ID, resp))
 }
 
 // skillUpdater is an optional interface for stores that support skill updates (e.g. PGSkillStore).
 type skillUpdater interface {
-	UpdateSkill(id uuid.UUID, updates map[string]interface{}) error
+	UpdateSkill(ctx context.Context, id uuid.UUID, updates map[string]any) error
 }
 
-func (m *SkillsMethods) handleUpdate(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SkillsMethods) handleUpdate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		Name    string                 `json:"name"`
-		ID      string                 `json:"id"`
-		Updates map[string]interface{} `json:"updates"`
+		Name    string         `json:"name"`
+		ID      string         `json:"id"`
+		Updates map[string]any `json:"updates"`
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
 	}
 	if params.Name == "" && params.ID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "name or id is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "name or id")))
 		return
 	}
 
 	// Check if the store supports updates (PGSkillStore does, FileSkillStore doesn't)
 	updater, ok := m.store.(skillUpdater)
 	if !ok {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, "skills.update not supported in standalone mode"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgSkillsUpdateNotSupported)))
 		return
 	}
 
@@ -103,33 +212,62 @@ func (m *SkillsMethods) handleUpdate(_ context.Context, client *gateway.Client, 
 	if params.ID != "" {
 		parsed, err := uuid.Parse(params.ID)
 		if err != nil {
-			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid skill ID"))
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "skill")))
 			return
 		}
 		skillID = parsed
 	} else {
 		// Look up by name — use GetSkill which returns path info, but we need DB ID
 		// For PGSkillStore, the name is the slug
-		info, exists := m.store.GetSkill(params.Name)
+		info, exists := m.store.GetSkill(ctx, params.Name)
 		if !exists {
-			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, "skill not found: "+params.Name))
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "skill", params.Name)))
 			return
 		}
 		// Try to parse Path as UUID (PGSkillStore stores DB ID in Path field for managed skills)
 		parsed, err := uuid.Parse(info.Path)
 		if err != nil {
-			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "cannot resolve skill ID for file-based skill"))
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgCannotResolveSkillID)))
 			return
 		}
 		skillID = parsed
 	}
 
 	if params.Updates == nil || len(params.Updates) == 0 {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "updates is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "updates")))
 		return
 	}
 
-	if err := updater.UpdateSkill(skillID, params.Updates); err != nil {
+	// Ownership check first: only skill owner or admin can update.
+	// Fail-closed: if store doesn't implement skillOwnerGetter, deny non-admin callers.
+	// Auth-before-validate avoids leaking skill-existence info via validation errors.
+	if !permissions.HasMinRole(client.Role(), permissions.RoleAdmin) {
+		ownerGetter, ok := m.store.(skillOwnerGetter)
+		if !ok {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "skills.update")))
+			return
+		}
+		if ownerID, found := ownerGetter.GetSkillOwnerID(ctx, skillID); found && ownerID != client.UserID() {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "skills.update")))
+			return
+		}
+	}
+
+	// Validate visibility enum if present — fail closed before mutating the DB.
+	if v, ok := params.Updates["visibility"]; ok {
+		vs, ok := v.(string)
+		if !ok {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidVisibility, "")))
+			return
+		}
+		if err := skills.ValidateVisibility(vs); err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidVisibility, vs)))
+			return
+		}
+		params.Updates["visibility"] = skills.NormalizeVisibility(vs)
+	}
+
+	if err := updater.UpdateSkill(ctx, skillID, params.Updates); err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
 		return
 	}

@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -61,14 +63,21 @@ type TokenEstimateFunc func(sessionKey string) (tokens int, contextWindow int)
 
 // PendingRequest is a queued agent run awaiting execution.
 type PendingRequest struct {
-	Req      agent.RunRequest
-	ResultCh chan RunOutcome
+	Req        agent.RunRequest
+	ResultCh   chan RunOutcome
+	EnqueuedAt time.Time // timestamp when enqueued, used for stale message detection
 }
 
 // RunOutcome is the result of a scheduled agent run.
 type RunOutcome struct {
 	Result *agent.RunResult
 	Err    error
+}
+
+// activeRunEntry tracks a running agent execution with its generation.
+type activeRunEntry struct {
+	cancel     context.CancelFunc
+	generation uint64
 }
 
 // SessionQueue manages agent runs for a single session key.
@@ -80,13 +89,15 @@ type SessionQueue struct {
 	laneMgr *LaneManager
 	lane     string
 
-	mu            sync.Mutex
-	queue         []*PendingRequest
-	activeRuns    map[string]context.CancelFunc // runID → cancel
-	activeOrder   []string                      // FIFO order of active runIDs
-	maxConcurrent int                           // effective limit (from config or per-session override)
-	timer         *time.Timer                   // debounce timer
-	parentCtx     context.Context               // stored from first Enqueue call
+	mu              sync.Mutex
+	queue           []*PendingRequest
+	activeRuns      map[string]activeRunEntry // runID → entry (with generation)
+	activeOrder     []string                  // FIFO order of active runIDs
+	maxConcurrent   int                       // effective limit (from config or per-session override)
+	timer           *time.Timer               // debounce timer
+	parentCtx       context.Context           // stored from first Enqueue call
+	abortCutoffTime time.Time                 // messages enqueued before this are stale
+	generation      uint64                    // bumped on Reset() to ignore stale completions
 
 	tokenEstimateFn TokenEstimateFunc // optional: for adaptive throttle
 }
@@ -103,7 +114,7 @@ func NewSessionQueue(key, lane string, cfg QueueConfig, laneMgr *LaneManager, ru
 		runFn:         runFn,
 		laneMgr:       laneMgr,
 		lane:          lane,
-		activeRuns:    make(map[string]context.CancelFunc),
+		activeRuns:    make(map[string]activeRunEntry),
 		maxConcurrent: maxC,
 	}
 }
@@ -148,7 +159,7 @@ func (sq *SessionQueue) hasCapacity() bool {
 // Returns a channel that receives the result when the run completes.
 func (sq *SessionQueue) Enqueue(ctx context.Context, req agent.RunRequest) <-chan RunOutcome {
 	outcome := make(chan RunOutcome, 1)
-	pending := &PendingRequest{Req: req, ResultCh: outcome}
+	pending := &PendingRequest{Req: req, ResultCh: outcome, EnqueuedAt: time.Now()}
 
 	sq.mu.Lock()
 	defer sq.mu.Unlock()
@@ -161,8 +172,8 @@ func (sq *SessionQueue) Enqueue(ctx context.Context, req agent.RunRequest) <-cha
 	switch sq.config.Mode {
 	case QueueModeInterrupt:
 		// Cancel all active runs
-		for runID, cancel := range sq.activeRuns {
-			cancel()
+		for runID, entry := range sq.activeRuns {
+			entry.cancel()
 			delete(sq.activeRuns, runID)
 		}
 		sq.activeOrder = nil
@@ -223,8 +234,28 @@ func (sq *SessionQueue) startAvailable(ctx context.Context) {
 }
 
 // startOne picks the first queued request and runs it in the lane.
+// Skips stale messages that were enqueued before the last abort cutoff.
 // Must be called with sq.mu held.
 func (sq *SessionQueue) startOne(ctx context.Context) {
+	// Skip stale messages enqueued before the last /stopall abort cutoff.
+	for len(sq.queue) > 0 {
+		head := sq.queue[0]
+		if !sq.abortCutoffTime.IsZero() && head.EnqueuedAt.Before(sq.abortCutoffTime) {
+			sq.queue = sq.queue[1:]
+			head.ResultCh <- RunOutcome{Err: ErrMessageStale}
+			close(head.ResultCh)
+			slog.Debug("scheduler: skipped stale message",
+				"session", sq.key,
+				"enqueued", head.EnqueuedAt,
+				"cutoff", sq.abortCutoffTime,
+			)
+			continue
+		}
+		// Clear cutoff once a non-stale message is found
+		sq.abortCutoffTime = time.Time{}
+		break
+	}
+
 	if len(sq.queue) == 0 {
 		return
 	}
@@ -234,7 +265,7 @@ func (sq *SessionQueue) startOne(ctx context.Context) {
 
 	runID := pending.Req.RunID
 	runCtx, cancel := context.WithCancel(ctx)
-	sq.activeRuns[runID] = cancel
+	sq.activeRuns[runID] = activeRunEntry{cancel: cancel, generation: sq.generation}
 	sq.activeOrder = append(sq.activeOrder, runID)
 
 	lane := sq.laneMgr.Get(sq.lane)
@@ -242,14 +273,16 @@ func (sq *SessionQueue) startOne(ctx context.Context) {
 		lane = sq.laneMgr.Get(LaneMain)
 	}
 
+	gen := sq.generation // capture generation under lock
+
 	if lane == nil {
 		// No lane available — run directly
-		go sq.executeRun(runCtx, runID, pending)
+		go sq.executeRun(runCtx, runID, gen, pending)
 		return
 	}
 
 	err := lane.Submit(ctx, func() {
-		sq.executeRun(runCtx, runID, pending)
+		sq.executeRun(runCtx, runID, gen, pending)
 	})
 	if err != nil {
 		pending.ResultCh <- RunOutcome{Err: err}
@@ -261,14 +294,38 @@ func (sq *SessionQueue) startOne(ctx context.Context) {
 }
 
 // executeRun runs the agent and then starts the next queued message(s) if capacity allows.
-func (sq *SessionQueue) executeRun(ctx context.Context, runID string, pending *PendingRequest) {
+func (sq *SessionQueue) executeRun(ctx context.Context, runID string, runGeneration uint64, pending *PendingRequest) {
+	// Defense-in-depth: if runFn panics despite agent-level recovery,
+	// ensure cleanup still runs so the session queue doesn't orphan this run.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("scheduler: executeRun panicked", "run_id", runID, "panic", fmt.Sprint(r))
+			pending.ResultCh <- RunOutcome{Err: fmt.Errorf("run panic: %v", r)}
+			close(pending.ResultCh)
+			sq.mu.Lock()
+			delete(sq.activeRuns, runID)
+			sq.removeFromOrder(runID)
+			if sq.hasCapacity() && len(sq.queue) > 0 {
+				sq.scheduleNext(sq.parentCtx)
+			}
+			sq.mu.Unlock()
+		}
+	}()
+
 	result, err := sq.runFn(ctx, pending.Req)
 	pending.ResultCh <- RunOutcome{Result: result, Err: err}
 	close(pending.ResultCh)
 
 	sq.mu.Lock()
-	delete(sq.activeRuns, runID)
-	sq.removeFromOrder(runID)
+	// Check generation: ignore stale completions from a previous generation.
+	if entry, ok := sq.activeRuns[runID]; ok && entry.generation == sq.generation {
+		delete(sq.activeRuns, runID)
+		sq.removeFromOrder(runID)
+	} else if runGeneration != sq.generation {
+		// Stale completion from old generation — skip cleanup.
+		sq.mu.Unlock()
+		return
+	}
 
 	if sq.hasCapacity() && len(sq.queue) > 0 {
 		// Use parentCtx (not the per-run ctx which may be cancelled)
@@ -330,7 +387,7 @@ func (sq *SessionQueue) drainQueue(outcome RunOutcome) {
 }
 
 // CancelOne stops the oldest active run (FIFO).
-// Does NOT drain the pending queue. Used by /stop command.
+// Does NOT drain the pending queue or set abort cutoff. Used by /stop command.
 // Returns true if an active run was actually cancelled.
 func (sq *SessionQueue) CancelOne() bool {
 	sq.mu.Lock()
@@ -342,8 +399,8 @@ func (sq *SessionQueue) CancelOne() bool {
 
 	// Cancel the oldest active run
 	runID := sq.activeOrder[0]
-	if cancel, ok := sq.activeRuns[runID]; ok {
-		cancel()
+	if entry, ok := sq.activeRuns[runID]; ok {
+		entry.cancel()
 		delete(sq.activeRuns, runID)
 		sq.activeOrder = sq.activeOrder[1:]
 		return true
@@ -352,15 +409,18 @@ func (sq *SessionQueue) CancelOne() bool {
 }
 
 // CancelAll stops all active runs and drains all pending requests.
+// Sets abort cutoff so stale queued messages are skipped on next schedule.
 // Used by /stopall command.
 // Returns true if any active run was actually cancelled.
 func (sq *SessionQueue) CancelAll() bool {
 	sq.mu.Lock()
 	defer sq.mu.Unlock()
 
+	sq.abortCutoffTime = time.Now() // mark cutoff for stale message skipping
+
 	cancelled := false
-	for runID, cancel := range sq.activeRuns {
-		cancel()
+	for runID, entry := range sq.activeRuns {
+		entry.cancel()
 		delete(sq.activeRuns, runID)
 		cancelled = true
 	}
@@ -395,4 +455,17 @@ func (sq *SessionQueue) QueueLen() int {
 	return len(sq.queue)
 }
 
-
+// Reset bumps the generation counter, cancels all active runs, and drains
+// the pending queue. Stale completions from the old generation are ignored.
+// Used during in-process restart (e.g. SIGUSR1).
+func (sq *SessionQueue) Reset() {
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+	sq.generation++
+	for _, entry := range sq.activeRuns {
+		entry.cancel()
+	}
+	sq.activeRuns = make(map[string]activeRunEntry)
+	sq.activeOrder = nil
+	sq.drainQueue(RunOutcome{Err: ErrLaneCleared})
+}

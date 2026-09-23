@@ -5,37 +5,75 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"sync"
-	"time"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
+	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // buildMessages constructs the full message list for an LLM request.
 // Returns the messages and whether BOOTSTRAP.md was present in context files
 // (used by the caller for auto-cleanup without an extra DB roundtrip).
-func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, userID string, historyLimit int) ([]providers.Message, bool) {
+func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, summary, userMessage, extraSystemPrompt, sessionKey, channel, channelType, bitrixPortalDomain, chatTitle, chatID, peerKind, userID, senderName string, historyLimit int, skillFilter []string, lightContext bool, telegramManagerPermissions []string) ([]providers.Message, bool) {
 	var messages []providers.Message
 
-	// Build full system prompt using the new builder (matching TS buildAgentSystemPrompt)
-	mode := PromptFull
-	if bootstrap.IsSubagentSession(sessionKey) || bootstrap.IsCronSession(sessionKey) {
-		mode = PromptMinimal
-	}
+	// Build system prompt — 3-layer mode resolution: runtime > auto-detect > config
+	mode := resolvePromptMode("", sessionKey, l.promptMode)
 
 	_, hasSpawn := l.tools.Get("spawn")
+	_, hasTeamTools := l.tools.Get("team_tasks")
 	_, hasSkillSearch := l.tools.Get("skill_search")
+	_, hasSkillManage := l.tools.Get("skill_manage")
+	_, hasMCPToolSearch := l.tools.Get("mcp_tool_search")
+	_, hasKG := l.tools.Get("knowledge_graph_search")
+	_, hasMemoryExpand := l.tools.Get("memory_expand")
 
-	// Per-user workspace: show the user's subdirectory in the system prompt (managed mode)
+	// Per-user workspace: show the user's subdirectory in the system prompt.
+	// Uses cached workspace from userSetups (includes channel isolation).
+	// When workspace sharing is enabled, show the base workspace without user subfolder.
 	promptWorkspace := l.workspace
 	if l.agentUUID != uuid.Nil && userID != "" && l.workspace != "" {
-		promptWorkspace = filepath.Join(l.workspace, sanitizePathSegment(userID))
+		shared := l.shouldShareWorkspace(userID, peerKind)
+		baseWs := l.workspace
+		if val, ok := l.userSetups.Load(userID); ok {
+			if ws := val.(*userSetup).workspace; ws != "" {
+				baseWs = ws
+			}
+		}
+		promptWorkspace = tools.ResolveWorkspace(baseWs,
+			tools.UserChatLayer(tools.SanitizePathSegment(userID), shared),
+		)
+	}
+	if tools.IsDelegationArtifactRun(ctx) {
+		promptWorkspace = "."
+		const artifactGuidance = "Delegation workspace: write outputs using ordinary relative paths in the current workspace. Read staged inputs only through inputs/... . Files are returned to the caller only after runtime validation and publication."
+		if extraSystemPrompt != "" {
+			extraSystemPrompt += "\n\n"
+		}
+		extraSystemPrompt += artifactGuidance
 	}
 
 	// Resolve context files once — also detect BOOTSTRAP.md presence.
-	contextFiles := l.resolveContextFiles(ctx, userID)
+	// lightContext: skip loading context files, only inject ExtraSystemPrompt (heartbeat checklist).
+	var contextFiles []bootstrap.ContextFile
+	if !lightContext {
+		contextFiles = l.resolveContextFiles(ctx, userID)
+
+		// Fallback: if DB seeding failed (e.g. SQLITE_BUSY) but we have
+		// in-memory embedded templates, merge them so the first turn still
+		// gets bootstrap onboarding. Only applies when DB returned no user files.
+		if val, ok := l.userSetups.Load(userID); ok {
+			if fb := val.(*userSetup).fallbackBootstrap; len(fb) > 0 {
+				contextFiles = l.mergeContextFallback(contextFiles, fb)
+				// Clear after first use — next turn should read from DB.
+				val.(*userSetup).fallbackBootstrap = nil
+			}
+		}
+	}
 	hadBootstrap := false
 	for _, cf := range contextFiles {
 		if cf.Path == bootstrap.BootstrapFile {
@@ -44,23 +82,196 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		}
 	}
 
+	// Bootstrap mode: only direct user DMs need onboarding.
+	// System sessions (group, team, subagent, cron, heartbeat) skip bootstrap
+	// to prevent the model from getting distracted by onboarding instructions.
+	isSystemSession := peerKind == "group" ||
+		bootstrap.IsTeamSession(sessionKey) ||
+		bootstrap.IsSubagentSession(sessionKey) ||
+		bootstrap.IsCronSession(sessionKey) ||
+		bootstrap.IsHeartbeatSession(sessionKey)
+	if hadBootstrap && isSystemSession {
+		filtered := make([]bootstrap.ContextFile, 0, len(contextFiles))
+		for _, cf := range contextFiles {
+			if cf.Path != bootstrap.BootstrapFile {
+				filtered = append(filtered, cf)
+			}
+		}
+		contextFiles = filtered
+		hadBootstrap = false
+	}
+
+	// Bootstrap auto-contact: inject known sender info from channel metadata.
+	// DM only — group chats have permission checks and multiple senders.
+	if hadBootstrap && peerKind == "direct" {
+		if senderName := store.SenderNameFromContext(ctx); senderName != "" {
+			hint := fmt.Sprintf("Known user info (from %s): Name=%q\nTimezone: not yet known. When the user mentions times, schedules, or reminders, ask for their timezone and update USER.md.", channelType, senderName)
+			if extraSystemPrompt != "" {
+				extraSystemPrompt += "\n\n"
+			}
+			extraSystemPrompt += hint
+		}
+	}
+
+	// Group writer restrictions: filter context files + inject prompt
+	if l.configPermStore != nil && (strings.HasPrefix(userID, "group:") || strings.HasPrefix(userID, "guild:")) {
+		senderID := store.SenderIDFromContext(ctx)
+		writerPrompt, filtered := l.buildGroupWriterPrompt(ctx, userID, senderID, contextFiles)
+		contextFiles = filtered
+		if writerPrompt != "" {
+			if extraSystemPrompt != "" {
+				extraSystemPrompt += "\n\n"
+			}
+			extraSystemPrompt += writerPrompt
+		}
+	}
+
+	slashReq := &RunRequest{
+		SessionKey: sessionKey,
+		UserID:     userID,
+		SenderID:   store.SenderIDFromContext(ctx),
+		Channel:    channel,
+		ChatID:     chatID,
+		PeerKind:   peerKind,
+	}
+	userMessage, extraSystemPrompt, skillFilter = l.applySkillSlashCommand(ctx, slashReq, userMessage, extraSystemPrompt, skillFilter)
+
+	// Build tool list, filtering out skill_manage when skill_evolve is off.
+	// Also applies ChannelAware filtering so channel-specific tools don't
+	// appear in ## Tooling when the current channel doesn't support them.
+	toolNames := l.filteredToolNamesForChannel(channelType, telegramManagerPermissions)
+	if !l.skillEvolve {
+		filtered := toolNames[:0:0]
+		for _, n := range toolNames {
+			if n != "skill_manage" {
+				filtered = append(filtered, n)
+			}
+		}
+		toolNames = filtered
+	}
+	// Exclude tool aliases from the system prompt tool list.
+	// Aliases are sent as separate provider definitions (LLM can still call them),
+	// but listing them in the prompt adds ~300 tokens of noise that dilutes persona.
+	if l.tools != nil {
+		aliasSet := l.tools.Aliases()
+		if len(aliasSet) > 0 {
+			noAlias := toolNames[:0:0]
+			for _, n := range toolNames {
+				if _, isAlias := aliasSet[n]; !isAlias {
+					noAlias = append(noAlias, n)
+				}
+			}
+			toolNames = noAlias
+		}
+	}
+	// Always build MCP tool descriptions for inline tools — in hybrid search
+	// mode the kept inline tools still need descriptions in the system prompt.
+	// A-G1 fix (260512): scope MCP descriptions to the calling actor's available
+	// tools. Otherwise lookupMCPDescFromUserTools surfaces descriptions from
+	// any user's cache → LLM sees tools it can't actually call (executeToolForActor
+	// scoped to actorUserID returns "tool not found"). Compute actor via
+	// CredentialUserID (merged tenant_user identity) to match the cache key
+	// used by getUserMCPTools. Fall back to resolveActorUserID for channels
+	// without merge resolution.
+	actorUserID := store.CredentialUserIDFromContext(ctx)
+	if actorUserID == "" {
+		actorUserID = resolveActorUserID(userID, store.SenderIDFromContext(ctx), peerKind, channelType)
+	}
+	mcpToolDescs := l.buildMCPToolDescs(toolNames, actorUserID)
+
+	// Bootstrap DM mode: only restrict tools for open agents (identity being created).
+	// Predefined agents keep full capabilities — BOOTSTRAP.md guides behavior.
+	if hadBootstrap && l.agentType != store.AgentTypePredefined {
+		toolNames = filterBootstrapTools(toolNames)
+		mcpToolDescs = nil
+	}
+
+	// Determine whether to inject team context into the system prompt.
+	// Team context (TEAM.md, workspace section, members roster) is injected when:
+	//   - This is a team-dispatched session (team: prefix), OR
+	//   - Agent is the lead of a team AND this is an inbound (non-dispatch) session.
+	// Member-only agents in inbound chat get spawn section instead of team context.
+	isTeamDispatch := bootstrap.IsTeamSession(sessionKey)
+	injectTeamContext := isTeamDispatch || (hasTeamTools && l.isTeamLead)
+
+	// Filter TEAM.md from context files when team context should not be injected
+	// (i.e. member-only agent in inbound chat — spawn section applies instead).
+	if !injectTeamContext {
+		filtered := make([]bootstrap.ContextFile, 0, len(contextFiles))
+		for _, cf := range contextFiles {
+			if cf.Path != bootstrap.TeamFile {
+				filtered = append(filtered, cf)
+			}
+		}
+		contextFiles = filtered
+	}
+
+	// Mode-aware context file filtering: each mode loads different files.
+	if allowlist := bootstrap.ModeAllowlist(string(mode)); allowlist != nil {
+		filtered := make([]bootstrap.ContextFile, 0, len(contextFiles))
+		for _, cf := range contextFiles {
+			if allowlist[cf.Path] {
+				filtered = append(filtered, cf)
+			}
+		}
+		contextFiles = filtered
+	}
+
+	// Resolve team members so agent knows who to assign tasks to.
+	// Only resolve when team context is active — avoids unnecessary DB query for member-only inbound chats.
+	var teamMembers []store.TeamMemberData
+	if injectTeamContext && hasTeamTools && l.teamStore != nil && l.agentUUID != uuid.Nil {
+		if team, _ := l.teamStore.GetTeamForAgent(ctx, l.agentUUID); team != nil {
+			teamMembers, _ = l.teamStore.ListMembers(ctx, team.ID)
+		}
+	}
+
 	systemPrompt := BuildSystemPrompt(SystemPromptConfig{
-		AgentID:        l.id,
-		Model:          l.model,
-		Workspace:      promptWorkspace,
-		Channel:        channel,
-		OwnerIDs:       l.ownerIDs,
-		Mode:           mode,
-		ToolNames:      l.tools.List(),
-		SkillsSummary:  l.resolveSkillsSummary(),
-		HasMemory:      l.hasMemory,
-		HasSpawn:       l.tools != nil && hasSpawn,
-		HasSkillSearch: hasSkillSearch,
-		ContextFiles:   contextFiles,
-		ExtraPrompt:    extraSystemPrompt,
-		SandboxEnabled:        l.sandboxEnabled,
-		SandboxContainerDir:   l.sandboxContainerDir,
+		AgentID:                l.id,
+		AgentUUID:              l.agentUUID.String(),
+		DisplayName:            l.displayName,
+		Model:                  l.model,
+		Workspace:              promptWorkspace,
+		Channel:                channel,
+		ChannelType:            channelType,
+		BitrixPortalDomain:     bitrixPortalDomain,
+		ChatID:                 chatID,
+		ChatTitle:              chatTitle,
+		PeerKind:               peerKind,
+		OwnerIDs:               l.ownerIDs,
+		SenderID:               store.SenderIDFromContext(ctx),
+		SenderName:             senderName,
+		Mode:                   mode,
+		ToolNames:              toolNames,
+		SkillsSummary:          l.resolveSkillsSummary(ctx, skillFilter),
+		PinnedSkillsSummary:    l.resolvePinnedSkillsSummary(ctx),
+		HasMemory:              l.hasMemory,
+		HasSpawn:               l.tools != nil && hasSpawn,
+		IsTeamContext:          injectTeamContext,
+		TeamWorkspace:          tools.ToolTeamWorkspaceFromCtx(ctx),
+		TeamMembers:            teamMembers,
+		TeamGuidance:           teamGuidance(edition.Current().TeamFullMode),
+		HasSkillSearch:         hasSkillSearch,
+		HasSkillManage:         l.skillEvolve && hasSkillManage,
+		HasMCPToolSearch:       hasMCPToolSearch,
+		HasKnowledgeGraph:      hasKG,
+		HasMemoryExpand:        hasMemoryExpand,
+		MCPToolDescs:           mcpToolDescs,
+		ContextFiles:           contextFiles,
+		AgentType:              l.agentType,
+		ExtraPrompt:            extraSystemPrompt,
+		SandboxEnabled:         l.sandboxEnabled,
+		SandboxContainerDir:    l.sandboxContainerDir,
 		SandboxWorkspaceAccess: l.sandboxWorkspaceAccess,
+		ShellDenyGroups:        l.shellDenyGroups,
+		SelfEvolve:             l.selfEvolve,
+		TTSAutoMode:            l.ttsAutoMode,
+		ProviderType:           providerTypeOf(l.provider),
+		CredentialCLIContext:   l.buildCredentialCLIContext(ctx),
+		IsBootstrap:            hadBootstrap && l.agentType != store.AgentTypePredefined,
+		DelegateTargets:        l.delegateTargets,
+		OrchMode:               l.orchMode,
+		ProviderContribution:   l.providerContribution(),
 	})
 
 	messages = append(messages, providers.Message{
@@ -80,10 +291,21 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 		})
 	}
 
-	// History pipeline matching TS: limitHistoryTurns → pruneContext → sanitizeHistory.
+	// History pipeline: limitHistoryTurns → sanitizeHistory.
+	// Pruning is owned by PruneStage in the pipeline (single entry point).
 	trimmed := limitHistoryTurns(history, historyLimit)
-	pruned := pruneContextMessages(trimmed, l.contextWindow, l.contextPruningCfg)
-	messages = append(messages, sanitizeHistory(pruned)...)
+	sanitized, droppedCount := sanitizeHistory(trimmed)
+	messages = append(messages, sanitized...)
+
+	// If orphaned messages were found and dropped, persist the cleaned history
+	// back to the session store so the same orphans don't trigger on every request.
+	if droppedCount > 0 {
+		slog.Info("sanitizeHistory: cleaned session history",
+			"session", sessionKey, "dropped", droppedCount)
+		cleanedHistory, _ := sanitizeHistory(history)
+		l.sessions.SetHistory(ctx, sessionKey, cleanedHistory)
+		l.sessions.Save(ctx, sessionKey)
+	}
 
 	// Current user message
 	messages = append(messages, providers.Message{
@@ -99,14 +321,14 @@ func (l *Loop) buildMessages(ctx context.Context, history []providers.Message, s
 // but base-only files (like auto-injected delegation info) are preserved.
 func (l *Loop) resolveContextFiles(ctx context.Context, userID string) []bootstrap.ContextFile {
 	if l.contextFileLoader == nil || userID == "" {
-		return l.contextFiles
+		return dropBuiltinUserFileIfPredefined(l.agentType, l.contextFiles)
 	}
 	userFiles := l.contextFileLoader(ctx, l.agentUUID, userID, l.agentType)
 	if len(userFiles) == 0 {
-		return l.contextFiles
+		return dropBuiltinUserFileIfPredefined(l.agentType, l.contextFiles)
 	}
 	if len(l.contextFiles) == 0 {
-		return userFiles
+		return dropBuiltinUserFileIfPredefined(l.agentType, userFiles)
 	}
 
 	// Merge: start with per-user files, then append base-only files
@@ -121,217 +343,49 @@ func (l *Loop) resolveContextFiles(ctx context.Context, userID string) []bootstr
 			merged = append(merged, base)
 		}
 	}
-	return merged
+	return dropBuiltinUserFileIfPredefined(l.agentType, merged)
 }
 
-// Hybrid skill thresholds: when skill count and total token estimate are below
-// these limits, inline all skills as XML in the system prompt (like TS).
-// Above these limits, only include skill_search instructions.
-const (
-	skillInlineMaxCount  = 20   // max skills to inline
-	skillInlineMaxTokens = 3500 // max estimated tokens for skill descriptions
-)
-
-// resolveSkillsSummary dynamically builds the skills summary for the system prompt.
-// Called per-message so it picks up hot-reloaded skills automatically.
-// Returns (summary XML, useInline) — useInline=true means skills are inlined and
-// the system prompt should use TS-style "scan <available_skills>" instructions
-// instead of "use skill_search".
-func (l *Loop) resolveSkillsSummary() string {
-	if l.skillsLoader == nil {
-		return ""
+// dropBuiltinUserFileIfPredefined removes the built-in USER.md entry from the
+// merged context files when the agent is predefined AND has an operator-authored
+// USER_PREDEFINED.md. The operator owns the entire user-context portion of the
+// system prompt in that case, so the built-in USER.md template must never be
+// injected alongside it (per-turn name/timezone/pronoun nag).
+func dropBuiltinUserFileIfPredefined(agentType string, files []bootstrap.ContextFile) []bootstrap.ContextFile {
+	if agentType != store.AgentTypePredefined {
+		return files
 	}
-
-	filtered := l.skillsLoader.FilterSkills(l.skillAllowList)
-	if len(filtered) == 0 {
-		return ""
+	hasUserPredefined := false
+	for _, f := range files {
+		if filepath.Base(f.Path) == bootstrap.UserPredefinedFile {
+			hasUserPredefined = true
+			break
+		}
 	}
-
-	// Estimate tokens: ~1 token per 4 chars for name+description
-	totalChars := 0
-	for _, s := range filtered {
-		totalChars += len(s.Name) + len(s.Description) + 10 // +10 for XML tags overhead
+	if !hasUserPredefined {
+		return files
 	}
-	estimatedTokens := totalChars / 4
-
-	if len(filtered) <= skillInlineMaxCount && estimatedTokens <= skillInlineMaxTokens {
-		// Inline mode: build full XML summary
-		return l.skillsLoader.BuildSummary(l.skillAllowList)
+	filtered := make([]bootstrap.ContextFile, 0, len(files))
+	for _, f := range files {
+		if filepath.Base(f.Path) == bootstrap.UserFile {
+			continue
+		}
+		filtered = append(filtered, f)
 	}
-
-	// Search mode: no XML in prompt, agent uses skill_search tool
-	return ""
+	return filtered
 }
 
-// limitHistoryTurns keeps only the last N user turns (and their associated
-// assistant/tool messages) from history. A "turn" = one user message plus
-// all subsequent non-user messages until the next user message.
-// Matching TS src/agents/pi-embedded-runner/history.ts limitHistoryTurns().
-func limitHistoryTurns(msgs []providers.Message, limit int) []providers.Message {
-	if limit <= 0 || len(msgs) == 0 {
-		return msgs
+// mergeContextFallback adds fallback (in-memory) files into contextFiles,
+// skipping any that already exist. Used when DB seeding failed.
+func (l *Loop) mergeContextFallback(contextFiles, fallback []bootstrap.ContextFile) []bootstrap.ContextFile {
+	existing := make(map[string]struct{}, len(contextFiles))
+	for _, f := range contextFiles {
+		existing[f.Path] = struct{}{}
 	}
-
-	// Walk backwards counting user messages.
-	userCount := 0
-	lastUserIndex := len(msgs)
-
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == "user" {
-			userCount++
-			if userCount > limit {
-				return msgs[lastUserIndex:]
-			}
-			lastUserIndex = i
+	for _, fb := range fallback {
+		if _, ok := existing[fb.Path]; !ok {
+			contextFiles = append(contextFiles, fb)
 		}
 	}
-
-	return msgs
-}
-
-// sanitizeHistory repairs tool_use/tool_result pairing in session history.
-// Matching TS session-transcript-repair.ts sanitizeToolUseResultPairing().
-//
-// Problems this fixes:
-//   - Orphaned tool messages at start of history (after truncation)
-//   - tool_result without matching tool_use in preceding assistant message
-//   - assistant with tool_calls but missing tool_results
-func sanitizeHistory(msgs []providers.Message) []providers.Message {
-	if len(msgs) == 0 {
-		return msgs
-	}
-
-	// 1. Skip leading orphaned tool messages (no preceding assistant with tool_calls).
-	start := 0
-	for start < len(msgs) && msgs[start].Role == "tool" {
-		slog.Warn("dropping orphaned tool message at history start",
-			"tool_call_id", msgs[start].ToolCallID)
-		start++
-	}
-
-	if start >= len(msgs) {
-		return nil
-	}
-
-	// 2. Walk through messages ensuring tool_result follows matching tool_use.
-	var result []providers.Message
-	for i := start; i < len(msgs); i++ {
-		msg := msgs[i]
-
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			// Collect expected tool call IDs
-			expectedIDs := make(map[string]bool, len(msg.ToolCalls))
-			for _, tc := range msg.ToolCalls {
-				expectedIDs[tc.ID] = true
-			}
-
-			result = append(result, msg)
-
-			// Collect matching tool results that follow
-			for i+1 < len(msgs) && msgs[i+1].Role == "tool" {
-				i++
-				toolMsg := msgs[i]
-				if expectedIDs[toolMsg.ToolCallID] {
-					result = append(result, toolMsg)
-					delete(expectedIDs, toolMsg.ToolCallID)
-				} else {
-					slog.Warn("dropping mismatched tool result",
-						"tool_call_id", toolMsg.ToolCallID)
-				}
-			}
-
-			// Synthesize missing tool results
-			for id := range expectedIDs {
-				slog.Warn("synthesizing missing tool result", "tool_call_id", id)
-				result = append(result, providers.Message{
-					Role:       "tool",
-					Content:    "[Tool result missing — session was compacted]",
-					ToolCallID: id,
-				})
-			}
-		} else if msg.Role == "tool" {
-			// Orphaned tool message mid-history (no preceding assistant with matching tool_calls)
-			slog.Warn("dropping orphaned tool message mid-history",
-				"tool_call_id", msg.ToolCallID)
-		} else {
-			result = append(result, msg)
-		}
-	}
-
-	return result
-}
-
-func (l *Loop) maybeSummarize(ctx context.Context, sessionKey string) {
-	history := l.sessions.GetHistory(sessionKey)
-	tokenEstimate := EstimateTokens(history)
-	threshold := l.contextWindow * 75 / 100
-
-	if len(history) <= 50 && tokenEstimate <= threshold {
-		return
-	}
-
-	// Per-session lock: prevent concurrent summarize+flush goroutines for the same session.
-	// TryLock is non-blocking — if another run is already summarizing this session, skip.
-	// The next run will trigger summarization again if still needed.
-	muI, _ := l.summarizeMu.LoadOrStore(sessionKey, &sync.Mutex{})
-	sessionMu := muI.(*sync.Mutex)
-	if !sessionMu.TryLock() {
-		slog.Debug("summarization already in progress, skipping", "session", sessionKey)
-		return
-	}
-
-	// Memory flush runs synchronously INSIDE the guard
-	// (so concurrent runs don't both trigger flush for the same compaction cycle).
-	flushSettings := ResolveMemoryFlushSettings(l.compactionCfg)
-	if l.shouldRunMemoryFlush(sessionKey, tokenEstimate, flushSettings) {
-		l.runMemoryFlush(ctx, sessionKey, flushSettings)
-	}
-
-	// Summarize in background (holds the per-session lock until done)
-	go func() {
-		defer sessionMu.Unlock()
-
-		// Re-check: history may have been truncated by a concurrent summarize
-		// that finished between our threshold check and acquiring the lock.
-		history := l.sessions.GetHistory(sessionKey)
-		if len(history) <= 4 {
-			return
-		}
-
-		sctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-
-		summary := l.sessions.GetSummary(sessionKey)
-		toSummarize := history[:len(history)-4]
-
-		var sb string
-		for _, m := range toSummarize {
-			if m.Role == "user" {
-				sb += fmt.Sprintf("user: %s\n", m.Content)
-			} else if m.Role == "assistant" {
-				sb += fmt.Sprintf("assistant: %s\n", SanitizeAssistantContent(m.Content))
-			}
-		}
-
-		prompt := "Provide a concise summary of this conversation, preserving key context:\n"
-		if summary != "" {
-			prompt += "Existing context: " + summary + "\n"
-		}
-		prompt += "\n" + sb
-
-		resp, err := l.provider.Chat(sctx, providers.ChatRequest{
-			Messages: []providers.Message{{Role: "user", Content: prompt}},
-			Model:    l.model,
-			Options:  map[string]interface{}{"max_tokens": 1024, "temperature": 0.3},
-		})
-		if err != nil {
-			slog.Warn("summarization failed", "session", sessionKey, "error", err)
-			return
-		}
-
-		l.sessions.SetSummary(sessionKey, SanitizeAssistantContent(resp.Content))
-		l.sessions.TruncateHistory(sessionKey, 4)
-		l.sessions.IncrementCompaction(sessionKey)
-		l.sessions.Save(sessionKey)
-	}()
+	return contextFiles
 }

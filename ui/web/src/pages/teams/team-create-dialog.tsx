@@ -11,7 +11,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Combobox } from "@/components/ui/combobox";
 import { Badge } from "@/components/ui/badge";
-import { X } from "lucide-react";
+import { X, Info, Loader2 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { useTranslation } from "react-i18next";
 import { useAgents } from "@/pages/agents/hooks/use-agents";
 
 interface TeamCreateDialogProps {
@@ -26,6 +33,7 @@ interface TeamCreateDialogProps {
 }
 
 export function TeamCreateDialog({ open, onOpenChange, onCreate }: TeamCreateDialogProps) {
+  const { t } = useTranslation("teams");
   const { agents, loading: agentsLoading, refresh: refreshAgents } = useAgents();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -104,46 +112,58 @@ export function TeamCreateDialog({ open, onOpenChange, onCreate }: TeamCreateDia
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-lg max-h-[90vh] flex flex-col">
+      <DialogContent className="max-h-[90vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>Create Team</DialogTitle>
+          <DialogTitle>{t("create.title")}</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4 py-4 overflow-y-auto min-h-0">
+        <div className="space-y-4 py-4 -mx-4 px-4 sm:-mx-6 sm:px-6 overflow-y-auto min-h-0">
           <div className="space-y-2">
-            <Label htmlFor="teamName">Name *</Label>
+            <Label htmlFor="teamName">{t("create.name")}</Label>
             <Input
               id="teamName"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Research Team"
+              placeholder={t("create.namePlaceholder")}
             />
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="teamDesc">Description</Label>
+            <Label htmlFor="teamDesc">{t("create.description")}</Label>
             <Input
               id="teamDesc"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Optional team description..."
+              placeholder={t("create.descriptionPlaceholder")}
             />
           </div>
 
           <div className="space-y-2">
-            <Label>Lead Agent *</Label>
+            <Label>{t("create.leadAgent")}</Label>
             <Combobox
               value={lead}
               onChange={setLead}
               options={leadOptions}
-              placeholder={agentsLoading ? "Loading agents..." : "Select lead agent..."}
+              placeholder={agentsLoading ? t("create.loadingAgents") : t("create.selectLeadAgent")}
             />
             {!agentsLoading && leadOptions.length === 0 && (
-              <p className="text-xs text-muted-foreground">No active agents found. Create agents first.</p>
+              <p className="text-xs text-muted-foreground">{t("create.noActiveAgents")}</p>
             )}
           </div>
 
           <div className="space-y-2">
-            <Label>Members</Label>
+            <Label className="inline-flex items-center gap-1">
+              {t("create.members")}
+              <TooltipProvider delayDuration={200}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Info className="h-3.5 w-3.5 text-muted-foreground cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {t("create.membersTooltip")}
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            </Label>
             <Combobox
               value={memberSearch}
               onChange={(val) => {
@@ -155,7 +175,7 @@ export function TeamCreateDialog({ open, onOpenChange, onCreate }: TeamCreateDia
                 }
               }}
               options={memberOptions}
-              placeholder={agentsLoading ? "Loading agents..." : "Search and add members..."}
+              placeholder={agentsLoading ? t("create.loadingAgents") : t("create.searchMembers")}
             />
             {members.length > 0 && (
               <div className="flex flex-wrap gap-1.5 pt-1">
@@ -173,14 +193,18 @@ export function TeamCreateDialog({ open, onOpenChange, onCreate }: TeamCreateDia
                 ))}
               </div>
             )}
+            {lead && members.length === 0 && memberOptions.length > 0 && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">{t("create.needMembers")}</p>
+            )}
           </div>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
-            Cancel
+            {t("create.cancel")}
           </Button>
-          <Button onClick={handleCreate} disabled={!name.trim() || !leadOptions.some((o) => o.value === lead) || loading}>
-            {loading ? "Creating..." : "Create"}
+          <Button onClick={handleCreate} disabled={!name.trim() || !leadOptions.some((o) => o.value === lead) || members.length === 0 || loading} className="gap-1">
+            {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {loading ? t("create.creating") : t("create.create")}
           </Button>
         </DialogFooter>
       </DialogContent>

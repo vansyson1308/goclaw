@@ -1,7 +1,6 @@
 package providers
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,30 +8,62 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 )
 
 const (
-	defaultClaudeModel   = "claude-sonnet-4-5-20250929"
-	anthropicAPIBase     = "https://api.anthropic.com/v1"
-	anthropicAPIVersion  = "2023-06-01"
+	defaultClaudeModel  = "claude-sonnet-4-5-20250929"
+	anthropicAPIBase    = "https://api.anthropic.com/v1"
+	anthropicAPIVersion = "2023-06-01"
 )
+
+// claudeModelAliases maps short model aliases to full Anthropic model IDs.
+// This allows agents configured with aliases (e.g. "opus") to work with the
+// anthropic_native provider, consistent with the Claude CLI provider.
+var claudeModelAliases = map[string]string{
+	"opus":   "claude-opus-4-6",
+	"sonnet": "claude-sonnet-4-6",
+	"haiku":  "claude-haiku-4-5-20251001",
+}
+
+// resolveAnthropicModel expands a short alias to a full model ID, or returns the input unchanged.
+// If a registry is provided, triggers forward-compat resolution for unknown models.
+func resolveAnthropicModel(model, defaultModel string, registry ModelRegistry) string {
+	if model == "" {
+		return defaultModel
+	}
+	if full, ok := claudeModelAliases[model]; ok {
+		return full
+	}
+	// Trigger forward-compat resolution to cache specs for token counting
+	if registry != nil {
+		_ = registry.Resolve("anthropic", model)
+	}
+	return model
+}
 
 // AnthropicProvider implements Provider using the Anthropic Claude API via net/http.
 type AnthropicProvider struct {
+	name         string // provider name (default: "anthropic")
 	apiKey       string
+	baseURL      string
 	defaultModel string
 	client       *http.Client
 	retryConfig  RetryConfig
+	middlewares  RequestMiddleware // composed middleware chain (nil = no-op)
+	registry     ModelRegistry    // model resolution registry (nil = skip)
 }
 
 // NewAnthropicProvider creates a new Anthropic provider.
 func NewAnthropicProvider(apiKey string, opts ...AnthropicOption) *AnthropicProvider {
 	p := &AnthropicProvider{
+		name:         "anthropic",
 		apiKey:       apiKey,
+		baseURL:      anthropicAPIBase,
 		defaultModel: defaultClaudeModel,
-		client:       &http.Client{Timeout: 120 * time.Second},
+		client:       NewDefaultHTTPClient(),
 		retryConfig:  DefaultRetryConfig(),
+		// No CacheMiddleware: Anthropic uses block-level cache_control in buildRequestBody
+		middlewares: ComposeMiddlewares(FastModeMiddleware, ServiceTierMiddleware),
 	}
 	for _, o := range opts {
 		o(p)
@@ -42,272 +73,103 @@ func NewAnthropicProvider(apiKey string, opts ...AnthropicOption) *AnthropicProv
 
 type AnthropicOption func(*AnthropicProvider)
 
+// WithAnthropicName overrides the provider name (default: "anthropic").
+func WithAnthropicName(name string) AnthropicOption {
+	return func(p *AnthropicProvider) {
+		if name != "" {
+			p.name = name
+		}
+	}
+}
+
 func WithAnthropicModel(model string) AnthropicOption {
 	return func(p *AnthropicProvider) { p.defaultModel = model }
 }
 
-func (p *AnthropicProvider) Name() string        { return "anthropic" }
-func (p *AnthropicProvider) DefaultModel() string { return p.defaultModel }
+func WithAnthropicRegistry(r ModelRegistry) AnthropicOption {
+	return func(p *AnthropicProvider) { p.registry = r }
+}
+
+func WithAnthropicMiddlewares(mws ...RequestMiddleware) AnthropicOption {
+	return func(p *AnthropicProvider) { p.middlewares = ComposeMiddlewares(mws...) }
+}
+
+func WithAnthropicBaseURL(baseURL string) AnthropicOption {
+	return func(p *AnthropicProvider) {
+		if baseURL != "" {
+			p.baseURL = strings.TrimRight(baseURL, "/")
+		}
+	}
+}
+
+func (p *AnthropicProvider) Name() string           { return p.name }
+func (p *AnthropicProvider) DefaultModel() string   { return p.defaultModel }
+func (p *AnthropicProvider) SupportsThinking() bool { return true }
+
+// Capabilities implements CapabilitiesAware for pipeline code-path selection.
+func (p *AnthropicProvider) Capabilities() ProviderCapabilities {
+	return ProviderCapabilities{
+		Streaming:        true,
+		ToolCalling:      true,
+		StreamWithTools:  true,
+		Thinking:         true,
+		Vision:           true,
+		CacheControl:     true,
+		MaxContextWindow: 200_000,
+		TokenizerID:      "cl100k_base",
+	}
+}
+
+// middlewareConfig builds a MiddlewareConfig for the current request.
+func (p *AnthropicProvider) middlewareConfig(model string, req ChatRequest) MiddlewareConfig {
+	return MiddlewareConfig{
+		Provider: "anthropic",
+		Model:    model,
+		Caps:     p.Capabilities(),
+		AuthType: "api_key",
+		APIBase:  p.baseURL,
+		Options:  req.Options,
+	}
+}
 
 func (p *AnthropicProvider) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, error) {
-	model := req.Model
-	if model == "" {
-		model = p.defaultModel
-	}
+	model := resolveAnthropicModel(req.Model, p.defaultModel, p.registry)
 
 	body := p.buildRequestBody(model, req, false)
+	body = ApplyMiddlewares(body, p.middlewares, p.middlewareConfig(model, req))
 
-	return RetryDo(ctx, p.retryConfig, func() (*ChatResponse, error) {
+	resp, err := RetryDo(ctx, p.retryConfig, func() (*ChatResponse, error) {
 		respBody, err := p.doRequest(ctx, body)
 		if err != nil {
 			return nil, err
 		}
 		defer respBody.Close()
 
-		var resp anthropicResponse
-		if err := json.NewDecoder(respBody).Decode(&resp); err != nil {
+		var parsed anthropicResponse
+		if err := json.NewDecoder(respBody).Decode(&parsed); err != nil {
 			return nil, fmt.Errorf("anthropic: decode response: %w", err)
 		}
 
-		return p.parseResponse(&resp), nil
+		return p.parseResponse(&parsed), nil
 	})
+	// Drop user-visible reasoning after parsing for models flagged as leakers.
+	// Usage.ThinkingTokens and RawAssistantContent remain intact so billing
+	// and Anthropic tool-use thinking passback continue to work.
+	if resp != nil {
+		if strip, _ := req.Options[OptStripThinking].(bool); strip {
+			resp.Thinking = ""
+		}
+	}
+	return resp, err
 }
 
-func (p *AnthropicProvider) ChatStream(ctx context.Context, req ChatRequest, onChunk func(StreamChunk)) (*ChatResponse, error) {
-	model := req.Model
-	if model == "" {
-		model = p.defaultModel
-	}
-
-	body := p.buildRequestBody(model, req, true)
-
-	// Retry only the connection phase; once streaming starts, no retry.
-	respBody, err := RetryDo(ctx, p.retryConfig, func() (io.ReadCloser, error) {
-		return p.doRequest(ctx, body)
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer respBody.Close()
-
-	result := &ChatResponse{FinishReason: "stop"}
-	// Accumulate raw JSON fragments for each tool call by index
-	toolCallJSON := make(map[int]string)
-
-	scanner := bufio.NewScanner(respBody)
-	var currentEvent string
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Track event type
-		if strings.HasPrefix(line, "event: ") {
-			currentEvent = strings.TrimPrefix(line, "event: ")
-			continue
-		}
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-
-		switch currentEvent {
-		case "message_start":
-			var ev anthropicMessageStartEvent
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				if result.Usage == nil {
-					result.Usage = &Usage{}
-				}
-				if ev.Message.Usage.InputTokens > 0 {
-					result.Usage.PromptTokens = ev.Message.Usage.InputTokens
-				}
-				result.Usage.CacheCreationTokens = ev.Message.Usage.CacheCreationInputTokens
-				result.Usage.CacheReadTokens = ev.Message.Usage.CacheReadInputTokens
-			}
-
-		case "content_block_start":
-			var ev anthropicContentBlockStartEvent
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				if ev.ContentBlock.Type == "tool_use" {
-					result.ToolCalls = append(result.ToolCalls, ToolCall{
-						ID:        ev.ContentBlock.ID,
-						Name:      ev.ContentBlock.Name,
-						Arguments: make(map[string]interface{}),
-					})
-				}
-			}
-
-		case "content_block_delta":
-			var ev anthropicContentBlockDeltaEvent
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				if ev.Delta.Type == "text_delta" {
-					result.Content += ev.Delta.Text
-					if onChunk != nil {
-						onChunk(StreamChunk{Content: ev.Delta.Text})
-					}
-				} else if ev.Delta.Type == "input_json_delta" {
-					if len(result.ToolCalls) > 0 {
-						idx := len(result.ToolCalls) - 1
-						toolCallJSON[idx] += ev.Delta.PartialJSON
-					}
-				}
-			}
-
-		case "message_delta":
-			var ev anthropicMessageDeltaEvent
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				if ev.Delta.StopReason != "" {
-					switch ev.Delta.StopReason {
-					case "tool_use":
-						result.FinishReason = "tool_calls"
-					case "max_tokens":
-						result.FinishReason = "length"
-					default:
-						result.FinishReason = "stop"
-					}
-				}
-				if ev.Usage.OutputTokens > 0 {
-					if result.Usage == nil {
-						result.Usage = &Usage{}
-					}
-					result.Usage.CompletionTokens = ev.Usage.OutputTokens
-				}
-			}
-
-		case "error":
-			var ev anthropicErrorEvent
-			if err := json.Unmarshal([]byte(data), &ev); err == nil {
-				return nil, fmt.Errorf("anthropic stream error: %s: %s", ev.Error.Type, ev.Error.Message)
-			}
-
-		case "message_stop":
-			// Stream complete
-		}
-	}
-
-	// Parse accumulated tool call JSON arguments
-	for i, rawJSON := range toolCallJSON {
-		if rawJSON != "" {
-			args := make(map[string]interface{})
-			_ = json.Unmarshal([]byte(rawJSON), &args)
-			result.ToolCalls[i].Arguments = args
-		}
-	}
-
-	if result.Usage != nil {
-		result.Usage.TotalTokens = result.Usage.PromptTokens + result.Usage.CompletionTokens
-	}
-
-	if onChunk != nil {
-		onChunk(StreamChunk{Done: true})
-	}
-
-	return result, nil
-}
-
-func (p *AnthropicProvider) buildRequestBody(model string, req ChatRequest, stream bool) map[string]interface{} {
-	// Separate system messages and build conversation messages
-	var systemBlocks []map[string]interface{}
-	var messages []map[string]interface{}
-
-	for _, msg := range req.Messages {
-		switch msg.Role {
-		case "system":
-			systemBlocks = append(systemBlocks, map[string]interface{}{
-				"type": "text",
-				"text": msg.Content,
-			})
-
-		case "user":
-			messages = append(messages, map[string]interface{}{
-				"role":    "user",
-				"content": msg.Content,
-			})
-
-		case "assistant":
-			var blocks []map[string]interface{}
-			if msg.Content != "" {
-				blocks = append(blocks, map[string]interface{}{
-					"type": "text",
-					"text": msg.Content,
-				})
-			}
-			for _, tc := range msg.ToolCalls {
-				blocks = append(blocks, map[string]interface{}{
-					"type":  "tool_use",
-					"id":    tc.ID,
-					"name":  tc.Name,
-					"input": tc.Arguments,
-				})
-			}
-			messages = append(messages, map[string]interface{}{
-				"role":    "assistant",
-				"content": blocks,
-			})
-
-		case "tool":
-			messages = append(messages, map[string]interface{}{
-				"role": "user",
-				"content": []map[string]interface{}{
-					{
-						"type":        "tool_result",
-						"tool_use_id": msg.ToolCallID,
-						"content":     msg.Content,
-					},
-				},
-			})
-		}
-	}
-
-	body := map[string]interface{}{
-		"model":         model,
-		"max_tokens":    4096,
-		"messages":      messages,
-		"cache_control": map[string]interface{}{"type": "ephemeral"},
-	}
-
-	if stream {
-		body["stream"] = true
-	}
-
-	if len(systemBlocks) > 0 {
-		body["system"] = systemBlocks
-	}
-
-	// Translate tools to Anthropic format
-	if len(req.Tools) > 0 {
-		var tools []map[string]interface{}
-		for _, t := range req.Tools {
-			cleanedParams := CleanSchemaForProvider("anthropic", t.Function.Parameters)
-			tool := map[string]interface{}{
-				"name":         t.Function.Name,
-				"description":  t.Function.Description,
-				"input_schema": cleanedParams,
-			}
-			tools = append(tools, tool)
-		}
-		body["tools"] = tools
-	}
-
-	// Merge options
-	if v, ok := req.Options["max_tokens"]; ok {
-		body["max_tokens"] = v
-	}
-	if v, ok := req.Options["temperature"]; ok {
-		body["temperature"] = v
-	}
-
-	return body
-}
-
-func (p *AnthropicProvider) doRequest(ctx context.Context, body interface{}) (io.ReadCloser, error) {
+func (p *AnthropicProvider) doRequest(ctx context.Context, body any) (io.ReadCloser, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", anthropicAPIBase+"/messages", bytes.NewReader(data))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", p.baseURL+"/messages", bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: create request: %w", err)
 	}
@@ -315,6 +177,13 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, body interface{}) (io
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", p.apiKey)
 	httpReq.Header.Set("anthropic-version", anthropicAPIVersion)
+
+	// Add beta header for interleaved thinking when thinking is enabled
+	if bodyMap, ok := body.(map[string]any); ok {
+		if _, hasThinking := bodyMap["thinking"]; hasThinking {
+			httpReq.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+		}
+	}
 
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
@@ -337,18 +206,28 @@ func (p *AnthropicProvider) doRequest(ctx context.Context, body interface{}) (io
 
 func (p *AnthropicProvider) parseResponse(resp *anthropicResponse) *ChatResponse {
 	result := &ChatResponse{}
+	thinkingChars := 0
 
 	for _, block := range resp.Content {
 		switch block.Type {
 		case "text":
 			result.Content += block.Text
+		case "thinking":
+			result.Thinking += block.Thinking
+			thinkingChars += len(block.Thinking)
+		case "redacted_thinking":
+			// Encrypted thinking — cannot display but must preserve for passback
 		case "tool_use":
-			args := make(map[string]interface{})
-			_ = json.Unmarshal(block.Input, &args)
+			args := make(map[string]any)
+			var parseErr string
+			if err := json.Unmarshal(block.Input, &args); err != nil && len(block.Input) > 0 {
+				parseErr = fmt.Sprintf("malformed JSON (%d chars): %v", len(block.Input), err)
+			}
 			result.ToolCalls = append(result.ToolCalls, ToolCall{
-				ID:        block.ID,
-				Name:      block.Name,
-				Arguments: args,
+				ID:         block.ID,
+				Name:       strings.TrimSpace(block.Name),
+				Arguments:  args,
+				ParseError: parseErr,
 			})
 		}
 	}
@@ -369,6 +248,16 @@ func (p *AnthropicProvider) parseResponse(resp *anthropicResponse) *ChatResponse
 		CacheCreationTokens: resp.Usage.CacheCreationInputTokens,
 		CacheReadTokens:     resp.Usage.CacheReadInputTokens,
 	}
+	if thinkingChars > 0 {
+		result.Usage.ThinkingTokens = thinkingChars / 4
+	}
+
+	// Preserve raw content blocks for tool use passback
+	if len(result.ToolCalls) > 0 {
+		if b, err := json.Marshal(resp.Content); err == nil {
+			result.RawAssistantContent = b
+		}
+	}
 
 	return result
 }
@@ -377,16 +266,19 @@ func (p *AnthropicProvider) parseResponse(resp *anthropicResponse) *ChatResponse
 
 type anthropicResponse struct {
 	Content    []anthropicContentBlock `json:"content"`
-	StopReason string                 `json:"stop_reason"`
-	Usage      anthropicUsage         `json:"usage"`
+	StopReason string                  `json:"stop_reason"`
+	Usage      anthropicUsage          `json:"usage"`
 }
 
 type anthropicContentBlock struct {
-	Type  string          `json:"type"`
-	Text  string          `json:"text,omitempty"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Input json.RawMessage `json:"input,omitempty"`
+	Type      string          `json:"type"`
+	Text      string          `json:"text,omitempty"`
+	Thinking  string          `json:"thinking,omitempty"`  // for type="thinking"
+	Signature string          `json:"signature,omitempty"` // encrypted thinking verification
+	Data      string          `json:"data,omitempty"`      // for type="redacted_thinking"
+	ID        string          `json:"id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Input     json.RawMessage `json:"input,omitempty"`
 }
 
 type anthropicUsage struct {
@@ -413,6 +305,8 @@ type anthropicContentBlockDeltaEvent struct {
 	Delta struct {
 		Type        string `json:"type"`
 		Text        string `json:"text,omitempty"`
+		Thinking    string `json:"thinking,omitempty"`  // for thinking_delta
+		Signature   string `json:"signature,omitempty"` // for signature_delta
 		PartialJSON string `json:"partial_json,omitempty"`
 	} `json:"delta"`
 }

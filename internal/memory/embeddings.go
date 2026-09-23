@@ -3,12 +3,129 @@ package memory
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"strings"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 )
+
+// ContentHash returns a short SHA256 hex digest of the content (first 16 bytes).
+func ContentHash(text string) string {
+	h := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("%x", h[:16])
+}
+
+// TextChunk is a chunk of text with line number metadata.
+type TextChunk struct {
+	Text      string
+	StartLine int
+	EndLine   int
+}
+
+// ChunkText splits text into chunks at paragraph boundaries with optional overlap.
+// Each chunk includes its starting line number in the source file.
+// When overlap > 0, trailing lines from the previous chunk are prepended to the next chunk
+// so that context at chunk boundaries is preserved for semantic search.
+func ChunkText(text string, maxChunkLen, overlap int) []TextChunk {
+	if maxChunkLen <= 0 {
+		maxChunkLen = 1000
+	}
+	if overlap < 0 {
+		overlap = 0
+	}
+	// Clamp overlap to half the chunk size to prevent infinite loop
+	if overlap >= maxChunkLen/2 {
+		overlap = maxChunkLen / 2
+	}
+
+	lines := strings.Split(text, "\n")
+	var chunks []TextChunk
+	var current strings.Builder
+	startLine := 1
+
+	// overlapLines holds trailing lines from the previous chunk to prepend to the next.
+	var overlapLines []string
+	overlapStartLine := 0
+
+	flush := func(endLine int) {
+		content := strings.TrimSpace(current.String())
+		if content != "" {
+			chunks = append(chunks, TextChunk{
+				Text:      content,
+				StartLine: startLine,
+				EndLine:   endLine,
+			})
+		}
+
+		// Compute overlap lines to carry into the next chunk.
+		overlapLines = nil
+		overlapStartLine = 0
+		if overlap > 0 && endLine > 0 {
+			charCount := 0
+			for j := endLine - 1; j >= startLine-1 && j >= 0; j-- {
+				lineLen := len(lines[j])
+				if charCount+lineLen > overlap {
+					break
+				}
+				charCount += lineLen + 1 // +1 for newline
+				overlapLines = append(overlapLines, lines[j])
+				overlapStartLine = j + 1 // 1-based
+			}
+			// Reverse to restore original order
+			for left, right := 0, len(overlapLines)-1; left < right; left, right = left+1, right-1 {
+				overlapLines[left], overlapLines[right] = overlapLines[right], overlapLines[left]
+			}
+		}
+
+		current.Reset()
+		// Seed next chunk with overlap content
+		if len(overlapLines) > 0 {
+			startLine = overlapStartLine
+			for k, ol := range overlapLines {
+				if k > 0 {
+					current.WriteString("\n")
+				}
+				current.WriteString(ol)
+			}
+		} else {
+			startLine = endLine + 1
+		}
+	}
+
+	for i, line := range lines {
+		lineNum := i + 1
+
+		// Paragraph boundary: empty line
+		if strings.TrimSpace(line) == "" && current.Len() > 0 {
+			if current.Len() >= maxChunkLen/2 {
+				flush(lineNum - 1)
+				continue
+			}
+		}
+
+		if current.Len() > 0 {
+			current.WriteString("\n")
+		}
+		current.WriteString(line)
+
+		// Force flush if too large
+		if current.Len() >= maxChunkLen {
+			flush(lineNum)
+		}
+	}
+
+	if current.Len() > 0 {
+		flush(len(lines))
+	}
+
+	return chunks
+}
 
 // EmbeddingProvider generates vector embeddings for text.
 type EmbeddingProvider interface {
@@ -25,10 +142,12 @@ type EmbeddingProvider interface {
 // OpenAIEmbeddingProvider uses the OpenAI-compatible embedding API.
 // Works with OpenAI, OpenRouter, and any compatible endpoint.
 type OpenAIEmbeddingProvider struct {
-	name   string
-	model  string
-	apiKey string
-	apiURL string
+	name       string
+	model      string
+	apiKey     string
+	apiURL     string
+	dimensions int // optional: truncate output to this many dimensions (0 = use model default)
+	httpClient *http.Client
 }
 
 // NewOpenAIEmbeddingProvider creates a provider for OpenAI-compatible embedding APIs.
@@ -39,22 +158,36 @@ func NewOpenAIEmbeddingProvider(name, apiKey, apiURL, model string) *OpenAIEmbed
 	if model == "" {
 		model = "text-embedding-3-small"
 	}
+	// Rewrite loopback hosts to host.docker.internal when running inside Docker,
+	// centralized here so no call site (verify handler, runtime memory embedding)
+	// can reach the container itself instead of a host service like Ollama.
+	apiURL = config.DockerLocalhost(apiURL)
 
 	return &OpenAIEmbeddingProvider{
-		name:   name,
-		model:  model,
-		apiKey: apiKey,
-		apiURL: apiURL,
+		name:       name,
+		model:      model,
+		apiKey:     apiKey,
+		apiURL:     apiURL,
+		httpClient: &http.Client{Timeout: 60 * time.Second},
 	}
+}
+
+// WithDimensions sets the output dimensions for models that support dimension truncation.
+func (p *OpenAIEmbeddingProvider) WithDimensions(d int) *OpenAIEmbeddingProvider {
+	p.dimensions = d
+	return p
 }
 
 func (p *OpenAIEmbeddingProvider) Name() string  { return p.name }
 func (p *OpenAIEmbeddingProvider) Model() string { return p.model }
 
 func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	reqBody := map[string]interface{}{
+	reqBody := map[string]any{
 		"input": texts,
 		"model": p.model,
+	}
+	if p.dimensions > 0 {
+		reqBody["dimensions"] = p.dimensions
 	}
 
 	bodyJSON, err := json.Marshal(reqBody)
@@ -70,7 +203,7 @@ func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([]
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("embedding request: %w", err)
 	}
@@ -84,6 +217,7 @@ func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([]
 	var result struct {
 		Data []struct {
 			Embedding []float32 `json:"embedding"`
+			Index     *int      `json:"index"`
 		} `json:"data"`
 	}
 
@@ -91,9 +225,37 @@ func (p *OpenAIEmbeddingProvider) Embed(ctx context.Context, texts []string) ([]
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
+	if len(result.Data) != len(texts) {
+		return nil, fmt.Errorf("embedding response count: got %d vectors for %d inputs", len(result.Data), len(texts))
+	}
+
 	embeddings := make([][]float32, len(result.Data))
-	for i, d := range result.Data {
-		embeddings[i] = d.Embedding
+	indexed := false
+	for _, d := range result.Data {
+		indexed = indexed || d.Index != nil
+	}
+	seen := make([]bool, len(result.Data))
+	for responseIndex, d := range result.Data {
+		targetIndex := responseIndex
+		if indexed {
+			if d.Index == nil || *d.Index < 0 || *d.Index >= len(result.Data) || seen[*d.Index] {
+				return nil, fmt.Errorf("embedding response has invalid index at position %d", responseIndex)
+			}
+			targetIndex = *d.Index
+		}
+		seen[targetIndex] = true
+		if len(d.Embedding) == 0 {
+			return nil, fmt.Errorf("embedding response has empty vector at index %d", targetIndex)
+		}
+		if p.dimensions > 0 && len(d.Embedding) != p.dimensions {
+			return nil, fmt.Errorf("embedding response dimension at index %d: got %d, want %d", targetIndex, len(d.Embedding), p.dimensions)
+		}
+		for _, value := range d.Embedding {
+			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+				return nil, fmt.Errorf("embedding response has non-finite value at index %d", targetIndex)
+			}
+		}
+		embeddings[targetIndex] = d.Embedding
 	}
 
 	return embeddings, nil

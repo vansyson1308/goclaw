@@ -12,7 +12,9 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/internal/tracing"
+	usagecaps "github.com/nextlevelbuilder/goclaw/internal/usage/caps"
 )
 
 func (l *Loop) emit(event AgentEvent) {
@@ -21,8 +23,19 @@ func (l *Loop) emit(event AgentEvent) {
 	}
 }
 
-// ID returns the agent's identifier.
+// ID returns the agent's identifier (agent_key, e.g. "goctech-leader").
+// Use for logs, UI, filesystem paths. NEVER for DB FK or DomainEvent.AgentID.
+// See docs/agent-identity-conventions.md.
 func (l *Loop) ID() string { return l.id }
+
+// UUID returns the agent's canonical UUID (DB primary key).
+// Use for SQL WHERE/JOIN, DomainEvent.AgentID, context propagation.
+// See docs/agent-identity-conventions.md.
+func (l *Loop) UUID() uuid.UUID { return l.agentUUID }
+
+// OtherConfig returns the agent's other_config JSONB (extensibility bag).
+// Used for per-agent TTS voice override (tts_voice_id, tts_model_id).
+func (l *Loop) OtherConfig() json.RawMessage { return l.agentOtherConfig }
 
 // Model returns the model identifier for this agent loop.
 func (l *Loop) Model() string { return l.model }
@@ -30,29 +43,83 @@ func (l *Loop) Model() string { return l.model }
 // IsRunning returns whether the agent is currently processing.
 func (l *Loop) IsRunning() bool { return l.activeRuns.Load() > 0 }
 
-// emitLLMSpan records an LLM call span if tracing is active.
-// When GOCLAW_TRACE_VERBOSE is set, messages are serialized as InputPreview.
-func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, messages []providers.Message, resp *providers.ChatResponse, callErr error) {
-	traceID := tracing.TraceIDFromContext(ctx)
+// ---------------------------------------------------------------------------
+// Span options — functional options for overriding model/provider in spans.
+// ---------------------------------------------------------------------------
+
+// spanOption overrides span metadata (model, provider) when per-request
+// overrides are active (e.g. heartbeat with a cheaper model).
+type spanOption func(*spanOverrides)
+
+type spanOverrides struct {
+	model                 string
+	provider              string
+	usageCapAttempts      []usagecaps.TraceMetadata
+	modelFallbackAttempts []providers.ModelFallbackAttemptMetadata
+}
+
+func withModel(m string) spanOption    { return func(o *spanOverrides) { o.model = m } }
+func withProvider(p string) spanOption { return func(o *spanOverrides) { o.provider = p } }
+func withUsageCapMetadata(metadata usagecaps.TraceMetadata) spanOption {
+	return func(o *spanOverrides) {
+		if !metadata.Empty() {
+			o.usageCapAttempts = append(o.usageCapAttempts, metadata)
+		}
+	}
+}
+
+func withModelFallbackAttempt(metadata providers.ModelFallbackAttemptMetadata) spanOption {
+	return func(o *spanOverrides) {
+		if !metadata.Empty() {
+			o.modelFallbackAttempts = append(o.modelFallbackAttempts, metadata)
+		}
+	}
+}
+
+// resolveSpan returns (model, provider) applying any overrides on top of agent defaults.
+func (l *Loop) resolveSpan(opts []spanOption) (string, string) {
+	o := l.resolveSpanOverrides(opts)
+	return o.model, o.provider
+}
+
+func (l *Loop) resolveSpanOverrides(opts []spanOption) spanOverrides {
+	o := spanOverrides{model: l.model}
+	if l.provider != nil {
+		o.provider = l.provider.Name()
+	}
+	for _, fn := range opts {
+		fn(&o)
+	}
+	return o
+}
+
+// ---------------------------------------------------------------------------
+// Two-phase LLM span: start (running) + end (completed/error)
+// ---------------------------------------------------------------------------
+
+// emitLLMSpanStart emits a "running" LLM span before the LLM call begins.
+// Returns the span ID so the caller can later call emitLLMSpanEnd to finalize it.
+// Goroutine-safe: only reads immutable Loop fields and does a channel send.
+func (l *Loop) emitLLMSpanStart(ctx context.Context, start time.Time, iteration int, messages []providers.Message, opts ...spanOption) uuid.UUID {
 	collector := tracing.CollectorFromContext(ctx)
+	traceID := tracing.TraceIDFromContext(ctx)
 	if collector == nil || traceID == uuid.Nil {
-		return
+		return uuid.Nil
 	}
 
-	now := time.Now().UTC()
-	dur := int(now.Sub(start).Milliseconds())
+	model, providerName := l.resolveSpan(opts)
+	spanID := store.GenNewID()
 	span := store.SpanData{
-		TraceID:    traceID,
-		SpanType:   store.SpanTypeLLMCall,
-		Name:       fmt.Sprintf("%s/%s #%d", l.provider.Name(), l.model, iteration),
-		StartTime:  start,
-		EndTime:    &now,
-		DurationMS: dur,
-		Model:      l.model,
-		Provider:   l.provider.Name(),
-		Status:     store.SpanStatusCompleted,
-		Level:      store.SpanLevelDefault,
-		CreatedAt:  now,
+		ID:        spanID,
+		TraceID:   traceID,
+		SpanType:  store.SpanTypeLLMCall,
+		Name:      fmt.Sprintf("%s/%s #%d", providerName, model, iteration),
+		StartTime: start,
+		Status:    store.SpanStatusRunning,
+		Level:     store.SpanLevelDefault,
+		Model:     model,
+		Provider:  providerName,
+		CreatedAt: start,
 	}
 	if parentID := tracing.ParentSpanIDFromContext(ctx); parentID != uuid.Nil {
 		span.ParentSpanID = &parentID
@@ -60,71 +127,155 @@ func (l *Loop) emitLLMSpan(ctx context.Context, start time.Time, iteration int, 
 	if l.agentUUID != uuid.Nil {
 		span.AgentID = &l.agentUUID
 	}
+	span.TeamID = tracing.TraceTeamIDPtrFromContext(ctx)
+	span.TenantID = store.TenantIDFromContext(ctx)
+	if span.TenantID == uuid.Nil {
+		span.TenantID = store.MasterTenantID
+	}
 
-	// Verbose mode: serialize full messages and output
-	verbose := collector.Verbose()
-	if verbose && len(messages) > 0 {
-		if b, err := json.Marshal(messages); err == nil {
-			span.InputPreview = truncateStr(string(b), 100000)
+	// Include input messages preview as truncated JSON.
+	if len(messages) > 0 {
+		previewLimit := previewLimitForVerbose(collector.Verbose())
+		stripped := make([]providers.Message, len(messages))
+		copy(stripped, messages)
+		for i := range stripped {
+			if len(stripped[i].Images) > 0 {
+				placeholder := make([]providers.ImageContent, len(stripped[i].Images))
+				for j, img := range stripped[i].Images {
+					placeholder[j] = providers.ImageContent{MimeType: img.MimeType, Data: fmt.Sprintf("[base64 %s, %d bytes]", img.MimeType, len(img.Data))}
+				}
+				stripped[i].Images = placeholder
+			}
 		}
+		if b, err := json.Marshal(stripped); err == nil {
+			span.InputPreview = tracing.TruncateJSON(string(b), previewLimit)
+		}
+	}
+
+	collector.EmitSpan(tracing.RedactSpan(ctx, span))
+	return spanID
+}
+
+// emitLLMSpanEnd finalizes a running LLM span with results.
+// Uses EmitSpanUpdate (channel send) — does NOT depend on ctx being alive,
+// so it works correctly even after ctx cancellation or deadline exceeded.
+func (l *Loop) emitLLMSpanEnd(ctx context.Context, spanID uuid.UUID, start time.Time, resp *providers.ChatResponse, callErr error, opts ...spanOption) {
+	if spanID == uuid.Nil {
+		return // tracing disabled — no running span was emitted
+	}
+	collector := tracing.CollectorFromContext(ctx)
+	traceID := tracing.TraceIDFromContext(ctx)
+	if collector == nil || traceID == uuid.Nil {
+		return
+	}
+
+	now := time.Now().UTC()
+	updates := map[string]any{
+		"end_time":    now,
+		"duration_ms": int(now.Sub(start).Milliseconds()),
+		"status":      store.SpanStatusCompleted,
+	}
+	var spanMetadata json.RawMessage
+	spanOpts := l.resolveSpanOverrides(opts)
+	if spanOpts.provider != "" {
+		updates["provider"] = spanOpts.provider
+	}
+	if spanOpts.model != "" {
+		updates["model"] = spanOpts.model
 	}
 
 	if callErr != nil {
-		span.Status = store.SpanStatusError
-		span.Error = callErr.Error()
+		updates["status"] = store.SpanStatusError
+		updates["error"] = callErr.Error()
 	} else if resp != nil {
 		if resp.Usage != nil {
-			span.InputTokens = resp.Usage.PromptTokens
-			span.OutputTokens = resp.Usage.CompletionTokens
-			if resp.Usage.CacheCreationTokens > 0 || resp.Usage.CacheReadTokens > 0 {
-				meta := map[string]int{
-					"cache_creation_tokens": resp.Usage.CacheCreationTokens,
-					"cache_read_tokens":     resp.Usage.CacheReadTokens,
+			updates["input_tokens"] = resp.Usage.PromptTokens
+			updates["output_tokens"] = resp.Usage.CompletionTokens
+			hasMeta := resp.Usage.CacheCreationTokens > 0 || resp.Usage.CacheReadTokens > 0 || resp.Usage.ThinkingTokens > 0 || resp.Usage.PromptTokensIncludeCachedSegments
+			if hasMeta {
+				meta := map[string]any{}
+				if resp.Usage.CacheCreationTokens > 0 {
+					meta["cache_creation_tokens"] = resp.Usage.CacheCreationTokens
+				}
+				if resp.Usage.CacheReadTokens > 0 {
+					meta["cache_read_tokens"] = resp.Usage.CacheReadTokens
+				}
+				if resp.Usage.ThinkingTokens > 0 {
+					meta["thinking_tokens"] = resp.Usage.ThinkingTokens
+				}
+				if resp.Usage.PromptTokensIncludeCachedSegments {
+					meta["prompt_tokens_include_cached_segments"] = true
 				}
 				if b, err := json.Marshal(meta); err == nil {
-					span.Metadata = b
+					spanMetadata = b
 				}
 			}
 		}
-		span.FinishReason = resp.FinishReason
-		if verbose {
-			span.OutputPreview = truncateStr(resp.Content, 100000)
-		} else {
-			span.OutputPreview = truncateStr(resp.Content, 500)
+		if cost := l.calculateLLMCost(ctx, spanOpts.provider, spanOpts.model, resp.Usage); cost > 0 {
+			updates["total_cost"] = cost
+		}
+		updates["finish_reason"] = resp.FinishReason
+		limit := previewLimitForVerbose(collector.Verbose())
+		preview := resp.Content
+		if resp.Thinking != "" {
+			preview = "<thinking>\n" + resp.Thinking + "\n</thinking>\n" + resp.Content
+		}
+		updates["output_preview"] = tracing.TruncateMid(preview, limit)
+	}
+	if observation := providers.ChatGPTOAuthRoutingObservationFromContext(ctx); observation != nil {
+		evidence := observation.Snapshot()
+		if evidence.HasData() {
+			spanMetadata = providers.MergeChatGPTOAuthRoutingMetadata(spanMetadata, evidence)
+			if evidence.ServingProvider != "" {
+				updates["provider"] = evidence.ServingProvider
+			}
 		}
 	}
+	if decision := providers.ReasoningDecisionFromContext(ctx); decision != nil {
+		spanMetadata = providers.MergeReasoningMetadata(spanMetadata, *decision)
+	}
+	if len(spanOpts.usageCapAttempts) > 0 {
+		spanMetadata = usagecaps.MergeTraceMetadata(spanMetadata, spanOpts.usageCapAttempts)
+	}
+	if len(spanOpts.modelFallbackAttempts) > 0 {
+		spanMetadata = providers.MergeModelFallbackMetadata(spanMetadata, spanOpts.modelFallbackAttempts)
+	}
+	if len(spanMetadata) > 0 {
+		updates["metadata"] = spanMetadata
+	}
 
-	collector.EmitSpan(span)
+	collector.EmitSpanUpdate(spanID, traceID, tracing.RedactSpanUpdates(ctx, updates))
 }
 
-// emitToolSpan records a tool call span if tracing is active.
-func (l *Loop) emitToolSpan(ctx context.Context, start time.Time, toolName, toolCallID, input, output string, isError bool) {
-	traceID := tracing.TraceIDFromContext(ctx)
+// ---------------------------------------------------------------------------
+// Two-phase tool span: start (running) + end (completed/error)
+// ---------------------------------------------------------------------------
+
+// emitToolSpanStart emits a "running" tool span before tool execution begins.
+// Returns the span ID so the caller can later call emitToolSpanEnd to finalize it.
+// Goroutine-safe: only reads immutable Loop fields and does a channel send.
+func (l *Loop) emitToolSpanStart(ctx context.Context, start time.Time, toolName, toolCallID, input string) uuid.UUID {
 	collector := tracing.CollectorFromContext(ctx)
+	traceID := tracing.TraceIDFromContext(ctx)
 	if collector == nil || traceID == uuid.Nil {
-		return
+		return uuid.Nil
 	}
 
-	now := time.Now().UTC()
-	dur := int(now.Sub(start).Milliseconds())
-	previewLimit := 500
-	if collector.Verbose() {
-		previewLimit = 100000
-	}
+	previewLimit := previewLimitForVerbose(collector.Verbose())
+
+	spanID := store.GenNewID()
 	span := store.SpanData{
-		TraceID:       traceID,
-		SpanType:      store.SpanTypeToolCall,
-		Name:          toolName,
-		StartTime:     start,
-		EndTime:       &now,
-		DurationMS:    dur,
-		ToolName:      toolName,
-		ToolCallID:    toolCallID,
-		InputPreview:  truncateStr(input, previewLimit),
-		OutputPreview: truncateStr(output, previewLimit),
-		Status:        store.SpanStatusCompleted,
-		Level:         "DEFAULT",
-		CreatedAt:     now,
+		ID:           spanID,
+		TraceID:      traceID,
+		SpanType:     store.SpanTypeToolCall,
+		Name:         toolName,
+		StartTime:    start,
+		ToolName:     toolName,
+		ToolCallID:   toolCallID,
+		InputPreview: tracing.TruncateJSON(input, previewLimit),
+		Status:       store.SpanStatusRunning,
+		Level:        store.SpanLevelDefault,
+		CreatedAt:    start,
 	}
 	if parentID := tracing.ParentSpanIDFromContext(ctx); parentID != uuid.Nil {
 		span.ParentSpanID = &parentID
@@ -132,45 +283,111 @@ func (l *Loop) emitToolSpan(ctx context.Context, start time.Time, toolName, tool
 	if l.agentUUID != uuid.Nil {
 		span.AgentID = &l.agentUUID
 	}
-	if isError {
-		span.Status = store.SpanStatusError
-		span.Error = truncateStr(output, 200)
+	span.TeamID = tracing.TraceTeamIDPtrFromContext(ctx)
+	span.TenantID = store.TenantIDFromContext(ctx)
+	if span.TenantID == uuid.Nil {
+		span.TenantID = store.MasterTenantID
 	}
 
-	collector.EmitSpan(span)
+	collector.EmitSpan(tracing.RedactSpan(ctx, span))
+	return spanID
 }
 
-// emitAgentSpan records the root "agent" span that parents all LLM/tool spans in this request.
-func (l *Loop) emitAgentSpan(ctx context.Context, start time.Time, result *RunResult, runErr error) {
-	traceID := tracing.TraceIDFromContext(ctx)
+// emitToolSpanEnd finalizes a running tool span with execution results.
+// Uses EmitSpanUpdate (channel send) — safe after ctx cancellation.
+// Goroutine-safe: only does a channel send via EmitSpanUpdate.
+func (l *Loop) emitToolSpanEnd(ctx context.Context, spanID uuid.UUID, start time.Time, result *tools.Result) {
+	if spanID == uuid.Nil {
+		return // tracing disabled
+	}
 	collector := tracing.CollectorFromContext(ctx)
+	traceID := tracing.TraceIDFromContext(ctx)
 	if collector == nil || traceID == uuid.Nil {
 		return
 	}
 
-	agentSpanID := tracing.ParentSpanIDFromContext(ctx)
-	if agentSpanID == uuid.Nil {
+	now := time.Now().UTC()
+	previewLimit := previewLimitForVerbose(collector.Verbose())
+
+	updates := map[string]any{
+		"end_time":       now,
+		"duration_ms":    int(now.Sub(start).Milliseconds()),
+		"status":         store.SpanStatusCompleted,
+		"output_preview": tracing.TruncateMid(result.ForLLM, previewLimit),
+	}
+
+	if result.IsError {
+		updates["status"] = store.SpanStatusError
+		updates["error"] = truncateStr(result.ForLLM, 200)
+	}
+
+	// Record token usage from tools that make internal LLM calls (e.g. read_image).
+	if result.Usage != nil {
+		updates["input_tokens"] = result.Usage.PromptTokens
+		updates["output_tokens"] = result.Usage.CompletionTokens
+		updates["provider"] = result.Provider
+		updates["model"] = result.Model
+		hasMeta := result.Usage.CacheCreationTokens > 0 ||
+			result.Usage.CacheReadTokens > 0 ||
+			result.Usage.ThinkingTokens > 0 ||
+			result.Usage.PromptTokensIncludeCachedSegments
+		if hasMeta {
+			meta := map[string]any{
+				"cache_creation_tokens": result.Usage.CacheCreationTokens,
+				"cache_read_tokens":     result.Usage.CacheReadTokens,
+			}
+			if result.Usage.ThinkingTokens > 0 {
+				meta["thinking_tokens"] = result.Usage.ThinkingTokens
+			}
+			if result.Usage.PromptTokensIncludeCachedSegments {
+				meta["prompt_tokens_include_cached_segments"] = true
+			}
+			if b, err := json.Marshal(meta); err == nil {
+				updates["metadata"] = b
+			}
+		}
+		provider := result.Provider
+		model := result.Model
+		if cost := l.calculateLLMCost(ctx, provider, model, result.Usage); cost > 0 {
+			updates["total_cost"] = cost
+		}
+	}
+
+	collector.EmitSpanUpdate(spanID, traceID, tracing.RedactSpanUpdates(ctx, updates))
+}
+
+// ---------------------------------------------------------------------------
+// Two-phase agent span: start (running) + end (completed/error)
+// ---------------------------------------------------------------------------
+
+// emitAgentSpanStart emits a "running" root agent span at the beginning of a run.
+// The span is identified by agentSpanID (pre-generated, same ID used as ParentSpanID
+// for child LLM/tool spans).
+func (l *Loop) emitAgentSpanStart(ctx context.Context, agentSpanID uuid.UUID, start time.Time, inputPreview string, opts ...spanOption) {
+	collector := tracing.CollectorFromContext(ctx)
+	traceID := tracing.TraceIDFromContext(ctx)
+	if collector == nil || traceID == uuid.Nil {
 		return
 	}
 
-	now := time.Now().UTC()
-	dur := int(now.Sub(start).Milliseconds())
+	previewLimit := previewLimitForVerbose(collector.Verbose())
+
+	model, providerName := l.resolveSpan(opts)
 	spanName := l.id
 	span := store.SpanData{
-		ID:         agentSpanID,
-		TraceID:    traceID,
-		SpanType:   store.SpanTypeAgent,
-		Name:       spanName,
-		StartTime:  start,
-		EndTime:    &now,
-		DurationMS: dur,
-		Model:      l.model,
-		Provider:   l.provider.Name(),
-		Status:     store.SpanStatusCompleted,
-		Level:      store.SpanLevelDefault,
-		CreatedAt:  now,
+		ID:           agentSpanID,
+		TraceID:      traceID,
+		SpanType:     store.SpanTypeAgent,
+		Name:         spanName,
+		StartTime:    start,
+		Status:       store.SpanStatusRunning,
+		Level:        store.SpanLevelDefault,
+		Model:        model,
+		Provider:     providerName,
+		InputPreview: tracing.TruncateMid(inputPreview, previewLimit),
+		CreatedAt:    start,
 	}
-	// Nest under parent root span if this is an announce run
+	// Nest under parent root span if this is an announce run.
 	if announceParent := tracing.AnnounceParentSpanIDFromContext(ctx); announceParent != uuid.Nil {
 		span.ParentSpanID = &announceParent
 		span.Name = "announce:" + spanName
@@ -178,20 +395,53 @@ func (l *Loop) emitAgentSpan(ctx context.Context, start time.Time, result *RunRe
 	if l.agentUUID != uuid.Nil {
 		span.AgentID = &l.agentUUID
 	}
-	if runErr != nil {
-		span.Status = store.SpanStatusError
-		span.Error = runErr.Error()
-	} else if result != nil {
-		limit := 500
-		if collector.Verbose() {
-			limit = 100000
-		}
-		span.OutputPreview = truncateStr(result.Content, limit)
-		// Note: token counts are NOT set on agent spans to avoid double-counting
-		// with child llm_call spans. Trace aggregation sums only llm_call spans.
+	span.TeamID = tracing.TraceTeamIDPtrFromContext(ctx)
+	span.TenantID = store.TenantIDFromContext(ctx)
+	if span.TenantID == uuid.Nil {
+		span.TenantID = store.MasterTenantID
 	}
 
-	collector.EmitSpan(span)
+	collector.EmitSpan(tracing.RedactSpan(ctx, span))
+}
+
+// emitAgentSpanEnd finalizes the running root agent span with results.
+// Uses EmitSpanUpdate (channel send) — safe after ctx cancellation.
+func (l *Loop) emitAgentSpanEnd(ctx context.Context, agentSpanID uuid.UUID, start time.Time, result *RunResult, runErr error) {
+	if agentSpanID == uuid.Nil {
+		return
+	}
+	collector := tracing.CollectorFromContext(ctx)
+	traceID := tracing.TraceIDFromContext(ctx)
+	if collector == nil || traceID == uuid.Nil {
+		return
+	}
+
+	now := time.Now().UTC()
+	updates := map[string]any{
+		"end_time":    now,
+		"duration_ms": int(now.Sub(start).Milliseconds()),
+		"status":      store.SpanStatusCompleted,
+	}
+
+	if runErr != nil {
+		updates["status"] = store.SpanStatusError
+		updates["error"] = runErr.Error()
+	} else if result != nil {
+		limit := previewLimitForVerbose(collector.Verbose())
+		updates["output_preview"] = tracing.TruncateMid(result.Content, limit)
+		// Note: token counts are NOT set on agent spans to avoid double-counting
+		// with child spans that directly report model usage.
+	}
+
+	collector.EmitSpanUpdate(agentSpanID, traceID, tracing.RedactSpanUpdates(ctx, updates))
+}
+
+// previewLimitForVerbose returns the preview character limit based on verbose mode.
+func previewLimitForVerbose(verbose bool) int {
+	if verbose {
+		return 200_000
+	}
+	return 40_000
 }
 
 func truncateStr(s string, maxLen int) string {
@@ -199,19 +449,79 @@ func truncateStr(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
+	// Keep the tail — recent context is more useful for debugging.
+	start := len(s) - maxLen
 	// Don't cut in the middle of a multi-byte rune
-	for maxLen > 0 && !utf8.RuneStart(s[maxLen]) {
-		maxLen--
+	for start < len(s) && !utf8.RuneStart(s[start]) {
+		start++
 	}
-	return s[:maxLen] + "..."
+	return "..." + s[start:]
+}
+
+// estimateMessageTokens returns a rough token estimate for a single message,
+// including content text and tool call arguments.
+func estimateMessageTokens(m providers.Message) int {
+	tokens := utf8.RuneCountInString(m.Content) / 3
+	for _, tc := range m.ToolCalls {
+		tokens += len(tc.ID)/3 + len(tc.Name)/3
+		for k, v := range tc.Arguments {
+			tokens += len(k) / 3
+			switch val := v.(type) {
+			case string:
+				tokens += len(val) / 3
+			default:
+				tokens += 10 // small fixed estimate for non-string args (numbers, booleans, etc.)
+			}
+		}
+	}
+	return tokens
 }
 
 // EstimateTokens returns a rough token estimate for a slice of messages.
+// Includes content text and tool call arguments (JSON overhead).
 // Used internally for summarization thresholds and externally for adaptive throttle.
 func EstimateTokens(messages []providers.Message) int {
 	total := 0
 	for _, m := range messages {
-		total += utf8.RuneCountInString(m.Content) / 3
+		total += estimateMessageTokens(m)
 	}
 	return total
+}
+
+// EstimateHistoryTokens estimates tokens for history messages only,
+// excluding system messages (which are overhead: system prompt, tool defs, context files).
+// Used for compaction threshold checks where we need history-only token count.
+func EstimateHistoryTokens(messages []providers.Message) int {
+	total := 0
+	for _, m := range messages {
+		if m.Role == "system" {
+			continue
+		}
+		total += estimateMessageTokens(m)
+	}
+	return total
+}
+
+// EstimateTokensWithCalibration uses actual prompt tokens from the last LLM
+// response as a calibration base, then estimates only new messages on top.
+// Falls back to EstimateTokens() when no calibration data is available.
+func EstimateTokensWithCalibration(messages []providers.Message, lastPromptTokens, lastMsgCount int) int {
+	if lastPromptTokens <= 0 || lastMsgCount <= 0 {
+		return EstimateTokens(messages)
+	}
+
+	currentCount := len(messages)
+	newMsgs := currentCount - lastMsgCount
+	if newMsgs <= 0 {
+		// No new messages since last calibration (or history was truncated).
+		// Use calibration value as-is; it's the best estimate we have.
+		return lastPromptTokens
+	}
+
+	// Estimate only the new messages with the heuristic and add to base.
+	delta := 0
+	for _, m := range messages[lastMsgCount:] {
+		delta += estimateMessageTokens(m)
+	}
+	return lastPromptTokens + delta
 }

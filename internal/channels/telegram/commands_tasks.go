@@ -39,8 +39,17 @@ func truncateStr(s string, maxLen int) string {
 	return string(runes[:maxLen]) + "…"
 }
 
+// taskUserID composes the scoped user ID for task filtering.
+// Groups use "group:{channel}:{chatID}", DMs use the chat ID directly.
+func taskUserID(channelName string, chatID int64, isGroup bool) string {
+	if isGroup {
+		return fmt.Sprintf("group:%s:%d", channelName, chatID)
+	}
+	return fmt.Sprintf("%d", chatID)
+}
+
 // handleTasksList handles the /tasks command — lists team tasks.
-func (c *Channel) handleTasksList(ctx context.Context, chatID int64, setThread func(*telego.SendMessageParams)) {
+func (c *Channel) handleTasksList(ctx context.Context, chatID int64, isGroup bool, setThread func(*telego.SendMessageParams)) {
 	chatIDObj := tu.ID(chatID)
 
 	send := func(text string) {
@@ -72,7 +81,7 @@ func (c *Channel) handleTasksList(ctx context.Context, chatID int64, setThread f
 		return
 	}
 
-	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll)
+	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup), "", "", 0, 0)
 	if err != nil {
 		slog.Warn("tasks command: ListTasks failed", "error", err)
 		send("Failed to list tasks. Please try again.")
@@ -122,7 +131,7 @@ func (c *Channel) handleTasksList(ctx context.Context, chatID int64, setThread f
 }
 
 // handleTaskDetail handles the /task_detail command — shows detail for a task.
-func (c *Channel) handleTaskDetail(ctx context.Context, chatID int64, text string, setThread func(*telego.SendMessageParams)) {
+func (c *Channel) handleTaskDetail(ctx context.Context, chatID int64, text string, isGroup bool, setThread func(*telego.SendMessageParams)) {
 	chatIDObj := tu.ID(chatID)
 
 	send := func(t string) {
@@ -164,7 +173,7 @@ func (c *Channel) handleTaskDetail(ctx context.Context, chatID int64, text strin
 		return
 	}
 
-	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll)
+	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup), "", "", 0, 0)
 	if err != nil {
 		slog.Warn("task_detail command: ListTasks failed", "error", err)
 		send("Failed to list tasks. Please try again.")
@@ -187,9 +196,17 @@ func (c *Channel) handleTaskDetail(ctx context.Context, chatID int64, text strin
 // handleCallbackQuery handles inline keyboard button presses.
 func (c *Channel) handleCallbackQuery(ctx context.Context, query *telego.CallbackQuery) {
 	// Always answer to dismiss the loading indicator.
+	// Inject tenant scope (callback queries bypass handleBotCommand).
+	ctx = store.WithTenantID(ctx, c.TenantID())
+
 	c.bot.AnswerCallbackQuery(ctx, &telego.AnswerCallbackQueryParams{
 		CallbackQueryID: query.ID,
 	})
+
+	if strings.HasPrefix(query.Data, "sa:") {
+		c.handleSubagentCallback(ctx, query)
+		return
+	}
 
 	if !strings.HasPrefix(query.Data, "td:") {
 		return
@@ -197,9 +214,11 @@ func (c *Channel) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 
 	taskIDStr := strings.TrimPrefix(query.Data, "td:")
 
-	// Resolve chat ID from the callback's message.
-	chatID := query.Message.GetChat().ID
+	// Resolve chat ID and group status from the callback's message.
+	chat := query.Message.GetChat()
+	chatID := chat.ID
 	chatIDObj := tu.ID(chatID)
+	isGroup := chat.Type == "group" || chat.Type == "supergroup"
 
 	send := func(text string) {
 		for _, chunk := range chunkPlainText(text, telegramMaxMessageLen) {
@@ -225,7 +244,7 @@ func (c *Channel) handleCallbackQuery(ctx context.Context, query *telego.Callbac
 		return
 	}
 
-	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll)
+	tasks, err := c.teamStore.ListTasks(ctx, team.ID, "newest", store.TeamTaskFilterAll, taskUserID(c.Name(), chatID, isGroup), "", "", 0, 0)
 	if err != nil {
 		send("Failed to list tasks.")
 		return

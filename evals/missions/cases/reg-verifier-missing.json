@@ -1,0 +1,79 @@
+{
+  "id": "reg-verifier-missing",
+  "split": "regression",
+  "category": "regression",
+  "description": "A verifier that cannot run is an error, never a pass.",
+  "contract": {
+    "version": 1,
+    "title": "Fix Sum for negative numbers",
+    "objective": "Sum ignores negative numbers. Make Sum add every element and add a regression test.",
+    "agent": "eval-agent",
+    "workspace": {
+      "source_dir": "sumrepo"
+    },
+    "acceptance": [
+      {
+        "id": "existing-tests",
+        "kind": "command",
+        "command": [
+          "goclaw-no-such-verifier"
+        ],
+        "timeout_seconds": 30
+      },
+      {
+        "id": "behavior",
+        "description": "hidden acceptance tests pass",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "-run",
+          "TestAcceptance",
+          "./..."
+        ],
+        "timeout_seconds": 180,
+        "must_change": true,
+        "overlay_dir": "sumrepo-acceptance",
+        "expect_tests": [
+          "TestAcceptanceSumIncludesNegatives"
+        ]
+      },
+      {
+        "id": "regression-test",
+        "description": "a regression test was added",
+        "kind": "file_changed",
+        "glob": "*_test.go"
+      }
+    ],
+    "limits": {
+      "max_iterations": 20,
+      "timeout_seconds": 120
+    }
+  },
+  "agent": {
+    "steps": [
+      {
+        "tool": "edit",
+        "args": {
+          "path": "sum.go",
+          "old_string": "\t\tif x > 0 {\n\t\t\ttotal += x\n\t\t}\n",
+          "new_string": "\t\ttotal += x\n"
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "sum_negative_test.go",
+          "content": "package sum\n\nimport \"testing\"\n\nfunc TestSumNegative(t *testing.T) {\n\tif got := Sum([]int{5, -2}); got != 3 {\n\t\tt.Fatalf(\"got %d, want 3\", got)\n\t}\n}\n"
+        }
+      }
+    ],
+    "reply": "done"
+  },
+  "expect": {
+    "status": "blocked",
+    "criteria": {
+      "existing-tests": "error"
+    }
+  }
+}

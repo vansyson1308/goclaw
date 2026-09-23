@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -9,10 +12,13 @@ import (
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/golang-migrate/migrate/v4/source"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/spf13/cobra"
 
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/upgrade"
 )
 
 var migrationsDir string
@@ -33,9 +39,26 @@ func resolveMigrationsDir() string {
 	return filepath.Join(filepath.Dir(exe), "migrations")
 }
 
-func newMigrator(dsn string) (*migrate.Migrate, error) {
+// newMigrationSource opens the migrations directory as a golang-migrate source.
+// It uses an iofs source over os.DirFS rather than a file:// URL: golang-migrate's
+// file source driver mis-parses Windows absolute paths — the drive-letter URL
+// "file:///D:/..." fails with "open ." errors — whereas os.DirFS uses native OS
+// path handling and behaves identically on every platform.
+func newMigrationSource() (source.Driver, error) {
 	dir := resolveMigrationsDir()
-	m, err := migrate.New("file://"+dir, dsn)
+	src, err := iofs.New(os.DirFS(dir), ".")
+	if err != nil {
+		return nil, fmt.Errorf("open migrations dir %q: %w", dir, err)
+	}
+	return src, nil
+}
+
+func newMigrator(dsn string) (*migrate.Migrate, error) {
+	src, err := newMigrationSource()
+	if err != nil {
+		return nil, err
+	}
+	m, err := migrate.NewWithSourceInstance("iofs", src, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("create migrator: %w", err)
 	}
@@ -89,12 +112,28 @@ func migrateUpCmd() *cobra.Command {
 			}
 			defer m.Close()
 
-			if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+			if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 				return fmt.Errorf("migrate up: %w", err)
 			}
 
 			v, dirty, _ := m.Version()
 			slog.Info("migration complete", "version", v, "dirty", dirty)
+
+			// Run pending data hooks after SQL migrations.
+			db, dbErr := sql.Open("pgx", dsn)
+			if dbErr != nil {
+				slog.Warn("could not connect for data hooks", "error", dbErr)
+				return nil
+			}
+			defer db.Close()
+
+			count, hookErr := upgrade.RunPendingHooks(context.Background(), db)
+			if hookErr != nil {
+				slog.Warn("data hooks failed", "error", hookErr)
+			} else if count > 0 {
+				slog.Info("data hooks applied", "count", count)
+			}
+
 			return nil
 		},
 	}
@@ -119,7 +158,7 @@ func migrateDownCmd() *cobra.Command {
 			if steps <= 0 {
 				steps = 1
 			}
-			if err := m.Steps(-steps); err != nil && err != migrate.ErrNoChange {
+			if err := m.Steps(-steps); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 				return fmt.Errorf("migrate down: %w", err)
 			}
 
@@ -206,7 +245,7 @@ func migrateGotoCmd() *cobra.Command {
 			}
 			defer m.Close()
 
-			if err := m.Migrate(uint(version)); err != nil && err != migrate.ErrNoChange {
+			if err := m.Migrate(uint(version)); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 				return fmt.Errorf("migrate goto: %w", err)
 			}
 			slog.Info("migrated to version", "version", version)

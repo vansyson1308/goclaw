@@ -13,6 +13,8 @@ import (
 	"strings"
 )
 
+const maxWebhookBodyBytes = 1 << 20
+
 // --- Event types (replacing larkim.P2MessageReceiveV1) ---
 
 // MessageEvent is the parsed structure of a Feishu im.message.receive_v1 event.
@@ -42,9 +44,15 @@ type EventSender struct {
 }
 
 type EventMessage struct {
-	MessageID   string         `json:"message_id"`
-	RootID      string         `json:"root_id"`
-	ParentID    string         `json:"parent_id"`
+	MessageID string `json:"message_id"`
+	RootID    string `json:"root_id"`
+	ParentID  string `json:"parent_id"`
+	// ThreadID is the definitive "this message lives inside a thread" signal
+	// per Lark docs. Unlike RootID (which is populated on ANY reply — including
+	// plain quote replies), ThreadID is only present when the message is in an
+	// actual topic thread. Used to decide whether to reply via the reply
+	// endpoint with reply_in_thread=true.
+	ThreadID    string         `json:"thread_id"`
 	ChatID      string         `json:"chat_id"`
 	ChatType    string         `json:"chat_type"`
 	MessageType string         `json:"message_type"`
@@ -53,8 +61,8 @@ type EventMessage struct {
 }
 
 type EventMention struct {
-	Key       string `json:"key"`
-	ID        struct {
+	Key string `json:"key"`
+	ID  struct {
 		OpenID  string `json:"open_id"`
 		UserID  string `json:"user_id"`
 		UnionID string `json:"union_id"`
@@ -69,9 +77,9 @@ type EventMention struct {
 // Schema v1.0 uses flat structure, v2.0 uses header+event.
 type webhookEvent struct {
 	// v2.0 fields
-	Schema  string          `json:"schema"`
-	Header  json.RawMessage `json:"header"`
-	Event   json.RawMessage `json:"event"`
+	Schema string          `json:"schema"`
+	Header json.RawMessage `json:"header"`
+	Event  json.RawMessage `json:"event"`
 
 	// v1.0 fields (also used for URL verification challenge)
 	Type      string `json:"type"`
@@ -91,9 +99,13 @@ func NewWebhookHandler(verificationToken, encryptKey string, onMessage func(even
 			return
 		}
 
-		body, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBodyBytes+1))
 		if err != nil {
 			http.Error(w, "read body failed", http.StatusBadRequest)
+			return
+		}
+		if len(body) > maxWebhookBodyBytes {
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 
@@ -105,6 +117,7 @@ func NewWebhookHandler(verificationToken, encryptKey string, onMessage func(even
 		}
 
 		// Handle encrypted events
+		eventBody := body
 		if envelope.Encrypt != "" && encryptKey != "" {
 			decrypted, err := decryptEvent(envelope.Encrypt, encryptKey)
 			if err != nil {
@@ -112,6 +125,7 @@ func NewWebhookHandler(verificationToken, encryptKey string, onMessage func(even
 				http.Error(w, "decrypt failed", http.StatusBadRequest)
 				return
 			}
+			eventBody = decrypted
 			// Re-parse decrypted content
 			if err := json.Unmarshal(decrypted, &envelope); err != nil {
 				http.Error(w, "invalid decrypted json", http.StatusBadRequest)
@@ -121,21 +135,24 @@ func NewWebhookHandler(verificationToken, encryptKey string, onMessage func(even
 
 		// URL verification challenge
 		if envelope.Type == "url_verification" {
+			if verificationToken == "" || envelope.Token != verificationToken {
+				slog.Warn("security.feishu_webhook_url_verification_rejected")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]string{"challenge": envelope.Challenge})
 			return
 		}
 
+		if encryptKey != "" && envelope.Encrypt == "" {
+			slog.Warn("security.feishu_webhook_plaintext_rejected")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		// Parse as message event
 		var event MessageEvent
-		// Re-unmarshal the original (or decrypted) body as a full event
-		eventBody := body
-		if envelope.Encrypt != "" && encryptKey != "" {
-			decrypted, _ := decryptEvent(envelope.Encrypt, encryptKey)
-			if decrypted != nil {
-				eventBody = decrypted
-			}
-		}
 
 		if err := json.Unmarshal(eventBody, &event); err != nil {
 			slog.Debug("feishu webhook parse event failed", "error", err)
@@ -144,8 +161,13 @@ func NewWebhookHandler(verificationToken, encryptKey string, onMessage func(even
 		}
 
 		// Verify token if configured
+		if verificationToken == "" && encryptKey == "" {
+			slog.Warn("security.feishu_webhook_missing_verification")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if verificationToken != "" && event.Header.Token != verificationToken {
-			slog.Warn("feishu webhook token mismatch")
+			slog.Warn("security.feishu_webhook_token_mismatch")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -181,6 +203,9 @@ func decryptEvent(encryptedBase64, key string) ([]byte, error) {
 	// IV is first 16 bytes
 	iv := ciphertext[:aes.BlockSize]
 	ciphertext = ciphertext[aes.BlockSize:]
+	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+		return nil, fmt.Errorf("ciphertext length not block aligned")
+	}
 
 	mode := cipher.NewCBCDecrypter(block, iv)
 	mode.CryptBlocks(ciphertext, ciphertext)

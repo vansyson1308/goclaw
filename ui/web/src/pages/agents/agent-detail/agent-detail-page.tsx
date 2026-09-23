@@ -1,145 +1,214 @@
-import { useState } from "react";
+import { useState, lazy, Suspense } from "react";
+import { useNavigate } from "react-router";
+import { useTranslation } from "react-i18next";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
-import { ArrowLeft, Bot, Star } from "lucide-react";
 import { useAgentDetail } from "../hooks/use-agent-detail";
-import { AgentGeneralTab } from "./agent-general-tab";
-import { AgentConfigTab } from "./agent-config-tab";
+import { useAgents } from "../hooks/use-agents";
+import { useAgentHeartbeat } from "../hooks/use-agent-heartbeat";
+import { AgentHeader } from "./agent-header";
+import { AgentOverviewTab } from "./agent-overview-tab";
 import { AgentFilesTab } from "./agent-files-tab";
+import { AgentInstancesTab } from "./agent-instances-tab";
+import { AgentPermissionsTab } from "./agent-permissions-tab";
 import { AgentSharesTab } from "./agent-shares-tab";
-import { AgentLinksTab } from "./agent-links-tab";
+import { AgentEvolutionTab } from "./evolution-tab/agent-evolution-tab";
+import { AgentHooksTab } from "./agent-hooks-tab";
 import { SummoningModal } from "../summoning-modal";
-import { DeferredSpinner } from "@/components/shared/loading-skeleton";
+import { ConfirmDeleteDialog } from "@/components/shared/confirm-delete-dialog";
+import { DetailPageSkeleton } from "@/components/shared/loading-skeleton";
+import { agentDisplayName } from "./agent-display-utils";
+import { SystemPromptDialog } from "./system-prompt-dialog";
+
+const AgentAdvancedDialog = lazy(() =>
+  import("./agent-advanced-dialog").then((m) => ({ default: m.AgentAdvancedDialog }))
+);
+const HeartbeatConfigDialog = lazy(() =>
+  import("./heartbeat-config-dialog").then((m) => ({ default: m.HeartbeatConfigDialog }))
+);
 
 interface AgentDetailPageProps {
   agentId: string;
   onBack: () => void;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-function agentDisplayName(agent: { display_name?: string; agent_key: string }) {
-  if (agent.display_name) return agent.display_name;
-  if (UUID_RE.test(agent.agent_key)) return "Unnamed Agent";
-  return agent.agent_key;
-}
-
-function agentSubtitle(agent: { display_name?: string; agent_key: string; id: string }) {
-  // Don't show agent_key if it equals the id (both are UUID) and there's no display_name
-  if (!agent.display_name && agent.agent_key === agent.id) return null;
-  // Show agent_key as subtitle (truncate if UUID)
-  if (UUID_RE.test(agent.agent_key)) return agent.agent_key.slice(0, 8) + "…";
-  return agent.agent_key;
-}
-
 export function AgentDetailPage({ agentId, onBack }: AgentDetailPageProps) {
-  const { agent, files, loading, updateAgent, getFile, setFile, regenerateAgent, refresh } =
+  const { t } = useTranslation("agents");
+  const navigate = useNavigate();
+  const { agent, files, loading, updateAgent, getFile, setFile, regenerateAgent, resummonAgent, refresh } =
     useAgentDetail(agentId);
+  const { deleteAgent: deleteAgentById, cancelSummonAgent } = useAgents();
+  const hb = useAgentHeartbeat(agentId);
   const [summoningOpen, setSummoningOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState("agent");
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [heartbeatOpen, setHeartbeatOpen] = useState(false);
+  const [promptOpen, setPromptOpen] = useState(false);
+  const [hooksCreateOpen, setHooksCreateOpen] = useState(false);
 
-  const handleRegenerate = async (prompt: string) => {
-    await regenerateAgent(prompt);
+  const handleResummon = async () => {
+    await resummonAgent();
     setSummoningOpen(true);
   };
 
+  const handleSummoningClose = (open: boolean) => {
+    setSummoningOpen(open);
+    if (!open) refresh();
+  };
+
   if (loading || !agent) {
-    return (
-      <div className="p-6">
-        <Button variant="ghost" onClick={onBack} className="mb-4 gap-1">
-          <ArrowLeft className="h-4 w-4" /> Back
-        </Button>
-        <DeferredSpinner />
-      </div>
-    );
+    return <DetailPageSkeleton tabs={3} />;
   }
 
-  const title = agentDisplayName(agent);
-  const subtitle = agentSubtitle(agent);
+  const title = agentDisplayName(agent, t("card.unnamedAgent"));
 
   return (
-    <div className="p-6">
-      {/* Header */}
-      <div className="mb-6 flex items-start gap-4">
-        <Button variant="ghost" size="icon" onClick={onBack} className="mt-0.5 shrink-0">
-          <ArrowLeft className="h-4 w-4" />
-        </Button>
-        <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-primary/10 text-primary">
-          <Bot className="h-6 w-6" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <h2 className="truncate text-xl font-semibold">{title}</h2>
-            {agent.is_default && (
-              <Star className="h-4 w-4 shrink-0 fill-amber-400 text-amber-400" />
+    <div>
+      <AgentHeader
+        agent={agent}
+        heartbeat={hb.config}
+        onBack={onBack}
+        onDelete={() => setDeleteOpen(true)}
+        onAdvanced={() => setAdvancedOpen(true)}
+        onHeartbeat={() => setHeartbeatOpen(true)}
+        onSystemPrompt={() => setPromptOpen(true)}
+      />
+
+      <div className="p-3 sm:p-4">
+        <div className="max-w-4xl">
+          <Tabs value={activeTab} onValueChange={setActiveTab}>
+            <TabsList className="w-full justify-start overflow-x-auto overflow-y-hidden">
+              <TabsTrigger value="agent">{t("detail.tabs.agent")}</TabsTrigger>
+              <TabsTrigger value="files">{t("detail.tabs.files")}</TabsTrigger>
+              <TabsTrigger value="permissions">{t("detail.tabs.permissions")}</TabsTrigger>
+              <TabsTrigger value="shares">{t("detail.tabs.shares")}</TabsTrigger>
+              <TabsTrigger value="evolution">{t("detail.tabs.evolution")}</TabsTrigger>
+              <TabsTrigger value="hooks">{t("detail.tabs.hooks")}</TabsTrigger>
+              {agent.agent_type === "predefined" && (
+                <TabsTrigger value="instances">{t("detail.tabs.instances")}</TabsTrigger>
+              )}
+            </TabsList>
+
+            <TabsContent value="agent" className="mt-4">
+              <AgentOverviewTab
+                key={agent.id + "-" + agent.updated_at}
+                agent={agent}
+                onUpdate={updateAgent}
+                heartbeat={hb}
+                onManageCodexPool={() => navigate(`/agents/${agent.id}/codex-pool`)}
+                onViewHooks={() => setActiveTab("hooks")}
+                onAddHook={() => {
+                  setActiveTab("hooks");
+                  setHooksCreateOpen(true);
+                }}
+              />
+            </TabsContent>
+
+            <TabsContent value="files" className="mt-4">
+              <AgentFilesTab
+                agent={agent}
+                files={files}
+                onGetFile={getFile}
+                onSetFile={setFile}
+                onRegenerate={regenerateAgent}
+                onResummon={handleResummon}
+                onRegenerateCompleted={refresh}
+              />
+            </TabsContent>
+
+            <TabsContent value="permissions" className="mt-4">
+              <AgentPermissionsTab agentId={agentId} />
+            </TabsContent>
+
+            <TabsContent value="shares" className="mt-4">
+              <AgentSharesTab agentId={agentId} />
+            </TabsContent>
+
+            <TabsContent value="evolution" className="mt-4">
+              <AgentEvolutionTab
+                agentId={agentId}
+                agentOtherConfig={agent.other_config as Record<string, unknown> | undefined}
+              />
+            </TabsContent>
+
+            <TabsContent value="hooks" className="mt-4">
+              <AgentHooksTab
+                agentId={agentId}
+                initialCreateOpen={hooksCreateOpen}
+                onCreateOpenChange={setHooksCreateOpen}
+              />
+            </TabsContent>
+
+            {agent.agent_type === "predefined" && (
+              <TabsContent value="instances" className="mt-4">
+                <AgentInstancesTab agentId={agentId} />
+              </TabsContent>
             )}
-            <Badge variant={agent.status === "active" ? "success" : agent.status === "summon_failed" ? "destructive" : "secondary"}>
-              {agent.status === "summon_failed" ? "Summon Failed" : agent.status}
-            </Badge>
-          </div>
-          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
-            {subtitle && (
-              <>
-                <span className="font-mono text-xs">{subtitle}</span>
-                <span className="text-border">|</span>
-              </>
-            )}
-            <Badge variant="outline" className="text-[11px]">{agent.agent_type}</Badge>
-            {agent.provider && (
-              <>
-                <span className="text-border">|</span>
-                <span>{agent.provider} / {agent.model}</span>
-              </>
-            )}
-          </div>
+          </Tabs>
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="rounded-xl border bg-card p-4 shadow-sm">
-        <Tabs defaultValue="general">
-          <TabsList>
-            <TabsTrigger value="general">General</TabsTrigger>
-            <TabsTrigger value="config">Config</TabsTrigger>
-            <TabsTrigger value="files">Files</TabsTrigger>
-            <TabsTrigger value="shares">Shares</TabsTrigger>
-            <TabsTrigger value="links">Links</TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="general" className="mt-4">
-            <AgentGeneralTab agent={agent} onUpdate={updateAgent} />
-          </TabsContent>
-
-          <TabsContent value="config" className="mt-4">
-            <AgentConfigTab agent={agent} onUpdate={updateAgent} />
-          </TabsContent>
-
-          <TabsContent value="files" className="mt-4">
-            <AgentFilesTab
-              agent={agent}
-              files={files}
-              onGetFile={getFile}
-              onSetFile={setFile}
-              onRegenerate={handleRegenerate}
-            />
-          </TabsContent>
-
-          <TabsContent value="shares" className="mt-4">
-            <AgentSharesTab agentId={agentId} />
-          </TabsContent>
-
-          <TabsContent value="links" className="mt-4">
-            <AgentLinksTab agentId={agentId} />
-          </TabsContent>
-        </Tabs>
-      </div>
+      {advancedOpen ? (
+        <Suspense fallback={null}>
+          <AgentAdvancedDialog
+            key={agent.id}
+            open={advancedOpen}
+            onOpenChange={setAdvancedOpen}
+            agent={agent}
+            onUpdate={updateAgent}
+          />
+        </Suspense>
+      ) : null}
 
       <SummoningModal
         open={summoningOpen}
-        onOpenChange={setSummoningOpen}
+        onOpenChange={handleSummoningClose}
         agentId={agentId}
         agentName={title}
-        onCompleted={refresh}
+        onCompleted={() => {}}
+        onResummon={async () => { await resummonAgent(); }}
+        onCancel={cancelSummonAgent}
+      />
+
+      {heartbeatOpen && (
+        <Suspense fallback={null}>
+          <HeartbeatConfigDialog
+            open={heartbeatOpen}
+            onOpenChange={setHeartbeatOpen}
+            config={hb.config}
+            saving={hb.saving}
+            update={hb.update}
+            test={hb.test}
+            getChecklist={hb.getChecklist}
+            setChecklist={hb.setChecklist}
+            fetchTargets={hb.fetchTargets}
+            refresh={hb.refresh}
+            agentProvider={agent?.provider}
+            agentModel={agent?.model}
+          />
+        </Suspense>
+      )}
+
+      {promptOpen && (
+        <SystemPromptDialog
+          agentKey={agent.agent_key}
+          open={promptOpen}
+          onOpenChange={setPromptOpen}
+        />
+      )}
+
+      <ConfirmDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title={t("delete.title")}
+        description={t("delete.detailDescription", { name: title })}
+        confirmValue={agent.display_name || agent.agent_key}
+        confirmLabel={t("delete.confirmLabel")}
+        onConfirm={async () => {
+          await deleteAgentById(agentId);
+          setDeleteOpen(false);
+          onBack();
+        }}
       />
     </div>
   );

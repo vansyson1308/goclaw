@@ -1,60 +1,41 @@
-import { useState, useEffect } from "react";
-import { Settings, Save, RefreshCw, AlertCircle, ShieldAlert, ArrowRight } from "lucide-react";
-import { Link } from "react-router";
+import { Settings, RefreshCw, ShieldAlert } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
-import { Card, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmptyState } from "@/components/shared/empty-state";
 import { DetailSkeleton } from "@/components/shared/loading-skeleton";
 import { useConfig } from "./hooks/use-config";
 import { useMinLoading } from "@/hooks/use-min-loading";
 import { useDeferredLoading } from "@/hooks/use-deferred-loading";
-import { ROUTES } from "@/lib/constants";
-import { GatewaySection } from "./sections/gateway-section";
-import { ProvidersSection } from "./sections/providers-section";
-import { AgentsDefaultsSection } from "./sections/agents-defaults-section";
-import { ToolsSection } from "./sections/tools-section";
-import { ChannelsSection } from "./sections/channels-section";
-import { SessionsSection } from "./sections/sessions-section";
+import { useIsMobile } from "@/hooks/use-media-query";
+import { ServerSection } from "./sections/server-section";
+import { BrandingSection } from "./sections/branding-section";
+import { BehaviorSection } from "./sections/behavior-section";
+import { AiDefaultsSection } from "./sections/ai-defaults-section";
+import { QuotaSection } from "./sections/quota-section";
+import { ToolsProfileSection } from "./sections/tools-profile-section";
+import { ToolsBrowserSection } from "./sections/tools-browser-section";
+import { ToolsExecSection } from "./sections/tools-exec-section";
+import { ShellSecuritySection } from "./sections/shell-security-section";
 import { TtsSection } from "./sections/tts-section";
 import { CronSection } from "./sections/cron-section";
 import { TelemetrySection } from "./sections/telemetry-section";
 import { BindingsSection } from "./sections/bindings-section";
+import { SystemMessagesSection } from "./sections/system-messages-section";
 
 export function ConfigPage() {
-  const { config, hash, configPath, loading, saving, error, refresh, applyRaw, patch } = useConfig();
+  const { t } = useTranslation("config");
+  const { config, schema, hash, loading, saving, refresh, patch } = useConfig();
+  const isMobile = useIsMobile();
   const spinning = useMinLoading(loading);
   const showSkeleton = useDeferredLoading(loading && !config);
-  const [rawText, setRawText] = useState("");
-  const [dirty, setDirty] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (config) {
-      const text = JSON.stringify(config, null, 2);
-      setRawText(text);
-      setDirty(false);
-      setSaveError(null);
-    }
-  }, [config]);
-
-  const handleSave = async () => {
-    setSaveError(null);
-    try {
-      await applyRaw(rawText);
-      setDirty(false);
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Failed to save");
-    }
-  };
 
   if (showSkeleton) {
     return (
-      <div className="p-6">
-        <PageHeader title="Config" description="Gateway configuration" />
+      <div className="p-4 sm:p-6 pb-10">
+        <PageHeader title={t("title")} description={t("description")} />
         <div className="mt-6">
           <DetailSkeleton />
         </div>
@@ -64,16 +45,16 @@ export function ConfigPage() {
 
   if (!config) {
     return (
-      <div className="p-6">
-        <PageHeader title="Config" description="Gateway configuration" />
+      <div className="p-4 sm:p-6 pb-10">
+        <PageHeader title={t("title")} description={t("description")} />
         <div className="mt-6">
           <EmptyState
             icon={Settings}
-            title="No configuration"
-            description="Could not load gateway configuration."
+            title={t("noConfig")}
+            description={t("noConfigDescription")}
             action={
               <Button variant="outline" size="sm" onClick={refresh}>
-                Retry
+                {t("retry")}
               </Button>
             }
           />
@@ -83,22 +64,19 @@ export function ConfigPage() {
   }
 
   return (
-    <div className="p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
-        title="Config"
-        description="Gateway configuration"
+        title={t("title")}
+        description={t("description")}
         actions={
           <div className="flex items-center gap-2">
-            {configPath && (
-              <span className="text-xs text-muted-foreground">{configPath}</span>
-            )}
             {hash && (
               <Badge variant="outline" className="font-mono text-xs">
                 {hash.slice(0, 8)}
               </Badge>
             )}
             <Button variant="outline" size="sm" onClick={refresh} disabled={spinning} className="gap-1">
-              <RefreshCw className={"h-3.5 w-3.5" + (spinning ? " animate-spin" : "")} /> Refresh
+              <RefreshCw className={"h-3.5 w-3.5" + (spinning ? " animate-spin" : "")} /> {t("common:refresh", "Refresh")}
             </Button>
           </div>
         }
@@ -106,160 +84,114 @@ export function ConfigPage() {
 
       <div className="mt-4 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2.5 text-sm text-amber-700 dark:text-amber-400">
         <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
-        <span>
-          API keys and tokens are managed via environment variables and are not shown here.
-          Fields displaying <code className="rounded bg-muted px-1 font-mono text-xs">***</code> are
-          read-only secrets — edit them in your <code className="rounded bg-muted px-1 font-mono text-xs">.env.local</code> file
-          or server environment.
-        </span>
+        <span>{t("warning")}</span>
       </div>
 
-      <Tabs defaultValue="ui" className="mt-4">
-        <TabsList>
-          <TabsTrigger value="ui">UI</TabsTrigger>
-          <TabsTrigger value="raw">Raw Editor</TabsTrigger>
+      <Tabs orientation={isMobile ? "horizontal" : "vertical"} defaultValue="server" className="mt-4 items-start">
+        <TabsList
+          variant={isMobile ? "default" : "line"}
+          className={isMobile
+            ? "w-full overflow-x-auto overflow-y-hidden"
+            : "w-44 shrink-0 sticky top-6 rounded-lg border bg-card p-3 shadow-sm"
+          }
+        >
+          <TabsTrigger value="server">{t("tabs.server")}</TabsTrigger>
+          <TabsTrigger value="behavior">{t("tabs.behavior")}</TabsTrigger>
+          <TabsTrigger value="aiDefaults">{t("tabs.aiDefaults")}</TabsTrigger>
+          <TabsTrigger value="quota">{t("tabs.quota")}</TabsTrigger>
+          <TabsTrigger value="tools">{t("tabs.tools")}</TabsTrigger>
+          <TabsTrigger value="integrations">{t("tabs.integrations")}</TabsTrigger>
+          <TabsTrigger value="systemMessages">{t("tabs.systemMessages")}</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="ui" className="mt-4">
-          <ConfigUI config={config} onPatch={patch} saving={saving} />
+        <TabsContent value="server" className="space-y-4">
+          <ServerSection
+            data={config.gateway as any}
+            onSave={(v) => patch({ gateway: v })}
+            saving={saving}
+          />
+          <BrandingSection
+            data={config.branding as any}
+            onSave={(v) => patch({ branding: v })}
+            saving={saving}
+          />
         </TabsContent>
 
-        <TabsContent value="raw" className="mt-4">
-          <div className="space-y-3">
-            <Textarea
-              value={rawText}
-              onChange={(e) => {
-                setRawText(e.target.value);
-                setDirty(true);
-              }}
-              className="min-h-[500px] font-mono text-sm"
-              placeholder="JSON configuration..."
-            />
+        <TabsContent value="behavior" className="space-y-4">
+          <BehaviorSection
+            config={config as any}
+            onPatch={patch}
+            saving={saving}
+          />
+        </TabsContent>
 
-            {(saveError || error) && (
-              <div className="flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                <AlertCircle className="h-4 w-4" />
-                {saveError || error}
-              </div>
-            )}
+        <TabsContent value="aiDefaults" className="space-y-4">
+          <AiDefaultsSection
+            data={config.agents as any}
+            onSave={(v) => patch({ agents: v })}
+            saving={saving}
+          />
+        </TabsContent>
 
-            <div className="flex items-center gap-2">
-              <Button
-                onClick={handleSave}
-                disabled={!dirty || saving}
-                className="gap-1"
-              >
-                <Save className="h-3.5 w-3.5" />
-                {saving ? "Saving..." : "Save"}
-              </Button>
-              {dirty && (
-                <span className="text-xs text-muted-foreground">Unsaved changes</span>
-              )}
-            </div>
-          </div>
+        <TabsContent value="quota" className="space-y-4">
+          <QuotaSection
+            data={config.gateway as any}
+            onSave={(v) => patch({ gateway: v })}
+            saving={saving}
+          />
+        </TabsContent>
+
+        <TabsContent value="tools" className="space-y-4">
+          <ToolsProfileSection
+            data={config.tools as any}
+            onSave={(v) => patch({ tools: v })}
+            saving={saving}
+          />
+          <ToolsBrowserSection
+            data={config.tools as any}
+            onSave={(v) => patch({ tools: v })}
+            saving={saving}
+          />
+          <ToolsExecSection
+            data={config.tools as any}
+            onSave={(v) => patch({ tools: v })}
+            saving={saving}
+          />
+          <ShellSecuritySection
+            data={config.tools as any}
+            onSave={(v) => patch({ tools: v })}
+            saving={saving}
+          />
+        </TabsContent>
+
+        <TabsContent value="integrations" className="space-y-4">
+          <TtsSection data={config.tts as any} />
+          <CronSection
+            data={config.cron as any}
+            onSave={(v) => patch({ cron: v })}
+            saving={saving}
+          />
+          <TelemetrySection
+            data={config.telemetry as any}
+            onSave={(v) => patch({ telemetry: v })}
+            saving={saving}
+          />
+          <BindingsSection
+            data={config.bindings as any}
+            onSave={(v) => patch({ bindings: v })}
+            saving={saving}
+          />
+        </TabsContent>
+
+        <TabsContent value="systemMessages" className="space-y-4">
+          <SystemMessagesSection
+            data={config.system_messages as any}
+            schema={schema}
+            onSave={(v) => patch({ system_messages: v })}
+            saving={saving}
+          />
         </TabsContent>
       </Tabs>
-    </div>
-  );
-}
-
-/** Compact redirect card shown in managed mode for sections that have dedicated pages. */
-function ManagedRedirect({ title, description, to }: { title: string; description: string; to: string }) {
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <CardTitle className="text-base">{title}</CardTitle>
-            <CardDescription>{description}</CardDescription>
-          </div>
-          <Button variant="outline" size="sm" className="gap-1.5 shrink-0" asChild>
-            <Link to={to}>
-              Manage <ArrowRight className="h-3.5 w-3.5" />
-            </Link>
-          </Button>
-        </div>
-      </CardHeader>
-    </Card>
-  );
-}
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
-function ConfigUI({
-  config,
-  onPatch,
-  saving,
-}: {
-  config: Record<string, unknown>;
-  onPatch: (updates: Record<string, unknown>) => Promise<void>;
-  saving: boolean;
-}) {
-  const isManaged = (config.database as any)?.mode === "managed";
-
-  return (
-    <div className="space-y-4">
-      <GatewaySection
-        data={config.gateway as any}
-        onSave={(v) => onPatch({ gateway: v })}
-        saving={saving}
-      />
-      {isManaged ? (
-        <ManagedRedirect
-          title="LLM Providers"
-          description="Managed via the Providers page in managed mode."
-          to={ROUTES.PROVIDERS}
-        />
-      ) : (
-        <ProvidersSection
-          data={config.providers as any}
-          onSave={(v) => onPatch({ providers: v })}
-          saving={saving}
-        />
-      )}
-      <AgentsDefaultsSection
-        data={config.agents as any}
-        onSave={(v) => onPatch({ agents: v })}
-        saving={saving}
-      />
-      <ToolsSection
-        data={config.tools as any}
-        onSave={(v) => onPatch({ tools: v })}
-        saving={saving}
-      />
-      {isManaged ? (
-        <ManagedRedirect
-          title="Channels"
-          description="Managed via the Channels page in managed mode."
-          to={ROUTES.CHANNELS}
-        />
-      ) : (
-        <ChannelsSection
-          data={config.channels as any}
-          onSave={(v) => onPatch({ channels: v })}
-          saving={saving}
-        />
-      )}
-      <SessionsSection
-        data={config.sessions as any}
-        onSave={(v) => onPatch({ sessions: v })}
-        saving={saving}
-      />
-      <TtsSection data={config.tts as any} />
-      <CronSection
-        data={config.cron as any}
-        onSave={(v) => onPatch({ cron: v })}
-        saving={saving}
-      />
-      <TelemetrySection
-        data={config.telemetry as any}
-        onSave={(v) => onPatch({ telemetry: v })}
-        saving={saving}
-      />
-      <BindingsSection
-        data={config.bindings as any}
-        onSave={(v) => onPatch({ bindings: v })}
-        saving={saving}
-      />
     </div>
   );
 }

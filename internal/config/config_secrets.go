@@ -23,6 +23,8 @@ func (c *Config) MaskedCopy() *Config {
 	// Mask provider API keys
 	maskNonEmpty(&cp.Providers.Anthropic.APIKey)
 	maskNonEmpty(&cp.Providers.OpenAI.APIKey)
+	maskNonEmpty(&cp.Providers.AtlasCloud.APIKey)
+	maskNonEmpty(&cp.Providers.APIRoute.APIKey)
 	maskNonEmpty(&cp.Providers.OpenRouter.APIKey)
 	maskNonEmpty(&cp.Providers.Groq.APIKey)
 	maskNonEmpty(&cp.Providers.DeepSeek.APIKey)
@@ -32,9 +34,16 @@ func (c *Config) MaskedCopy() *Config {
 	maskNonEmpty(&cp.Providers.MiniMax.APIKey)
 	maskNonEmpty(&cp.Providers.Cohere.APIKey)
 	maskNonEmpty(&cp.Providers.Perplexity.APIKey)
+	maskNonEmpty(&cp.Providers.DashScope.APIKey)
+	maskNonEmpty(&cp.Providers.Bailian.APIKey)
+	maskNonEmpty(&cp.Providers.Zai.APIKey)
+	maskNonEmpty(&cp.Providers.ZaiCoding.APIKey)
+	maskNonEmpty(&cp.Providers.OllamaCloud.APIKey)
+	maskNonEmpty(&cp.Providers.Vertex.APIKey)
 
 	// Mask gateway token
 	maskNonEmpty(&cp.Gateway.Token)
+	maskNonEmpty(&cp.Gateway.MCPServerToken)
 
 	// Mask channel secrets
 	maskNonEmpty(&cp.Channels.Telegram.Token)
@@ -53,9 +62,6 @@ func (c *Config) MaskedCopy() *Config {
 	maskNonEmpty(&cp.Tts.ElevenLabs.APIKey)
 	maskNonEmpty(&cp.Tts.MiniMax.APIKey)
 
-	// Mask web tool keys
-	maskNonEmpty(&cp.Tools.Web.Brave.APIKey)
-
 	// Mask Tailscale auth key
 	maskNonEmpty(&cp.Tailscale.AuthKey)
 
@@ -68,6 +74,8 @@ func (c *Config) StripSecrets() {
 	// Provider API keys
 	c.Providers.Anthropic.APIKey = ""
 	c.Providers.OpenAI.APIKey = ""
+	c.Providers.AtlasCloud.APIKey = ""
+	c.Providers.APIRoute.APIKey = ""
 	c.Providers.OpenRouter.APIKey = ""
 	c.Providers.Groq.APIKey = ""
 	c.Providers.DeepSeek.APIKey = ""
@@ -77,9 +85,16 @@ func (c *Config) StripSecrets() {
 	c.Providers.MiniMax.APIKey = ""
 	c.Providers.Cohere.APIKey = ""
 	c.Providers.Perplexity.APIKey = ""
+	c.Providers.DashScope.APIKey = ""
+	c.Providers.Bailian.APIKey = ""
+	c.Providers.Zai.APIKey = ""
+	c.Providers.ZaiCoding.APIKey = ""
+	c.Providers.OllamaCloud.APIKey = ""
+	c.Providers.Vertex.APIKey = ""
 
 	// Gateway token
 	c.Gateway.Token = ""
+	c.Gateway.MCPServerToken = ""
 
 	// Channel secrets
 	c.Channels.Telegram.Token = ""
@@ -98,16 +113,13 @@ func (c *Config) StripSecrets() {
 	c.Tts.ElevenLabs.APIKey = ""
 	c.Tts.MiniMax.APIKey = ""
 
-	// Web tool keys
-	c.Tools.Web.Brave.APIKey = ""
-
 	// Tailscale auth key
 	c.Tailscale.AuthKey = ""
 }
 
 // StripMaskedSecrets strips only fields that still contain the mask value "***".
-// Real values (user-entered via UI) are preserved. Used in standalone mode
-// so that secrets entered via the config UI persist in config.json.
+// Real values (user-entered via UI) are preserved, so that secrets entered
+// via the config UI persist in config.json.
 func (c *Config) StripMaskedSecrets() {
 	stripIfMasked := func(s *string) {
 		if *s == secretMask {
@@ -118,6 +130,8 @@ func (c *Config) StripMaskedSecrets() {
 	// Provider API keys
 	stripIfMasked(&c.Providers.Anthropic.APIKey)
 	stripIfMasked(&c.Providers.OpenAI.APIKey)
+	stripIfMasked(&c.Providers.AtlasCloud.APIKey)
+	stripIfMasked(&c.Providers.APIRoute.APIKey)
 	stripIfMasked(&c.Providers.OpenRouter.APIKey)
 	stripIfMasked(&c.Providers.Groq.APIKey)
 	stripIfMasked(&c.Providers.DeepSeek.APIKey)
@@ -127,9 +141,16 @@ func (c *Config) StripMaskedSecrets() {
 	stripIfMasked(&c.Providers.MiniMax.APIKey)
 	stripIfMasked(&c.Providers.Cohere.APIKey)
 	stripIfMasked(&c.Providers.Perplexity.APIKey)
+	stripIfMasked(&c.Providers.DashScope.APIKey)
+	stripIfMasked(&c.Providers.Bailian.APIKey)
+	stripIfMasked(&c.Providers.Zai.APIKey)
+	stripIfMasked(&c.Providers.ZaiCoding.APIKey)
+	stripIfMasked(&c.Providers.OllamaCloud.APIKey)
+	stripIfMasked(&c.Providers.Vertex.APIKey)
 
 	// Gateway token
 	stripIfMasked(&c.Gateway.Token)
+	stripIfMasked(&c.Gateway.MCPServerToken)
 
 	// Channel secrets
 	stripIfMasked(&c.Channels.Telegram.Token)
@@ -148,9 +169,6 @@ func (c *Config) StripMaskedSecrets() {
 	stripIfMasked(&c.Tts.ElevenLabs.APIKey)
 	stripIfMasked(&c.Tts.MiniMax.APIKey)
 
-	// Web tool keys
-	stripIfMasked(&c.Tools.Web.Brave.APIKey)
-
 	// Tailscale auth key
 	stripIfMasked(&c.Tailscale.AuthKey)
 }
@@ -166,16 +184,16 @@ func (c *Config) ApplyDBSecrets(secrets map[string]string) {
 	}
 
 	apply("gateway.token", &c.Gateway.Token)
+	apply("gateway.mcp_server_token", &c.Gateway.MCPServerToken)
 	apply("tts.openai.api_key", &c.Tts.OpenAI.APIKey)
 	apply("tts.elevenlabs.api_key", &c.Tts.ElevenLabs.APIKey)
 	apply("tts.minimax.api_key", &c.Tts.MiniMax.APIKey)
 	apply("tts.minimax.group_id", &c.Tts.MiniMax.GroupID)
-	apply("tools.web.brave.api_key", &c.Tools.Web.Brave.APIKey)
 	apply("tailscale.auth_key", &c.Tailscale.AuthKey)
 }
 
 // ExtractDBSecrets returns the config_secrets key-value pairs from the config.
-// Used by managed mode to save secrets to the config_secrets table.
+// Saves secrets to the config_secrets table.
 func (c *Config) ExtractDBSecrets() map[string]string {
 	secrets := make(map[string]string)
 
@@ -186,11 +204,11 @@ func (c *Config) ExtractDBSecrets() map[string]string {
 	}
 
 	collect("gateway.token", c.Gateway.Token)
+	collect("gateway.mcp_server_token", c.Gateway.MCPServerToken)
 	collect("tts.openai.api_key", c.Tts.OpenAI.APIKey)
 	collect("tts.elevenlabs.api_key", c.Tts.ElevenLabs.APIKey)
 	collect("tts.minimax.api_key", c.Tts.MiniMax.APIKey)
 	collect("tts.minimax.group_id", c.Tts.MiniMax.GroupID)
-	collect("tools.web.brave.api_key", c.Tools.Web.Brave.APIKey)
 	collect("tailscale.auth_key", c.Tailscale.AuthKey)
 
 	return secrets

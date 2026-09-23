@@ -4,48 +4,57 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
+	"strings"
 
 	"github.com/mymmrac/telego"
 	tu "github.com/mymmrac/telego/telegoutil"
+
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
 
 // --- Pairing UX ---
 
-// buildPairingReply builds the pairing reply message matching TS behavior.
-func buildPairingReply(telegramUserID, code string) string {
-	return fmt.Sprintf(
-		"GoClaw: access not configured.\n\nYour Telegram user id: %s\n\nPairing code: %s\n\nAsk the bot owner to approve with:\n  goclaw pairing approve %s",
-		telegramUserID, code, code,
-	)
+// buildPairingReply builds the pairing reply message for unpaired users.
+func (c *Channel) buildPairingReply(code string) string {
+	return c.SystemMessage("", systemmessages.KeyPairingAccountSimpleRequired, systemmessages.Vars{
+		"platform": "Telegram",
+		"code":     code,
+	})
+}
+
+func (c *Channel) buildGroupPairingReply(code string) string {
+	return c.SystemMessage("", systemmessages.KeyPairingGroupRequired, systemmessages.Vars{
+		"platform": "Telegram",
+		"code":     code,
+	})
 }
 
 // sendPairingReply generates a pairing code and sends the reply to the user.
 // Debounces: won't send another reply to the same user within 60 seconds.
 func (c *Channel) sendPairingReply(ctx context.Context, chatID int64, userID, username string) {
-	if c.pairingService == nil {
+	ps := c.PairingService()
+	if ps == nil {
 		return
 	}
 
-	if lastSent, ok := c.pairingReplySent.Load(userID); ok {
-		if time.Since(lastSent.(time.Time)) < pairingReplyDebounce {
-			slog.Debug("pairing reply debounced", "user_id", userID)
-			return
-		}
+	if !c.CanSendPairingNotif(userID, pairingReplyDebounce) {
+		slog.Debug("pairing reply debounced", "user_id", userID)
+		return
 	}
 
-	code, err := c.pairingService.RequestPairing(userID, c.Name(), fmt.Sprintf("%d", chatID), "default")
+	meta := map[string]string{"username": username}
+	code, err := ps.RequestPairing(ctx, userID, c.Name(), fmt.Sprintf("%d", chatID), "default", meta)
 	if err != nil {
 		slog.Debug("pairing request failed", "user_id", userID, "error", err)
 		return
 	}
 
-	replyText := buildPairingReply(userID, code)
+	replyText := c.buildPairingReply(code)
 	msg := tu.Message(tu.ID(chatID), replyText)
 	if _, err := c.bot.SendMessage(ctx, msg); err != nil {
 		slog.Warn("failed to send pairing reply", "chat_id", chatID, "error", err)
 	} else {
-		c.pairingReplySent.Store(userID, time.Now())
+		c.MarkPairingNotifSent(userID)
 		slog.Info("telegram pairing reply sent",
 			"user_id", userID, "username", username, "code", code,
 		)
@@ -54,35 +63,52 @@ func (c *Channel) sendPairingReply(ctx context.Context, chatID int64, userID, us
 
 // sendGroupPairingReply generates a pairing code for a group and sends the reply.
 // Debounces: won't send another reply to the same group within 60 seconds.
-func (c *Channel) sendGroupPairingReply(ctx context.Context, chatID int64, chatIDStr, groupSenderID string) {
-	if lastSent, ok := c.pairingReplySent.Load(chatIDStr); ok {
-		if time.Since(lastSent.(time.Time)) < pairingReplyDebounce {
-			return
-		}
+// messageThreadID should be set for forum groups so the reply lands in the correct topic.
+// localKey is the composite key (e.g. "-100123:topic:42") stored as chat_id in the pairing
+// request so that the approval notification can be routed to the correct forum topic.
+func (c *Channel) sendGroupPairingReply(ctx context.Context, chatID int64, chatIDStr, groupSenderID, localKey string, messageThreadID int, chatTitle string) {
+	ps := c.PairingService()
+	if ps == nil {
+		return
 	}
 
-	code, err := c.pairingService.RequestPairing(groupSenderID, c.Name(), chatIDStr, "default")
+	if !c.CanSendPairingNotif(chatIDStr, pairingReplyDebounce) {
+		return
+	}
+
+	var meta map[string]string
+	if chatTitle != "" {
+		meta = map[string]string{"chat_title": chatTitle}
+	}
+	code, err := ps.RequestPairing(ctx, groupSenderID, c.Name(), localKey, "default", meta)
 	if err != nil {
 		slog.Debug("group pairing request failed", "chat_id", chatIDStr, "error", err)
 		return
 	}
 
-	replyText := fmt.Sprintf(
-		"This group is not approved yet.\n\nPairing code: %s\n\nAsk the bot owner to approve with:\n  goclaw pairing approve %s",
-		code, code,
-	)
+	replyText := c.buildGroupPairingReply(code)
 	msg := tu.Message(tu.ID(chatID), replyText)
-	if _, err := c.bot.SendMessage(ctx, msg); err != nil {
+	if messageThreadID > 0 {
+		msg.MessageThreadID = messageThreadID
+	}
+	_, err = c.bot.SendMessage(ctx, msg)
+	// Retry without thread ID if topic is hidden/deleted (forum group with General topic removed).
+	if err != nil && messageThreadID > 0 && strings.Contains(err.Error(), "thread not found") {
+		msg.MessageThreadID = 0
+		_, err = c.bot.SendMessage(ctx, msg)
+	}
+	if err != nil {
 		slog.Warn("failed to send group pairing reply", "chat_id", chatIDStr, "error", err)
 	} else {
-		c.pairingReplySent.Store(chatIDStr, time.Now())
+		c.MarkPairingNotifSent(chatIDStr)
 		slog.Info("telegram group pairing reply sent", "chat_id", chatIDStr, "code", code)
 	}
 }
 
 // SendPairingApproved sends the approval notification to a user.
+// chatID may contain a topic suffix (e.g. "-100123:topic:42") for forum groups.
 func (c *Channel) SendPairingApproved(ctx context.Context, chatID, botName string) error {
-	id, err := parseChatID(chatID)
+	id, err := parseRawChatID(chatID)
 	if err != nil {
 		return fmt.Errorf("invalid chat ID: %w", err)
 	}
@@ -90,7 +116,25 @@ func (c *Channel) SendPairingApproved(ctx context.Context, chatID, botName strin
 		botName = "GoClaw"
 	}
 
-	msg := tu.Message(tu.ID(id), fmt.Sprintf("✅ %s access approved. Send a message to start chatting.", botName))
+	msg := tu.Message(tu.ID(id), c.SystemMessage("", systemmessages.KeyPairingApproved, systemmessages.Vars{
+		"app_name": botName,
+	}))
+
+	// Extract thread ID from topic/thread suffix for forum groups.
+	if idx := strings.Index(chatID, ":topic:"); idx > 0 {
+		var threadID int
+		fmt.Sscanf(chatID[idx+7:], "%d", &threadID)
+		if threadID > 0 {
+			msg.MessageThreadID = threadID
+		}
+	} else if idx := strings.Index(chatID, ":thread:"); idx > 0 {
+		var threadID int
+		fmt.Sscanf(chatID[idx+8:], "%d", &threadID)
+		if threadID > 0 {
+			msg.MessageThreadID = threadID
+		}
+	}
+
 	_, err = c.bot.SendMessage(ctx, msg)
 	return err
 }
@@ -123,10 +167,16 @@ func DefaultMenuCommands() []telego.BotCommand {
 		{Command: "stopall", Description: "Stop all running tasks"},
 		{Command: "reset", Description: "Reset conversation history"},
 		{Command: "status", Description: "Show bot status"},
+		{Command: "reactions", Description: "Show reaction emoji legend"},
 		{Command: "tasks", Description: "List team tasks"},
 		{Command: "task_detail", Description: "View task detail by ID"},
+		{Command: "subagents", Description: "List subagent tasks"},
+		{Command: "subagent", Description: "View subagent task detail by ID"},
 		{Command: "writers", Description: "List file writers for this group"},
 		{Command: "addwriter", Description: "Add a file writer (reply to their message)"},
 		{Command: "removewriter", Description: "Remove a file writer (reply to their message)"},
+		{Command: "croners", Description: "List cron managers for this group"},
+		{Command: "addcron", Description: "Add a cron manager (reply to their message)"},
+		{Command: "removecron", Description: "Remove a cron manager (reply to their message)"},
 	}
 }

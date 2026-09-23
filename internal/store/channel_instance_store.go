@@ -11,14 +11,15 @@ import (
 // ChannelInstanceData represents a channel instance in the database.
 type ChannelInstanceData struct {
 	BaseModel
-	Name        string          `json:"name"`
-	DisplayName string          `json:"display_name"`
-	ChannelType string          `json:"channel_type"`
-	AgentID     uuid.UUID       `json:"agent_id"`
-	Credentials []byte          `json:"-"`    // encrypted, never serialized to API
-	Config      json.RawMessage `json:"config"`
-	Enabled     bool            `json:"enabled"`
-	CreatedBy   string          `json:"created_by"`
+	TenantID    uuid.UUID       `json:"tenant_id,omitempty" db:"tenant_id"`
+	Name        string          `json:"name" db:"name"`
+	DisplayName string          `json:"display_name" db:"display_name"`
+	ChannelType string          `json:"channel_type" db:"channel_type"`
+	AgentID     uuid.UUID       `json:"agent_id" db:"agent_id"`
+	Credentials []byte          `json:"-" db:"credentials"` // encrypted, never serialized to API
+	Config      json.RawMessage `json:"config" db:"config"`
+	Enabled     bool            `json:"enabled" db:"enabled"`
+	CreatedBy   string          `json:"created_by" db:"created_by"`
 }
 
 // IsDefaultChannelInstance returns true if the instance name matches a default/seeded channel.
@@ -27,7 +28,7 @@ func IsDefaultChannelInstance(name string) bool {
 	if strings.HasSuffix(name, "/default") {
 		return true
 	}
-	// Legacy Telegram default uses bare name "telegram"
+	// Legacy config-based defaults that were seeded with bare channel-type names.
 	switch name {
 	case "telegram", "discord", "feishu", "zalo_oa", "whatsapp":
 		return true
@@ -35,7 +36,14 @@ func IsDefaultChannelInstance(name string) bool {
 	return false
 }
 
-// ChannelInstanceStore manages channel instance definitions (managed mode only).
+// ChannelInstanceListOpts configures channel instance listing with optional pagination and filtering.
+type ChannelInstanceListOpts struct {
+	Search string
+	Limit  int
+	Offset int
+}
+
+// ChannelInstanceStore manages channel instance definitions.
 type ChannelInstanceStore interface {
 	Create(ctx context.Context, inst *ChannelInstanceData) error
 	Get(ctx context.Context, id uuid.UUID) (*ChannelInstanceData, error)
@@ -44,4 +52,8 @@ type ChannelInstanceStore interface {
 	Delete(ctx context.Context, id uuid.UUID) error
 	ListEnabled(ctx context.Context) ([]ChannelInstanceData, error)
 	ListAll(ctx context.Context) ([]ChannelInstanceData, error)
+	ListAllInstances(ctx context.Context) ([]ChannelInstanceData, error)
+	ListAllEnabled(ctx context.Context) ([]ChannelInstanceData, error)
+	ListPaged(ctx context.Context, opts ChannelInstanceListOpts) ([]ChannelInstanceData, error)
+	CountInstances(ctx context.Context, opts ChannelInstanceListOpts) (int, error)
 }

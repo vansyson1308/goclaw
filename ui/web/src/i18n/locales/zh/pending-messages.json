@@ -1,0 +1,50 @@
+{
+  "title": "待处理消息",
+  "description": "已缓冲的Channel消息，等待Agent处理",
+  "emptyTitle": "暂无待处理消息",
+  "emptyDescription": "未找到缓冲消息组。当Channel在Agent处理前缓冲传入消息时，消息将显示在此处。",
+  "howItWorks": {
+    "title": "工作机制",
+    "step1": "来自各Channel（Telegram、Discord等）的消息在Agent忙碌或离线时缓冲在此。",
+    "step2": "当缓冲区达到阈值（默认：50条消息）时，系统自动压缩 — LLM将旧消息总结为摘要，仅保留最近15条。",
+    "step3": "在Agent的下一轮回复中，压缩摘要 + 最近消息作为上下文注入，让Agent快速了解情况而不会被淹没。",
+    "compactAction": "压缩 — 立即手动触发LLM摘要。当您希望Agent处理简洁摘要而非大量原始消息时使用。",
+    "clearAction": "清除 — 永久删除某组的所有缓冲消息。当消息不再相关时使用。"
+  },
+  "columns": {
+    "channel": "Channel",
+    "group": "组",
+    "messages": "消息",
+    "status": "状态",
+    "lastActivity": "最近活动",
+    "actions": "操作"
+  },
+  "status": {
+    "compacted": "已压缩",
+    "raw": "原始"
+  },
+  "compact": "压缩",
+  "compacting": "压缩中…",
+  "clear": "清除",
+  "confirmClear": {
+    "title": "清除消息？",
+    "description": "这将永久删除 {{channel}} / {{key}} 中的所有消息。此操作无法撤销。",
+    "cancel": "取消",
+    "confirm": "清除"
+  },
+  "dialog": {
+    "title": "消息 — {{name}}",
+    "noMessages": "未找到消息。",
+    "summary": "摘要"
+  },
+  "toast": {
+    "compacted": "压缩完成",
+    "compactedSummarized": "已压缩为 {{count}} 条消息",
+    "compactedDeleted": "已删除全部（无可用LLM Provider）",
+    "compacting": "压缩中…",
+    "compactingDesc": "LLM正在后台进行摘要。列表将自动刷新。",
+    "failedCompact": "压缩失败",
+    "cleared": "消息已清除",
+    "failedClear": "清除消息失败"
+  }
+}

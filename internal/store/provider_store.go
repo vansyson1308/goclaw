@@ -2,26 +2,296 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/google/uuid"
 )
 
+// Provider type constants.
+const (
+	ProviderAnthropicNative = "anthropic_native"
+	ProviderOpenAICompat    = "openai_compat"
+	ProviderGeminiNative    = "gemini_native"
+	ProviderOpenRouter      = "openrouter"
+	ProviderAIMLAPI         = "aimlapi"
+	ProviderGroq            = "groq"
+	ProviderDeepSeek        = "deepseek"
+	ProviderMistral         = "mistral"
+	ProviderXAI             = "xai"
+	ProviderMiniMax         = "minimax_native"
+	ProviderCohere          = "cohere"
+	ProviderPerplexity      = "perplexity"
+	ProviderDashScope       = "dashscope"
+	ProviderBailian         = "bailian"
+	ProviderChatGPTOAuth    = "chatgpt_oauth"
+	ProviderClaudeCLI       = "claude_cli"
+	ProviderYesScale        = "yescale"
+	ProviderZai             = "zai"
+	ProviderZaiCoding       = "zai_coding"
+	ProviderOllama          = "ollama" // local or self-hosted Ollama (no API key)
+	// ProviderScripted replays canned turns for offline runs; accepted only when
+	// GOCLAW_ENABLE_SCRIPTED_PROVIDER=1 (never in ValidProviderTypes).
+	ProviderScripted       = "scripted"
+	ProviderOllamaCloud    = "ollama_cloud"    // Ollama Cloud (Bearer token required)
+	ProviderACP            = "acp"             // ACP (Agent Client Protocol) agent subprocess
+	ProviderNovita         = "novita"          // Novita AI (OpenAI-compatible endpoint)
+	ProviderBytePlus       = "byteplus"        // BytePlus ModelArk (Seed 2.0 models)
+	ProviderBytePlusCoding = "byteplus_coding" // BytePlus ModelArk Coding Plan
+	ProviderVertex         = "vertex"          // Google Cloud Vertex AI (OAuth2 service account + ADC)
+	ProviderKimiCoding     = "kimi_coding"     // Moonshot Kimi Coding (OpenAI-compat, requires fixed User-Agent)
+	ProviderAtlasCloud     = "atlascloud"      // Atlas Cloud (OpenAI-compatible endpoint)
+	ProviderAPIRoute       = "api_route"       // API Route (OpenAI-compatible endpoint)
+
+	// MiniMax defaults.
+	MiniMaxDefaultAPIBase = "https://api.minimax.io/v1"
+	MiniMaxDefaultModel   = "MiniMax-M3"
+
+	// Z.AI defaults.
+	ZaiDefaultAPIBase       = "https://api.z.ai/api/paas/v4"
+	ZaiCodingDefaultAPIBase = "https://api.z.ai/api/coding/paas/v4"
+	ZaiDefaultModel         = "glm-5.2"
+
+	// Novita AI defaults.
+	NovitaDefaultAPIBase = "https://api.novita.ai/openai"
+	NovitaDefaultModel   = "moonshotai/kimi-k2.5"
+
+	// BytePlus ModelArk defaults.
+	BytePlusDefaultAPIBase       = "https://ark.ap-southeast.bytepluses.com/api/v3"
+	BytePlusCodingDefaultAPIBase = "https://ark.ap-southeast.bytepluses.com/api/coding/v3"
+	BytePlusDefaultModel         = "seed-2-0-lite-260228"
+
+	// Kimi Coding defaults. The upstream requires a fixed User-Agent on every
+	// request — handled by the runtime in cmd/gateway_providers.go via
+	// OpenAIProvider.WithExtraHeaders.
+	KimiCodingDefaultAPIBase    = "https://api.kimi.com/coding/v1"
+	KimiCodingDefaultModel      = "kimi-k2-turbo-preview"
+	KimiCodingRequiredUserAgent = "claude-code/0.1.0"
+
+	// Atlas Cloud defaults.
+	AtlasCloudDefaultAPIBase = "https://api.atlascloud.ai/v1"
+	AtlasCloudDefaultModel   = "qwen/qwen3.5-flash"
+
+	// API Route defaults.
+	APIRouteDefaultAPIBase = "https://global.api-route.com/v1"
+	APIRouteDefaultModel   = "gpt-5.4-mini"
+)
+
+// Vertex AI constants live in internal/providers/vertex.go to avoid a store→providers import cycle
+// (store is imported by providers). DB-layer concerns (ProviderVertex type + settings parsing)
+// remain in this package.
+
+// ValidProviderTypes lists all accepted provider_type values.
+var ValidProviderTypes = map[string]bool{
+	ProviderAnthropicNative: true,
+	ProviderOpenAICompat:    true,
+	ProviderGeminiNative:    true,
+	ProviderOpenRouter:      true,
+	ProviderAIMLAPI:         true,
+	ProviderGroq:            true,
+	ProviderDeepSeek:        true,
+	ProviderMistral:         true,
+	ProviderXAI:             true,
+	ProviderMiniMax:         true,
+	ProviderCohere:          true,
+	ProviderPerplexity:      true,
+	ProviderDashScope:       true,
+	ProviderBailian:         true,
+	ProviderChatGPTOAuth:    true,
+	ProviderClaudeCLI:       true,
+	ProviderYesScale:        true,
+	ProviderZai:             true,
+	ProviderZaiCoding:       true,
+	ProviderOllama:          true,
+	ProviderOllamaCloud:     true,
+	ProviderACP:             true,
+	ProviderNovita:          true,
+	ProviderBytePlus:        true,
+	ProviderBytePlusCoding:  true,
+	ProviderVertex:          true,
+	ProviderKimiCoding:      true,
+	ProviderAtlasCloud:      true,
+	ProviderAPIRoute:        true,
+}
+
+// VertexProviderSettings holds Vertex-specific config stored in llm_providers.settings JSONB.
+type VertexProviderSettings struct {
+	ProjectID string `json:"project_id"`
+	Region    string `json:"region"`
+	Model     string `json:"model,omitempty"` // optional default model override (e.g. "google/gemini-2.5-pro-001")
+}
+
+// ParseVertexProviderSettings extracts Vertex config from settings JSONB.
+// Returns nil if project_id or region is missing (both required).
+func ParseVertexProviderSettings(settings json.RawMessage) *VertexProviderSettings {
+	if len(settings) == 0 {
+		return nil
+	}
+	var s VertexProviderSettings
+	if json.Unmarshal(settings, &s) != nil {
+		return nil
+	}
+	if s.ProjectID == "" || s.Region == "" {
+		return nil
+	}
+	return &s
+}
+
 // LLMProviderData represents an LLM provider configuration.
 type LLMProviderData struct {
 	BaseModel
-	Name         string `json:"name"`
-	DisplayName  string `json:"display_name,omitempty"`
-	ProviderType string `json:"provider_type"` // "anthropic_native", "openai_compat"
-	APIBase      string `json:"api_base,omitempty"`
-	APIKey       string `json:"api_key,omitempty"`
-	Enabled      bool   `json:"enabled"`
+	TenantID     uuid.UUID       `json:"tenant_id,omitempty" db:"tenant_id"`
+	Name         string          `json:"name" db:"name"`
+	DisplayName  string          `json:"display_name,omitempty" db:"display_name"`
+	ProviderType string          `json:"provider_type" db:"provider_type"`
+	APIBase      string          `json:"api_base,omitempty" db:"api_base"`
+	APIKey       string          `json:"api_key,omitempty" db:"api_key"`
+	Enabled      bool            `json:"enabled" db:"enabled"`
+	Settings     json.RawMessage `json:"settings,omitempty" db:"settings"`
 }
 
-// ProviderStore manages LLM providers (managed mode only).
+// RequiredMemoryEmbeddingDimensions is the fixed vector size used by the pgvector memory schema.
+// All memory embeddings must match this dimensionality until the schema supports variable sizes.
+const RequiredMemoryEmbeddingDimensions = 1536
+
+// EmbeddingSettings holds embedding-specific configuration stored in provider settings JSONB.
+type EmbeddingSettings struct {
+	Enabled    bool   `json:"enabled" db:"-"`
+	Model      string `json:"model,omitempty" db:"-"`      // e.g. "text-embedding-3-small"
+	APIBase    string `json:"api_base,omitempty" db:"-"`   // override if embedding endpoint differs from chat
+	Dimensions int    `json:"dimensions,omitempty" db:"-"` // truncate output to N dims (e.g. 1536); 0 = model default
+}
+
+// ProviderReasoningConfig holds provider-owned default reasoning settings.
+// These defaults are inherited by agents unless they save a custom override.
+type ProviderReasoningConfig struct {
+	Effort   string `json:"effort,omitempty" db:"-"`
+	Fallback string `json:"fallback,omitempty" db:"-"`
+}
+
+// OllamaSettings holds Ollama-specific configuration stored in the provider settings JSONB.
+type OllamaSettings struct {
+	// NumCtx overrides the context window size sent in options.num_ctx on every request.
+	// When nil, the gateway queries the Ollama API (/api/show) for the model's native
+	// context length, falling back to 131072 if the API is unreachable.
+	NumCtx *int `json:"num_ctx,omitempty" db:"-"`
+}
+
+// ParseOllamaSettings extracts Ollama-specific config from a provider's settings JSONB.
+// Returns nil when no relevant settings are present.
+func ParseOllamaSettings(settings json.RawMessage) *OllamaSettings {
+	if len(settings) == 0 {
+		return nil
+	}
+	var s OllamaSettings
+	if json.Unmarshal(settings, &s) != nil || s.NumCtx == nil {
+		return nil
+	}
+	return &s
+}
+
+// ChatGPTOAuthProviderSettings holds provider-level defaults for Codex account pooling.
+type ChatGPTOAuthProviderSettings struct {
+	CodexPool *ChatGPTOAuthRoutingConfig `json:"codex_pool,omitempty" db:"-"`
+}
+
+// ParseEmbeddingSettings extracts embedding config from a provider's settings JSONB.
+// Returns nil if not configured.
+func ParseEmbeddingSettings(settings json.RawMessage) *EmbeddingSettings {
+	if len(settings) == 0 {
+		return nil
+	}
+	var s struct {
+		Embedding *EmbeddingSettings `json:"embedding"`
+	}
+	if json.Unmarshal(settings, &s) != nil || s.Embedding == nil {
+		return nil
+	}
+	return s.Embedding
+}
+
+// ParseThinkingEnabled extracts the provider-level override for whether the
+// provider should be asked to emit visible reasoning/thinking tokens (e.g.
+// Ollama native "think" field, OpenAI-compat "think" for Ollama endpoints).
+// Returns nil when unset in settings JSONB, meaning "use provider default"
+// (currently off for Ollama). Explicit true/false overrides that default.
+func ParseThinkingEnabled(settings json.RawMessage) *bool {
+	if len(settings) == 0 {
+		return nil
+	}
+	var s struct {
+		ThinkingEnabled *bool `json:"thinking_enabled"`
+	}
+	if json.Unmarshal(settings, &s) != nil {
+		return nil
+	}
+	return s.ThinkingEnabled
+}
+
+// ParseChatGPTOAuthProviderSettings extracts provider-level Codex pool defaults from settings JSONB.
+func ParseChatGPTOAuthProviderSettings(settings json.RawMessage) *ChatGPTOAuthProviderSettings {
+	if len(settings) == 0 {
+		return nil
+	}
+	var s ChatGPTOAuthProviderSettings
+	if json.Unmarshal(settings, &s) != nil {
+		return nil
+	}
+	s.CodexPool = normalizeChatGPTOAuthRoutingConfig(s.CodexPool)
+	if s.CodexPool == nil {
+		return nil
+	}
+	s.CodexPool.OverrideMode = ""
+	return &s
+}
+
+// ParseProviderReasoningConfig extracts provider-owned reasoning defaults from settings JSONB.
+// Returns nil when no non-default provider reasoning is configured.
+func ParseProviderReasoningConfig(settings json.RawMessage) *ProviderReasoningConfig {
+	if len(settings) == 0 {
+		return nil
+	}
+	var raw struct {
+		ReasoningDefaults *ProviderReasoningConfig `json:"reasoning_defaults"`
+	}
+	if json.Unmarshal(settings, &raw) != nil {
+		return nil
+	}
+	return normalizeProviderReasoningConfig(raw.ReasoningDefaults)
+}
+
+func normalizeProviderReasoningConfig(raw *ProviderReasoningConfig) *ProviderReasoningConfig {
+	if raw == nil {
+		return nil
+	}
+	cfg := &ProviderReasoningConfig{
+		Effort:   normalizeReasoningEffort(raw.Effort),
+		Fallback: normalizeReasoningFallback(raw.Fallback),
+	}
+	if cfg.Effort == "" {
+		cfg.Effort = "off"
+	}
+	if cfg.Effort == "off" && cfg.Fallback == ReasoningFallbackDowngrade {
+		return nil
+	}
+	return cfg
+}
+
+// NoEmbeddingTypes lists provider types that cannot serve embeddings.
+var NoEmbeddingTypes = map[string]bool{
+	ProviderAnthropicNative: true, // uses x-api-key auth, not Bearer; no embedding models
+	ProviderACP:             true,
+	ProviderClaudeCLI:       true,
+	ProviderChatGPTOAuth:    true,
+	ProviderVertex:          true, // Vertex embeddings live on a different native endpoint, not on /endpoints/openapi
+}
+
+// ProviderStore manages LLM providers.
 type ProviderStore interface {
 	CreateProvider(ctx context.Context, p *LLMProviderData) error
 	GetProvider(ctx context.Context, id uuid.UUID) (*LLMProviderData, error)
+	GetProviderByName(ctx context.Context, name string) (*LLMProviderData, error)
 	ListProviders(ctx context.Context) ([]LLMProviderData, error)
+	ListAllProviders(ctx context.Context) ([]LLMProviderData, error)
 	UpdateProvider(ctx context.Context, id uuid.UUID, updates map[string]any) error
 	DeleteProvider(ctx context.Context, id uuid.UUID) error
 }

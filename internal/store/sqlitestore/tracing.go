@@ -1,0 +1,423 @@
+//go:build sqlite || sqliteonly
+
+package sqlitestore
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+)
+
+// SQLiteTracingStore implements store.TracingStore backed by SQLite.
+type SQLiteTracingStore struct {
+	db *sql.DB
+}
+
+func NewSQLiteTracingStore(db *sql.DB) *SQLiteTracingStore {
+	return &SQLiteTracingStore{db: db}
+}
+
+func (s *SQLiteTracingStore) CreateTrace(ctx context.Context, trace *store.TraceData) error {
+	if trace.ID == uuid.Nil {
+		trace.ID = store.GenNewID()
+	}
+	tenantID := store.TenantIDFromContext(ctx)
+	if tenantID == uuid.Nil {
+		tenantID = store.MasterTenantID
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO traces (id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
+		 duration_ms, name, channel, input_preview, output_preview,
+		 total_input_tokens, total_output_tokens, total_cost, span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at, tenant_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		trace.ID, nilUUID(trace.ParentTraceID), nilUUID(trace.AgentID), nilStr(trace.UserID), nilStr(trace.SessionKey),
+		nilStr(trace.RunID), trace.StartTime, nilTime(trace.EndTime),
+		nilInt(trace.DurationMS), nilStr(trace.Name), nilStr(trace.Channel),
+		nilStr(trace.InputPreview), nilStr(trace.OutputPreview),
+		trace.TotalInputTokens, trace.TotalOutputTokens, trace.TotalCost, trace.SpanCount, trace.LLMCallCount, trace.ToolCallCount,
+		trace.Status, nilStr(trace.Error), jsonOrEmpty(trace.Metadata), jsonStringArray(trace.Tags), nilUUID(trace.TeamID), trace.CreatedAt, tenantID,
+	)
+	return err
+}
+
+func (s *SQLiteTracingStore) UpdateTrace(ctx context.Context, traceID uuid.UUID, updates map[string]any) error {
+	if store.IsCrossTenant(ctx) {
+		return execMapUpdate(ctx, s.db, "traces", traceID, updates)
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("tenant_id required for update")
+	}
+	return execMapUpdateWhereTenant(ctx, s.db, "traces", updates, traceID, tid)
+}
+
+func (s *SQLiteTracingStore) GetTrace(ctx context.Context, traceID uuid.UUID) (*store.TraceData, error) {
+	query := `SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
+		 duration_ms, name, channel, input_preview, output_preview,
+		 total_input_tokens, total_output_tokens, COALESCE(total_cost, 0), span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at
+		 FROM traces WHERE id = ?`
+	qArgs := []any{traceID}
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return nil, sql.ErrNoRows
+		}
+		query += ` AND tenant_id = ?`
+		qArgs = append(qArgs, tenantID)
+	}
+	return scanTraceRow(s.db.QueryRowContext(ctx, query, qArgs...))
+}
+
+func buildTraceWhere(ctx context.Context, opts store.TraceListOpts) (string, []any) {
+	var conditions []string
+	var args []any
+
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return " WHERE 1=0", nil
+		}
+		conditions = append(conditions, "tenant_id = ?")
+		args = append(args, tenantID)
+	}
+	if opts.AgentID != nil {
+		conditions = append(conditions, "agent_id = ?")
+		args = append(args, *opts.AgentID)
+	}
+	if opts.UserID != "" {
+		conditions = append(conditions, "user_id = ?")
+		args = append(args, opts.UserID)
+	}
+	if opts.SessionKey != "" {
+		conditions = append(conditions, "session_key = ?")
+		args = append(args, opts.SessionKey)
+	}
+	if opts.Status != "" {
+		conditions = append(conditions, "status = ?")
+		args = append(args, opts.Status)
+	}
+	if opts.Channel != "" {
+		conditions = append(conditions, "channel = ?")
+		args = append(args, opts.Channel)
+	}
+	if opts.From != nil {
+		conditions = append(conditions, "start_time >= ?")
+		args = append(args, *opts.From)
+	}
+	if opts.To != nil {
+		conditions = append(conditions, "start_time < ?")
+		args = append(args, *opts.To)
+	}
+	if opts.MinInputTokens != nil {
+		conditions = append(conditions, "total_input_tokens >= ?")
+		args = append(args, *opts.MinInputTokens)
+	}
+	if opts.MaxInputTokens != nil {
+		conditions = append(conditions, "total_input_tokens <= ?")
+		args = append(args, *opts.MaxInputTokens)
+	}
+	if opts.MinOutputTokens != nil {
+		conditions = append(conditions, "total_output_tokens >= ?")
+		args = append(args, *opts.MinOutputTokens)
+	}
+	if opts.MaxOutputTokens != nil {
+		conditions = append(conditions, "total_output_tokens <= ?")
+		args = append(args, *opts.MaxOutputTokens)
+	}
+	if opts.MinToolCalls != nil {
+		conditions = append(conditions, "tool_call_count >= ?")
+		args = append(args, *opts.MinToolCalls)
+	}
+	if opts.MaxToolCalls != nil {
+		conditions = append(conditions, "tool_call_count <= ?")
+		args = append(args, *opts.MaxToolCalls)
+	}
+	if opts.HasToolCalls != nil {
+		if *opts.HasToolCalls {
+			conditions = append(conditions, "tool_call_count > 0")
+		} else {
+			conditions = append(conditions, "tool_call_count = 0")
+		}
+	}
+	if opts.Query != "" {
+		conditions = append(conditions, `(
+			CAST(id AS TEXT) LIKE ? ESCAPE '\' OR
+			COALESCE(name, '') LIKE ? ESCAPE '\' OR
+			COALESCE(input_preview, '') LIKE ? ESCAPE '\' OR
+			COALESCE(output_preview, '') LIKE ? ESCAPE '\' OR
+			COALESCE(session_key, '') LIKE ? ESCAPE '\' OR
+			COALESCE(channel, '') LIKE ? ESCAPE '\' OR
+			EXISTS (SELECT 1 FROM agents a WHERE a.id = traces.agent_id AND a.tenant_id = traces.tenant_id AND (COALESCE(a.display_name, '') LIKE ? ESCAPE '\' OR COALESCE(a.agent_key, '') LIKE ? ESCAPE '\')) OR
+			EXISTS (SELECT 1 FROM channel_instances ci WHERE ci.name = traces.channel AND ci.tenant_id = traces.tenant_id AND (COALESCE(ci.display_name, '') LIKE ? ESCAPE '\' OR COALESCE(ci.name, '') LIKE ? ESCAPE '\' OR COALESCE(ci.channel_type, '') LIKE ? ESCAPE '\')) OR
+			EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = traces.id AND s.tenant_id = traces.tenant_id AND (COALESCE(s.tool_name, '') LIKE ? ESCAPE '\' OR COALESCE(s.input_preview, '') LIKE ? ESCAPE '\' OR COALESCE(s.output_preview, '') LIKE ? ESCAPE '\'))
+		)`)
+		pattern := containsPattern(opts.Query)
+		for range 14 {
+			args = append(args, pattern)
+		}
+	}
+	if opts.AgentQuery != "" {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM agents a WHERE a.id = traces.agent_id AND a.tenant_id = traces.tenant_id AND (COALESCE(a.display_name, '') LIKE ? ESCAPE '\' OR COALESCE(a.agent_key, '') LIKE ? ESCAPE '\'))`)
+		pattern := containsPattern(opts.AgentQuery)
+		args = append(args, pattern, pattern)
+	}
+	if opts.ChannelQuery != "" {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM channel_instances ci WHERE ci.name = traces.channel AND ci.tenant_id = traces.tenant_id AND (COALESCE(ci.display_name, '') LIKE ? ESCAPE '\' OR COALESCE(ci.name, '') LIKE ? ESCAPE '\' OR COALESCE(ci.channel_type, '') LIKE ? ESCAPE '\'))`)
+		pattern := containsPattern(opts.ChannelQuery)
+		args = append(args, pattern, pattern, pattern)
+	}
+	if opts.ToolName != "" {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM spans s WHERE s.trace_id = traces.id AND s.tenant_id = traces.tenant_id AND s.tool_name LIKE ? ESCAPE '\')`)
+		args = append(args, containsPattern(opts.ToolName))
+	}
+	if opts.ChangedAfter != nil {
+		conditions = append(conditions, "(created_at > ? OR end_time > ? OR status = ?)")
+		args = append(args, *opts.ChangedAfter, *opts.ChangedAfter, store.TraceStatusRunning)
+	}
+
+	if len(conditions) == 0 {
+		return "", nil
+	}
+	return " WHERE " + strings.Join(conditions, " AND "), args
+}
+
+func containsPattern(value string) string {
+	return "%" + escapeLike(value) + "%"
+}
+
+func (s *SQLiteTracingStore) CountTraces(ctx context.Context, opts store.TraceListOpts) (int, error) {
+	where, args := buildTraceWhere(ctx, opts)
+	var count int
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM traces"+where, args...).Scan(&count)
+	return count, err
+}
+
+func (s *SQLiteTracingStore) ListTraces(ctx context.Context, opts store.TraceListOpts) ([]store.TraceData, error) {
+	where, args := buildTraceWhere(ctx, opts)
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	q := `SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
+		 duration_ms, name, channel, input_preview, output_preview,
+		 total_input_tokens, total_output_tokens, COALESCE(total_cost, 0), span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at
+		 FROM traces` + where +
+		fmt.Sprintf(" ORDER BY created_at DESC LIMIT %d OFFSET %d", limit, opts.Offset)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTraceRows(rows)
+}
+
+func (s *SQLiteTracingStore) ListChildTraces(ctx context.Context, parentTraceID uuid.UUID) ([]store.TraceData, error) {
+	q := `SELECT id, parent_trace_id, agent_id, user_id, session_key, run_id, start_time, end_time,
+		 duration_ms, name, channel, input_preview, output_preview,
+		 total_input_tokens, total_output_tokens, COALESCE(total_cost, 0), span_count, llm_call_count, tool_call_count,
+		 status, error, metadata, tags, team_id, created_at
+		 FROM traces WHERE parent_trace_id = ?`
+	qArgs := []any{parentTraceID}
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return nil, fmt.Errorf("tenant_id required")
+		}
+		q += " AND tenant_id = ?"
+		qArgs = append(qArgs, tid)
+	}
+	q += " ORDER BY created_at"
+	rows, err := s.db.QueryContext(ctx, q, qArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTraceRows(rows)
+}
+
+func (s *SQLiteTracingStore) GetSessionCosts(ctx context.Context, sessionKeys []string) (map[string]float64, error) {
+	result := make(map[string]float64, len(sessionKeys))
+	keys := compactSessionKeys(sessionKeys)
+	if len(keys) == 0 {
+		return result, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
+	q := `SELECT session_key, COALESCE(SUM(total_cost), 0)
+		FROM traces
+		WHERE session_key IN (` + placeholders + `)
+		  AND parent_trace_id IS NULL`
+	args := make([]any, 0, len(keys)+1)
+	for _, key := range keys {
+		args = append(args, key)
+	}
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return result, nil
+		}
+		q += ` AND tenant_id = ?`
+		args = append(args, tid)
+	}
+	q += ` GROUP BY session_key`
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sessionKey string
+		var cost float64
+		if err := rows.Scan(&sessionKey, &cost); err != nil {
+			return nil, err
+		}
+		result[sessionKey] = cost
+	}
+	return result, rows.Err()
+}
+
+func compactSessionKeys(sessionKeys []string) []string {
+	seen := make(map[string]struct{}, len(sessionKeys))
+	keys := make([]string, 0, len(sessionKeys))
+	for _, key := range sessionKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func (s *SQLiteTracingStore) GetMonthlyAgentCost(ctx context.Context, agentID uuid.UUID, year int, month time.Month) (float64, error) {
+	start := time.Date(year, month, 1, 0, 0, 0, 0, time.UTC)
+	end := start.AddDate(0, 1, 0)
+	q := `SELECT COALESCE(SUM(total_cost), 0) FROM traces
+		 WHERE agent_id = ? AND created_at >= ? AND created_at < ? AND parent_trace_id IS NULL`
+	qArgs := []any{agentID, start, end}
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid != uuid.Nil {
+			q += " AND tenant_id = ?"
+			qArgs = append(qArgs, tid)
+		}
+	}
+	var cost float64
+	err := s.db.QueryRowContext(ctx, q, qArgs...).Scan(&cost)
+	return cost, err
+}
+
+func (s *SQLiteTracingStore) GetCostSummary(ctx context.Context, opts store.CostSummaryOpts) ([]store.CostSummaryRow, error) {
+	var conditions []string
+	var args []any
+
+	conditions = append(conditions, "parent_trace_id IS NULL")
+
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID != uuid.Nil {
+			conditions = append(conditions, "tenant_id = ?")
+			args = append(args, tenantID)
+		}
+	}
+	if opts.AgentID != nil {
+		conditions = append(conditions, "agent_id = ?")
+		args = append(args, *opts.AgentID)
+	}
+	if opts.From != nil {
+		conditions = append(conditions, "created_at >= ?")
+		args = append(args, *opts.From)
+	}
+	if opts.To != nil {
+		conditions = append(conditions, "created_at < ?")
+		args = append(args, *opts.To)
+	}
+
+	where := " WHERE " + strings.Join(conditions, " AND ")
+	q := `SELECT agent_id, COALESCE(SUM(total_cost), 0), COALESCE(SUM(total_input_tokens), 0),
+		  COALESCE(SUM(total_output_tokens), 0), COUNT(*)
+		  FROM traces` + where + ` GROUP BY agent_id ORDER BY SUM(total_cost) DESC`
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []store.CostSummaryRow
+	for rows.Next() {
+		var r store.CostSummaryRow
+		var agentID *uuid.UUID
+		if err := rows.Scan(&agentID, &r.TotalCost, &r.TotalInputTokens, &r.TotalOutputTokens, &r.TraceCount); err != nil {
+			continue
+		}
+		r.AgentID = agentID
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// DeleteTracesOlderThan deletes traces and their spans older than cutoff.
+// SQLite's spans.trace_id has no FK reference to traces(id), so spans must be
+// deleted explicitly before the parent traces to avoid leaving orphaned span rows.
+// Returns total traces deleted.
+func (s *SQLiteTracingStore) DeleteTracesOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	// Delete spans first — SQLite has no CASCADE on spans.trace_id.
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM spans WHERE trace_id IN (SELECT id FROM traces WHERE created_at < ?)`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete old spans: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM traces WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete old traces: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// RecoverStaleRunningTraces marks traces stuck in "running" since before cutoff as "error".
+// Also recovers their stuck spans. Called on startup to fix orphans from crashes.
+func (s *SQLiteTracingStore) RecoverStaleRunningTraces(ctx context.Context, cutoff time.Time) (int64, error) {
+	// Recover stuck spans first.
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE spans SET status = 'error', error = 'recovered: server restart',
+		   end_time = datetime('now'), duration_ms = CAST((julianday('now') - julianday(start_time)) * 86400000 AS INTEGER)
+		 WHERE status = 'running' AND start_time < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("recover stale spans: %w", err)
+	}
+
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE traces SET status = 'error',
+		   error = 'recovered: stuck in running state (server restart)',
+		   end_time = datetime('now'), duration_ms = CAST((julianday('now') - julianday(start_time)) * 86400000 AS INTEGER)
+		 WHERE status = 'running' AND start_time < ?`, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("recover stale running traces: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// ListCodexPoolSpans is not supported in SQLite (Codex pool is a standard-edition feature).
+func (s *SQLiteTracingStore) ListCodexPoolSpans(_ context.Context, _, _ uuid.UUID, _ []string, _ int) ([]store.CodexPoolSpan, error) {
+	return nil, nil
+}
+
+// ListCodexPoolSpansByProviders is not supported in SQLite (Codex pool is a standard-edition feature).
+func (s *SQLiteTracingStore) ListCodexPoolSpansByProviders(_ context.Context, _ uuid.UUID, _ []string, _ int) ([]store.CodexPoolProviderSpan, error) {
+	return nil, nil
+}

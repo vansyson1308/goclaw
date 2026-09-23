@@ -4,26 +4,46 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
+
+const pairingDebounceTime = 60 * time.Second
 
 // Channel connects to Discord via the Bot API using gateway events.
 type Channel struct {
 	*channels.BaseChannel
-	session      *discordgo.Session
-	config       config.DiscordConfig
-	botUserID    string   // populated on start
-	placeholders sync.Map // channelID string → messageID string
+	session              *discordgo.Session
+	config               config.DiscordConfig
+	botUserID            string                      // populated on start
+	placeholders         sync.Map                    // placeholderKey string → messageID string
+	typingCtrls          sync.Map                    // channelID string → *typing.Controller
+	agentStore           store.AgentStore            // for agent key lookup (nil = writer commands disabled)
+	configPermStore      store.ConfigPermissionStore // for group file writer management (nil = writer commands disabled)
+	audioMgr             *audio.Manager              // unified STT via audio.Manager (nil = no STT)
+	contactRefreshMu     sync.Mutex
+	contactRefreshCancel context.CancelFunc
+	// pairingService, pairingDebounce, approvedGroups, groupHistory, historyLimit, requireMention
+	// are inherited from channels.BaseChannel.
 }
 
 // New creates a new Discord channel from config.
-func New(cfg config.DiscordConfig, msgBus *bus.MessageBus) (*Channel, error) {
+// agentStore and configPermStore are optional (nil = writer commands disabled).
+// audioMgr is optional (nil = STT disabled).
+func New(cfg config.DiscordConfig, msgBus *bus.MessageBus, pairingSvc store.PairingStore,
+	agentStore store.AgentStore, configPermStore store.ConfigPermissionStore,
+	pendingStore store.PendingMessageStore, audioMgr *audio.Manager) (*Channel, error) {
 	session, err := discordgo.New("Bot " + cfg.Token)
 	if err != nil {
 		return nil, fmt.Errorf("create discord session: %w", err)
@@ -34,17 +54,32 @@ func New(cfg config.DiscordConfig, msgBus *bus.MessageBus) (*Channel, error) {
 		discordgo.IntentsDirectMessages |
 		discordgo.IntentsMessageContent
 
-	base := channels.NewBaseChannel("discord", msgBus, cfg.AllowFrom)
+	base := channels.NewBaseChannel(channels.TypeDiscord, msgBus, cfg.AllowFrom)
+	base.ValidatePolicy(cfg.DMPolicy, cfg.GroupPolicy)
 
-	return &Channel{
-		BaseChannel: base,
-		session:     session,
-		config:      cfg,
-	}, nil
+	requireMention := true
+	if cfg.RequireMention != nil {
+		requireMention = *cfg.RequireMention
+	}
+
+	ch := &Channel{
+		BaseChannel:     base,
+		session:         session,
+		config:          cfg,
+		agentStore:      agentStore,
+		configPermStore: configPermStore,
+		audioMgr:        audioMgr,
+	}
+	ch.SetRequireMention(requireMention)
+	ch.SetPairingService(pairingSvc)
+	ch.SetGroupHistory(channels.MakeHistory(channels.TypeDiscord, pendingStore, base.TenantID()))
+	ch.SetHistoryLimit(cfg.HistoryLimit)
+	return ch, nil
 }
 
 // Start opens the Discord gateway connection and begins receiving events.
-func (c *Channel) Start(_ context.Context) error {
+func (c *Channel) Start(ctx context.Context) error {
+	c.GroupHistory().StartFlusher()
 	slog.Info("starting discord bot")
 
 	c.session.AddHandler(c.handleMessage)
@@ -63,19 +98,79 @@ func (c *Channel) Start(_ context.Context) error {
 
 	c.SetRunning(true)
 	slog.Info("discord bot connected", "username", user.Username, "id", user.ID)
+	c.startContactRefreshLoop(ctx)
 
 	return nil
 }
 
+// SetContactCollector starts the metadata refresh loop when the collector is
+// wired after the channel was started. Gateway lifecycle wiring happens after
+// StartAll, so relying solely on Start would leave the loop permanently idle.
+func (c *Channel) SetContactCollector(cc *store.ContactCollector) {
+	c.BaseChannel.SetContactCollector(cc)
+	if cc != nil && c.IsRunning() {
+		c.startContactRefreshLoop(context.Background())
+	}
+}
+
+func (c *Channel) startContactRefreshLoop(ctx context.Context) {
+	if c == nil || c.ContactCollector() == nil {
+		return
+	}
+	c.contactRefreshMu.Lock()
+	defer c.contactRefreshMu.Unlock()
+	if c.contactRefreshCancel != nil {
+		return
+	}
+	refreshCtx, cancel := context.WithCancel(ctx)
+	c.contactRefreshCancel = cancel
+	go c.runContactRefreshLoop(refreshCtx)
+}
+
+func (c *Channel) stopContactRefreshLoop() {
+	if c == nil {
+		return
+	}
+	c.contactRefreshMu.Lock()
+	cancel := c.contactRefreshCancel
+	c.contactRefreshCancel = nil
+	c.contactRefreshMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
+func (c *Channel) BlockReplyEnabled() *bool { return c.config.BlockReply }
+
+// ChatBehaviorConfig returns the per-channel chat_behavior override.
+func (c *Channel) ChatBehaviorConfig() *config.ChatBehaviorConfig { return c.config.ChatBehavior }
+
+// SetPendingCompaction configures LLM-based auto-compaction for pending messages.
+func (c *Channel) SetPendingCompaction(cfg *channels.CompactionConfig) {
+	if gh := c.GroupHistory(); gh != nil {
+		gh.SetCompactionConfig(cfg)
+	}
+}
+
+// SetPendingHistoryTenantID propagates tenant_id to the pending history for DB operations.
+func (c *Channel) SetPendingHistoryTenantID(id uuid.UUID) {
+	if gh := c.GroupHistory(); gh != nil {
+		gh.SetTenantID(id)
+	}
+}
+
 // Stop closes the Discord gateway connection.
 func (c *Channel) Stop(_ context.Context) error {
+	c.stopContactRefreshLoop()
+	c.GroupHistory().StopFlusher()
 	slog.Info("stopping discord bot")
 	c.SetRunning(false)
 	return c.session.Close()
 }
 
 // Send delivers an outbound message to a Discord channel.
-func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
+func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) (err error) {
 	if !c.IsRunning() {
 		return fmt.Errorf("discord bot not running")
 	}
@@ -85,32 +180,121 @@ func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
 		return fmt.Errorf("empty chat ID for discord send")
 	}
 
-	content := msg.Content
+	// Resolve placeholder key from metadata (inbound message ID), fall back to channelID.
+	// Keying by message ID prevents race conditions when multiple messages
+	// arrive in the same channel before the first response is sent.
+	placeholderKey := channelID
+	if pk := msg.Metadata["placeholder_key"]; pk != "" {
+		placeholderKey = pk
+	}
 
-	// NO_REPLY cleanup: content is empty when agent suppresses reply.
-	// Delete placeholder and return without sending any message.
-	if content == "" {
-		if pID, ok := c.placeholders.Load(channelID); ok {
-			c.placeholders.Delete(channelID)
-			msgID := pID.(string)
-			_ = c.session.ChannelMessageDelete(channelID, msgID)
+	// Placeholder update (e.g. LLM retry notification): edit the placeholder
+	// but keep it alive for the final response. Don't stop typing or cleanup.
+	if msg.Metadata["placeholder_update"] == "true" {
+		if pID, ok := c.placeholders.Load(placeholderKey); ok {
+			if msgID, ok := pID.(string); ok {
+				_, _ = c.session.ChannelMessageEdit(channelID, msgID, msg.Content)
+			}
 		}
 		return nil
 	}
 
-	// Try to edit the placeholder "Thinking..." message
-	if pID, ok := c.placeholders.Load(channelID); ok {
-		c.placeholders.Delete(channelID)
-		msgID := pID.(string)
+	typingCtrl := c.currentTypingCtrl(channelID)
+	defer func() {
+		c.finishTyping(channelID, typingCtrl, err)
+	}()
 
-		// Discord has a 2000-char message limit
-		editContent := content
-		if len(editContent) > 2000 {
-			editContent = editContent[:1997] + "..."
+	content := msg.Content
+
+	// TTS auto-apply: convert [[tts]] tagged responses to voice
+	if c.audioMgr != nil && content != "" {
+		isVoiceInbound := msg.Metadata["is_voice_inbound"] == "true"
+		ttsResult, ttsErr := c.audioMgr.AutoApplyToText(ctx, content, "discord", isVoiceInbound, "")
+		if ttsErr != nil {
+			slog.Debug("discord: tts auto-apply error", "error", ttsErr)
 		}
+		if ttsResult != nil && ttsResult.AudioPath != "" {
+			// Send voice file via media API
+			if err := c.sendMediaMessage(channelID, "", []bus.MediaAttachment{{
+				URL:         ttsResult.AudioPath,
+				ContentType: ttsResult.AudioMime,
+			}}); err != nil {
+				slog.Warn("discord: tts auto-apply voice send failed, falling back to text", "error", err)
+			} else {
+				// Voice sent successfully
+				strippedText := strings.TrimSpace(ttsResult.Text)
+				if strippedText == "" {
+					// Voice-only: delete placeholder (no text to show)
+					if pID, ok := c.placeholders.LoadAndDelete(placeholderKey); ok {
+						if msgID, ok := pID.(string); ok {
+							_ = c.session.ChannelMessageDelete(channelID, msgID)
+						}
+					}
+					return nil
+				}
+				// Has remaining text: let normal flow handle placeholder edit
+				content = strippedText
+			}
+		}
+		// Update content with directives stripped (even if TTS not applied)
+		if ttsResult != nil {
+			content = ttsResult.Text
+		}
+	}
 
-		if _, err := c.session.ChannelMessageEdit(channelID, msgID, editContent); err == nil {
-			return nil
+	// Handle outbound media attachments: send files via Discord's file upload API.
+	if len(msg.Media) > 0 {
+		// Delete placeholder if present
+		if pID, ok := c.placeholders.Load(placeholderKey); ok {
+			c.placeholders.Delete(placeholderKey)
+			if msgID, ok := pID.(string); ok {
+				_ = c.session.ChannelMessageDelete(channelID, msgID)
+			}
+		}
+		return c.sendMediaMessage(channelID, content, msg.Media)
+	}
+
+	// NO_REPLY cleanup: content is empty when agent suppresses reply.
+	// Delete placeholder and return without sending any message.
+	if content == "" {
+		if pID, ok := c.placeholders.Load(placeholderKey); ok {
+			c.placeholders.Delete(placeholderKey)
+			if msgID, ok := pID.(string); ok {
+				_ = c.session.ChannelMessageDelete(channelID, msgID)
+			}
+		}
+		return nil
+	}
+
+	// Try to edit the placeholder "Thinking..." message with the first chunk,
+	// then send the rest as follow-up messages.
+	if pID, ok := c.placeholders.Load(placeholderKey); ok {
+		c.placeholders.Delete(placeholderKey)
+		if msgID, ok := pID.(string); ok {
+			const maxLen = 2000
+			editContent := content
+			remaining := ""
+
+			if len(editContent) > maxLen {
+				// Break at a newline if possible
+				cutAt := maxLen
+				if idx := lastIndexByte(content[:maxLen], '\n'); idx > maxLen/2 {
+					cutAt = idx + 1
+				}
+				editContent = content[:cutAt]
+				remaining = content[cutAt:]
+			}
+
+			if _, editErr := c.session.ChannelMessageEdit(channelID, msgID, editContent); editErr == nil {
+				// Send remaining content as follow-up messages
+				if remaining != "" {
+					return c.sendChunked(channelID, remaining)
+				}
+				return nil
+			} else {
+				slog.Warn("discord: placeholder edit failed, sending new message",
+					"channel_id", channelID, "placeholder_id", msgID, "error", editErr)
+			}
 		}
 		// Fall through to send new message if edit fails
 	}
@@ -120,118 +304,17 @@ func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
 }
 
 // sendChunked sends a message, splitting into multiple messages if over 2000 chars.
+// Uses markdown-aware chunking to avoid splitting inside fenced code blocks.
 func (c *Channel) sendChunked(channelID, content string) error {
 	const maxLen = 2000
 
-	for len(content) > 0 {
-		chunk := content
-		if len(chunk) > maxLen {
-			// Try to break at a newline
-			cutAt := maxLen
-			if idx := lastIndexByte(content[:maxLen], '\n'); idx > maxLen/2 {
-				cutAt = idx + 1
-			}
-			chunk = content[:cutAt]
-			content = content[cutAt:]
-		} else {
-			content = ""
-		}
-
+	for _, chunk := range channels.ChunkMarkdown(content, maxLen) {
 		if _, err := c.session.ChannelMessageSend(channelID, chunk); err != nil {
 			return fmt.Errorf("send discord message: %w", err)
 		}
 	}
 
 	return nil
-}
-
-// handleMessage processes incoming Discord messages.
-func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate) {
-	// Ignore bot's own messages
-	if m.Author == nil || m.Author.ID == c.botUserID {
-		return
-	}
-
-	// Ignore bot messages
-	if m.Author.Bot {
-		return
-	}
-
-	senderID := m.Author.ID
-	senderName := m.Author.Username
-
-	channelID := m.ChannelID
-	isDM := m.GuildID == ""
-
-	// DM/Group policy check (matching TS channel policy pattern)
-	peerKind := "group"
-	if isDM {
-		peerKind = "direct"
-	}
-	if !c.CheckPolicy(peerKind, c.config.DMPolicy, c.config.GroupPolicy, senderID) {
-		slog.Debug("discord message rejected by policy",
-			"user_id", senderID,
-			"username", senderName,
-			"peer_kind", peerKind,
-		)
-		return
-	}
-
-	// Check allowlist (for "open" policy, still apply allowlist if configured)
-	if !c.IsAllowed(senderID) {
-		slog.Debug("discord message rejected by allowlist",
-			"user_id", senderID,
-			"username", senderName,
-		)
-		return
-	}
-
-	// Build content
-	content := m.Content
-
-	// Append attachment URLs
-	for _, att := range m.Attachments {
-		if content != "" {
-			content += "\n"
-		}
-		content += fmt.Sprintf("[attachment: %s]", att.URL)
-	}
-
-	if content == "" {
-		content = "[empty message]"
-	}
-
-	slog.Debug("discord message received",
-		"sender_id", senderID,
-		"channel_id", channelID,
-		"is_dm", isDM,
-		"preview", channels.Truncate(content, 50),
-	)
-
-	// Send typing indicator
-	_ = c.session.ChannelTyping(channelID)
-
-	// Send placeholder "Thinking..." message
-	placeholder, err := c.session.ChannelMessageSend(channelID, "Thinking...")
-	if err == nil {
-		c.placeholders.Store(channelID, placeholder.ID)
-	}
-
-	// Annotate current message with sender name so LLM knows who is talking in groups.
-	if peerKind == "group" && senderName != "" {
-		content = fmt.Sprintf("[From: %s]\n%s", senderName, content)
-	}
-
-	metadata := map[string]string{
-		"message_id": m.ID,
-		"user_id":    senderID,
-		"username":   senderName,
-		"guild_id":   m.GuildID,
-		"channel_id": channelID,
-		"is_dm":      fmt.Sprintf("%t", isDM),
-	}
-
-	c.HandleMessage(senderID, channelID, content, nil, metadata, peerKind)
 }
 
 // lastIndexByte returns the last index of byte c in s, or -1.
@@ -242,4 +325,47 @@ func lastIndexByte(s string, c byte) int {
 		}
 	}
 	return -1
+}
+
+func (c *Channel) currentTypingCtrl(channelID string) *typing.Controller {
+	ctrl, ok := c.typingCtrls.Load(channelID)
+	if !ok {
+		return nil
+	}
+
+	typed, ok := ctrl.(*typing.Controller)
+	if !ok {
+		c.typingCtrls.Delete(channelID)
+		return nil
+	}
+
+	return typed
+}
+
+func (c *Channel) finishTyping(channelID string, expected *typing.Controller, sendErr error) {
+	if expected == nil {
+		return
+	}
+	if sendErr != nil {
+		slog.Warn("discord: outbound send failed; keeping typing indicator active until TTL",
+			"channel_id", channelID, "error", sendErr)
+		return
+	}
+
+	current, ok := c.typingCtrls.Load(channelID)
+	if !ok {
+		return
+	}
+
+	typed, ok := current.(*typing.Controller)
+	if !ok {
+		c.typingCtrls.Delete(channelID)
+		return
+	}
+	if typed != expected {
+		return
+	}
+
+	c.typingCtrls.Delete(channelID)
+	typed.Stop()
 }

@@ -12,10 +12,27 @@ import (
 
 // ListFilesTool lists files in a directory, optionally through a sandbox container.
 type ListFilesTool struct {
-	workspace      string
-	restrict       bool
-	deniedPrefixes []string // path prefixes to deny access to (e.g. .goclaw)
-	sandboxMgr     sandbox.Manager
+	workspace       string
+	restrict        bool
+	allowedPrefixes []string // extra allowed path prefixes (e.g. skills dirs)
+	deniedPrefixes  []string // path prefixes to deny access to (e.g. .goclaw)
+	sandboxMgr      sandbox.Manager
+	contextFileIntc *ContextFileInterceptor // unused, satisfies InterceptorAware
+	memIntc         *MemoryInterceptor      // nil = no memory routing
+}
+
+func (t *ListFilesTool) SetContextFileInterceptor(intc *ContextFileInterceptor) {
+	t.contextFileIntc = intc
+}
+
+func (t *ListFilesTool) SetMemoryInterceptor(intc *MemoryInterceptor) {
+	t.memIntc = intc
+}
+
+// AllowPaths adds extra path prefixes that list_files is allowed to access
+// even when restrict_to_workspace is true (e.g. skills directories).
+func (t *ListFilesTool) AllowPaths(prefixes ...string) {
+	t.allowedPrefixes = append(t.allowedPrefixes, prefixes...)
 }
 
 // DenyPaths adds path prefixes that list_files must reject/filter.
@@ -36,36 +53,57 @@ func (t *ListFilesTool) SetSandboxKey(key string) {}
 
 func (t *ListFilesTool) Name() string        { return "list_files" }
 func (t *ListFilesTool) Description() string { return "List files and directories in a path" }
-func (t *ListFilesTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+func (t *ListFilesTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"path": map[string]interface{}{
+		"properties": map[string]any{
+			"path": map[string]any{
 				"type":        "string",
-				"description": "Directory path to list (default: workspace root)",
+				"description": "Directory path (relative to workspace; omit for workspace root)",
 			},
 		},
 	}
 }
 
-func (t *ListFilesTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *ListFilesTool) Execute(ctx context.Context, args map[string]any) *Result {
 	path, _ := args["path"].(string)
 	if path == "" {
 		path = "."
 	}
 
+	// Virtual FS: route memory directory listing to DB
+	if !IsDelegationArtifactRun(ctx) && t.memIntc != nil {
+		if listing, handled, err := t.memIntc.ListFiles(ctx, path); handled {
+			if err != nil {
+				return ErrorResult(fmt.Sprintf("failed to list memory files: %v", err))
+			}
+			if listing == "" {
+				return SilentResult("No memory files stored yet")
+			}
+			return SilentResult(listing + "\n[Source: database, not filesystem]")
+		}
+	}
+
 	// Sandbox routing (sandboxKey from ctx — thread-safe)
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
-	if t.sandboxMgr != nil && sandboxKey != "" {
+	if sandboxManagerFor(ctx, t.sandboxMgr) != nil && sandboxKey != "" {
 		return t.executeInSandbox(ctx, path, sandboxKey)
 	}
 
-	// Host execution — use per-user workspace from context if available (managed mode)
+	if resolved, handled, err := resolveDelegationInputPath(ctx, path); handled {
+		if err != nil {
+			return ErrorResult("cannot access delegation input")
+		}
+		return t.executeDelegationHostList(ctx, resolved, path)
+	}
+
+	// Host execution — use per-user workspace from context if available
 	workspace := ToolWorkspaceFromCtx(ctx)
 	if workspace == "" {
 		workspace = t.workspace
 	}
-	resolved, err := resolvePath(path, workspace, t.restrict)
+	allowed := allowedWithTeamWorkspace(ctx, t.allowedPrefixes)
+	resolved, err := resolvePathWithAllowed(path, workspace, effectiveRestrict(ctx, t.restrict), allowed)
 	if err != nil {
 		return ErrorResult(err.Error())
 	}
@@ -73,18 +111,34 @@ func (t *ListFilesTool) Execute(ctx context.Context, args map[string]interface{}
 		return ErrorResult(err.Error())
 	}
 
+	return t.executeHostList(ctx, resolved, path)
+}
+
+func (t *ListFilesTool) executeDelegationHostList(ctx context.Context, resolved, displayPath string) *Result {
+	result := t.executeHostList(ctx, resolved, displayPath)
+	if result.IsError {
+		return ErrorResult("failed to list delegation input directory")
+	}
+	return result
+}
+
+func (t *ListFilesTool) executeHostList(ctx context.Context, resolved, displayPath string) *Result {
 	entries, err := os.ReadDir(resolved)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return SilentResult(fmt.Sprintf("Directory does not exist: %s", path))
+			msg := fmt.Sprintf("Directory does not exist: %s", displayPath)
+			if teamWs := ToolTeamWorkspaceFromCtx(ctx); teamWs != "" && !strings.HasPrefix(resolved, teamWs) {
+				msg += fmt.Sprintf("\nHint: try the team workspace path: list_files(path=\"%s/%s\")", teamWs, displayPath)
+			}
+			return SilentResult(msg)
 		}
 		return ErrorResult(fmt.Sprintf("failed to list directory: %v", err))
 	}
 
 	var sb strings.Builder
 	for _, entry := range entries {
-		// Filter out denied directories from listing
-		if entry.IsDir() && len(t.deniedPrefixes) > 0 {
+		// Filter out denied entries (both files and directories) from listing.
+		if len(t.deniedPrefixes) > 0 {
 			entryPath := filepath.Join(resolved, entry.Name())
 			if checkDeniedPath(entryPath, t.workspace, t.deniedPrefixes) != nil {
 				continue
@@ -105,23 +159,32 @@ func (t *ListFilesTool) Execute(ctx context.Context, args map[string]interface{}
 }
 
 func (t *ListFilesTool) executeInSandbox(ctx context.Context, path, sandboxKey string) *Result {
-	bridge, err := t.getFsBridge(ctx, sandboxKey)
+	mountWorkspace, err := effectiveSandboxWorkspace(ctx, t.workspace)
+	if err != nil {
+		return ErrorResult(err.Error())
+	}
+	containerCwd, cwdErr := sandboxCwdForHostPath(mountWorkspace, mountWorkspace, sandboxContainerWorkdir(ctx))
+	if cwdErr != nil {
+		return ErrorResult(fmt.Sprintf("sandbox path mapping: %v", cwdErr))
+	}
+	bridge, err := t.getFsBridge(ctx, sandboxKey, mountWorkspace, containerCwd)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
 	}
+	containerPath := ResolveSandboxPath(path, containerCwd)
 
-	output, err := bridge.ListDir(ctx, path)
+	output, err := bridge.ListDir(ctx, containerPath)
 	if err != nil {
-		return ErrorResult(fmt.Sprintf("failed to list directory: %v", err))
+		return ErrorResult(fmt.Sprintf("failed to list directory: %v", err) + MaybeFsBridgeHint(err))
 	}
 
 	return SilentResult(output)
 }
 
-func (t *ListFilesTool) getFsBridge(ctx context.Context, sandboxKey string) (*sandbox.FsBridge, error) {
-	sb, err := t.sandboxMgr.Get(ctx, sandboxKey, t.workspace)
+func (t *ListFilesTool) getFsBridge(ctx context.Context, sandboxKey, mountWorkspace, containerCwd string) (*sandbox.FsBridge, error) {
+	sb, err := acquireToolSandbox(ctx, t.sandboxMgr, sandboxKey, mountWorkspace)
 	if err != nil {
 		return nil, err
 	}
-	return sandbox.NewFsBridge(sb.ID(), "/workspace"), nil
+	return sandbox.NewFsBridge(sb.ID(), containerCwd), nil
 }

@@ -1,0 +1,59 @@
+{
+  "title": "Liên hệ",
+  "description": "Liên hệ tự động thu thập từ tất cả tương tác qua các channel.",
+  "searchPlaceholder": "Tìm theo tên, username hoặc ID...",
+  "filter": "Lọc",
+  "emptyTitle": "Không có liên hệ",
+  "emptyDescription": "Liên hệ sẽ xuất hiện khi người dùng tương tác với agent qua các channel.",
+  "noMatchTitle": "Không tìm thấy liên hệ phù hợp",
+  "noMatchDescription": "Thử từ khóa tìm kiếm hoặc bộ lọc khác.",
+  "columns": {
+    "name": "Tên",
+    "username": "Tên đăng nhập",
+    "senderId": "ID gửi",
+    "channelType": "Channel",
+    "peerKind": "Loại",
+    "lastSeen": "Lần cuối",
+    "merged": "Đã gộp"
+  },
+  "permissionsNote": {
+    "title": "Quyền truy cập tên liên hệ theo channel",
+    "telegram": "Telegram — Tên và username có sẵn tự động.",
+    "discord": "Discord — Tên hiển thị và username có sẵn tự động.",
+    "zalo": "Zalo — Tên hiển thị có sẵn tự động.",
+    "slack": "Slack — Tên được lấy qua Slack API (bot phải trong workspace).",
+    "feishu": "Feishu/Lark — Cần quyền contact:user.base:readonly. Nếu không có, tên sẽ trống.",
+    "bitrix24": "Bitrix24 — Cần scope `user` + 1 lần gọi `user.get` cho mỗi người gửi mới. Tên có thể trống ở tin nhắn đầu."
+  },
+  "selectedCount": "Đã chọn {{count}}",
+  "merge": {
+    "button": "Gộp",
+    "unmergeButton": "Tách",
+    "dialogTitle": "Gộp liên hệ",
+    "dialogDescription": "Liên kết các liên hệ đã chọn với một người dùng tenant. Xác định họ là cùng một người trên các channel khác nhau.",
+    "linkExisting": "Liên kết với người dùng có sẵn",
+    "createNew": "Tạo người dùng mới",
+    "selectUser": "Chọn người dùng tenant...",
+    "displayName": "Tên hiển thị",
+    "displayNamePlaceholder": "VD: Nguyễn Văn A",
+    "userId": "ID người dùng",
+    "userIdPlaceholder": "Định danh duy nhất",
+    "confirm": "Gộp",
+    "cancel": "Hủy",
+    "success": "Gộp liên hệ thành công",
+    "unmergeSuccess": "Tách liên hệ thành công",
+    "error": "Không thể gộp liên hệ",
+    "unmergeError": "Không thể tách liên hệ",
+    "comingSoon": "Tính năng này đang được phát triển và chưa khả dụng."
+  },
+  "types": {
+    "user": "Người dùng",
+    "group": "Nhóm"
+  },
+  "filters": {
+    "allChannels": "Tất cả Channel",
+    "allTypes": "Tất cả loại",
+    "direct": "Trực tiếp",
+    "group": "Nhóm"
+  }
+}

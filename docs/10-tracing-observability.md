@@ -2,7 +2,7 @@
 
 Records agent run activities asynchronously. Spans are buffered in memory and flushed to the TracingStore in batches, with optional export to external OpenTelemetry backends.
 
-> **Managed mode only**: Tracing requires PostgreSQL. In standalone mode, `TracingStore` is nil and no traces are recorded. The `traces` and `spans` tables store all tracing data. Optional OTel export sends spans to external backends (Jaeger, Grafana Tempo, Datadog) in addition to PostgreSQL.
+> Tracing uses PostgreSQL. The `traces` and `spans` tables store all tracing data. Optional OTel export sends spans to external backends (Jaeger, Grafana Tempo, Datadog) in addition to PostgreSQL.
 
 ---
 
@@ -28,6 +28,19 @@ flowchart LR
     ES --> FT["FinishTrace()<br/>(status, error, output preview)"]
 ```
 
+### Cancel Handling
+
+When a run is cancelled via `chat.abort` (WS) or manual stop, the router atomically transitions to "aborting" state, cancels the request context, and waits 3 seconds for the agent goroutine to exit. If it doesn't, the trace is force-marked `cancelled` to prevent orphaned traces.
+
+During cancellation:
+- HTTP provider streams close immediately (context-aware transport with `ResponseHeaderTimeout`; SSE body closes via goroutine wrapper to unblock socket read)
+- Tool execution terminates (shell: process-group kill; browser: page close)
+- Agent loop receives `ctx.Done()` and propagates cancellation up
+
+Trace finalization persists independently with a detached context (`context.WithoutCancel`), 5-second timeout, and exponential backoff retry (3 tries, max 10 total via retry queue). This ensures trace status writes don't fail silently due to cancellation.
+
+Stale recovery is **currently disabled**. The implementation exists but the background loop is not started in `Collector.Start()`. Reason: the sweep condition is `start_time < NOW() - threshold`, which measures trace age rather than inactivity. Any threshold low enough to be useful (2–10 min) would kill healthy long-running agent runs (research chains, large code generation, extended shell commands). Re-enable only after adding a `last_span_at` column so recovery can gate on "no activity for N minutes" instead of "started > N min ago". Until then, zombie traces from gateway crashes may remain `running` in the DB — an accepted safety-net gap traded against false kills. The primary abort path (router 2-phase abort + `trace.status` WS event) handles the common case. Context values (traceID, collector) survive cancellation — only `ctx.Done()` and `ctx.Err()` change.
+
 ---
 
 ## 2. Span Types & Hierarchy
@@ -37,6 +50,8 @@ flowchart LR
 | `llm_call` | LLM provider call | Client |
 | `tool_call` | Tool execution | Internal |
 | `agent` | Root agent span (parents all child spans) | Internal |
+| `embedding` | Embedding generation (vector store operations) | Internal |
+| `event` | Discrete event marker (no duration) | Internal |
 
 ```mermaid
 flowchart TD
@@ -44,6 +59,7 @@ flowchart TD
     AGENT --> TOOL1["Tool Span: exec<br/>(tool_name, duration)"]
     AGENT --> LLM2["LLM Call Span 2"]
     AGENT --> TOOL2["Tool Span: read_file"]
+    AGENT --> EMB["Embedding Span<br/>(vector store operation)"]
     AGENT --> LLM3["LLM Call Span 3"]
 ```
 
@@ -58,9 +74,15 @@ Token counts are aggregated **only from `llm_call` spans** (not `agent` spans) t
 | Mode | InputPreview | OutputPreview |
 |------|:---:|:---:|
 | Normal | Not recorded | 500 characters max |
-| Verbose (`GOCLAW_TRACE_VERBOSE=1`) | Up to 50KB | 500 characters max |
+| Verbose (`GOCLAW_TRACE_VERBOSE=1`) | Up to 200KB | Up to 200KB |
 
-Verbose mode is useful for debugging LLM conversations. Full input messages (including system prompt, history, and tool results) are serialized as JSON and stored in the span's `InputPreview` field, truncated at 50,000 characters.
+Verbose mode is useful for debugging LLM conversations. When enabled via `GOCLAW_TRACE_VERBOSE=1`:
+
+- **LLM spans**: Full input messages (including system prompt, history, and tool results) are serialized as JSON and stored in `InputPreview` (truncated at 200KB). LLM response content is stored in `OutputPreview` (truncated at 200KB, includes `<thinking>` tag if present).
+- **Tool spans**: Tool input and output are both recorded up to 200KB.
+- **Agent span**: Input message and output are both recorded up to 200KB.
+
+In normal mode, previews are truncated to 500 characters max to minimize storage overhead.
 
 ---
 
@@ -97,37 +119,163 @@ The exporter lives in a separate sub-package (`internal/tracing/otelexport/`) so
 
 ---
 
-## 5. Trace HTTP API (Managed Mode)
+## 5. Cost Calculation
+
+Per-span cost is calculated in `internal/tracing/cost.go`. For each LLM call span, pricing resolves in this order:
+
+1. Tenant/provider/model override
+2. OpenRouter-backed pricing catalog
+3. Legacy `telemetry.model_pricing` config fallback
+
+Catalog and override prices are stored as USD per token/unit. Legacy config prices remain USD per million tokens:
+
+```
+Cost = (PromptTokens × InputCostPerMillion) / 1,000,000
+      + (CompletionTokens × OutputCostPerMillion) / 1,000,000
+      + (CacheReadTokens × CacheReadCostPerMillion) / 1,000,000
+      + (CacheCreationTokens × CacheCreateCostPerMillion) / 1,000,000
+```
+
+Cost is stored in the `total_cost` field of each LLM call span. The trace aggregation sums costs from all child `llm_call` spans to compute the trace-level `total_cost`.
+
+Cache token costs (read + create) are optional and only applied when the resolved catalog, override, or fallback config provides those price dimensions.
+
+At startup, after the OpenRouter catalog sync succeeds, PostgreSQL tracing runs an idempotent historical backfill for LLM spans whose `total_cost` is still zero. The backfill uses the same override/catalog precedence, refreshes trace totals, and refreshes the affected `usage_snapshots` buckets so the Usage dashboard updates without waiting for new traffic. Bailian/DashScope Qwen model IDs and common unprefixed OpenAI-compatible model IDs are mapped to OpenRouter catalog IDs for observability pricing; usage cap enforcement rules remain separate.
+
+---
+
+## 6. Snapshot Worker -- Realtime Usage Aggregation
+
+The `SnapshotWorker` periodically aggregates trace and span data into hourly `usage_snapshots` for realtime analytics and dashboard displays.
+
+### Operation
+
+- **Schedule**: Ticks every hour at HH:05:00 UTC (5 minutes past the hour)
+- **Catch-up**: On startup and after each tick, computes snapshots for all missed hours
+- **Backfill**: `Backfill()` method populates historical snapshots from the earliest trace to now
+
+### Snapshot Dimensions
+
+For each hour `[00:00, 01:00)`, the worker creates two types of snapshot rows:
+
+1. **Totals Row** (`provider=""`, `model=""`) — Aggregated from traces:
+   - `request_count` — Count of root traces
+   - `error_count` — Count of failed traces
+   - `unique_users` — Distinct `user_id` in traces
+   - `input_tokens`, `output_tokens` — Sum from all child `llm_call` spans
+   - `total_cost` — Sum of costs from all child `llm_call` spans
+   - `tool_call_count` — Sum from traces
+   - `avg_duration_ms` — Average trace duration
+   - `memory_docs`, `memory_chunks` — Point-in-time count (attached to agent's totals row only)
+   - `kg_entities`, `kg_relations` — Point-in-time count (attached to agent's totals row only)
+
+2. **Detail Rows** (`provider` + `model` specified) — Aggregated from `llm_call` spans:
+   - `llm_call_count` — Count of LLM calls for this provider/model
+   - `input_tokens`, `output_tokens` — Sum of tokens
+   - `total_cost` — Sum of per-call costs
+   - `cache_read_tokens`, `cache_create_tokens`, `thinking_tokens` — Sum from span metadata
+
+Grouping: by `(agent_id, channel)` for totals; by `(agent_id, channel, provider, model)` for details.
+
+### Usage
+
+```go
+worker := tracing.NewSnapshotWorker(db, snapshotStore)
+worker.Start()
+
+// Later:
+hoursBackfilled, err := worker.Backfill(ctx)
+worker.Stop()
+```
+
+---
+
+## 7. Trace HTTP API
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/v1/traces` | List traces with pagination and filters |
+| GET | `/v1/traces/follow` | Poll trace changes for one session or agent |
 | GET | `/v1/traces/{id}` | Get trace details with all spans |
+| GET | `/v1/traces/{id}/export` | Export a gzipped trace tree with spans and sub-traces |
+| GET | `/v1/runs/{runID}/timeline` | Get persisted run archive timeline items |
 
 ### Query Filters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
+| `q` | string | Contains search across trace ID, trace previews, session/channel labels, joined agent/channel labels, and span previews/tool names |
 | `agent_id` | UUID | Filter by agent |
 | `user_id` | string | Filter by user |
-| `status` | string | Filter by status (running, success, error) |
-| `from` / `to` | timestamp | Date range filter |
+| `session_key` | string | Filter by session key |
+| `status` | string | Filter by status (running, completed, error, cancelled) |
+| `channel` | string | Filter by raw channel |
+| `agent` | string | Contains search over agent display name and key |
+| `channel_query` | string | Contains search over tenant-scoped channel instance labels |
+| `from` / `to` | timestamp | `start_time` range filter; `from` inclusive, `to` exclusive |
+| `min_input_tokens` / `max_input_tokens` | int | Input token range |
+| `min_output_tokens` / `max_output_tokens` | int | Output token range |
+| `min_tool_calls` / `max_tool_calls` | int | Tool-call count range |
+| `tool_name` | string | Contains search over span tool names |
+| `has_tool_calls` | boolean | Filter traces with or without tool calls |
 | `limit` | int | Page size (default 50) |
 | `offset` | int | Pagination offset |
+
+### Operator CLI
+
+The main `goclaw` binary can also act as a thin operator client for trace
+inspection:
+
+```bash
+goclaw traces list --status error --limit 20
+goclaw traces get <trace-id> -o json
+goclaw traces export <trace-id> --file trace.json.gz
+goclaw traces follow --session <session-key> --since 2026-06-12T01:00:00Z
+goclaw traces timeline <trace-id>
+```
+
+By default, commands use the same local gateway config and
+`GOCLAW_GATEWAY_TOKEN` behavior as existing admin commands. For remote
+operations, use explicit overrides:
+
+```bash
+goclaw --server https://goclaw.example.com --token "$GOCLAW_GATEWAY_TOKEN" traces get <trace-id> -o json
+```
+
+`--server` also applies to existing WebSocket/RPC-backed admin commands such as
+`sessions`, `cron`, and `pairing`. The URL can also come from `GOCLAW_SERVER`
+or `GOCLAW_GATEWAY_URL`; `--server` wins when both are set.
+
+The standalone `nextlevelbuilder/goclaw-cli` can remain a compatibility tool,
+but first-party trace operator workflows are now available from the main
+server/runtime binary.
+
+---
+
+## 8. Delegation History
+
+Delegation history records are stored in the `delegation_history` table and exposed alongside traces for cross-referencing agent interactions.
+
+| Channel | Endpoint | Details |
+|---------|----------|---------|
+| WebSocket RPC | `delegations.list` / `delegations.get` | Results truncated (500 runes for list, 8000 for detail) |
+| HTTP API | `GET /v1/delegations` / `GET /v1/delegations/{id}` | Full records |
+| Agent tool | `delegate(action="history")` | Agent self-checking past delegations |
+
+Delegation history is automatically recorded by `DelegateManager.saveDelegationHistory()` for every delegation (sync/async). Each record includes source agent, target agent, input, result, duration, and status.
 
 ---
 
 ## File Reference
 
-| File | Description |
-|------|-------------|
-| `internal/tracing/collector.go` | Collector buffer-flush, EmitSpan, FinishTrace |
-| `internal/tracing/context.go` | Trace context propagation (TraceID, ParentSpanID) |
-| `internal/tracing/otelexport/exporter.go` | OTel OTLP exporter (gRPC + HTTP) |
-| `internal/store/tracing_store.go` | TracingStore interface |
-| `internal/store/pg/tracing.go` | PostgreSQL trace/span persistence + aggregation |
-| `internal/http/traces.go` | Trace HTTP API handler (GET /v1/traces) |
-| `internal/agent/loop_tracing.go` | Span emission from agent loop (LLM, tool, agent spans) |
+| Module | Path | Purpose |
+|---|---|---|
+| Tracing engine | `internal/tracing/` | Collector (buffer-flush, EmitSpan, FinishTrace), context propagation, cost calculation, OTel OTLP exporter |
+| Store & snapshots | `internal/store/tracing_store.go`, `internal/store/pg/tracing.go`, `internal/tracing/snapshot_worker.go` | TracingStore interface, PostgreSQL persistence + aggregation, hourly usage snapshots |
+| Agent & pipeline integration | `internal/agent/loop_tracing.go`, `internal/pipeline/` | Span emission from agent loop (LLM, tool, agent spans), pipeline stage tracing |
+| HTTP & RPC handlers | `internal/http/traces.go`, `internal/http/delegations.go`, `internal/gateway/methods/delegations.go` | GET /v1/traces, delegation history HTTP + RPC handlers |
+
+Use `grep` or your editor's symbol search for specific files.
 
 ---
 
@@ -135,6 +283,8 @@ The exporter lives in a separate sub-package (`internal/tracing/otelexport/`) so
 
 | Document | Relevant Content |
 |----------|-----------------|
-| [01-agent-loop.md](./01-agent-loop.md) | Span emission during agent execution |
-| [06-store-data-model.md](./06-store-data-model.md) | traces/spans tables schema |
+| [01-agent-loop.md](./01-agent-loop.md) | Span emission during agent execution, cancel handling |
+| [03-tools-system.md](./03-tools-system.md) | Delegation system, delegation history via agent tool |
+| [06-store-data-model.md](./06-store-data-model.md) | traces/spans tables schema, delegation_history table |
+| [08-scheduling-cron.md](./08-scheduling-cron.md) | Scheduler lanes, /stop and /stopall commands |
 | [09-security.md](./09-security.md) | Rate limiting, RBAC access control |

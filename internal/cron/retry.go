@@ -40,10 +40,9 @@ func ExecuteWithRetry(fn func() (string, error), cfg RetryConfig) (result string
 
 // backoffWithJitter computes delay = min(base * 2^attempt, max) + jitter(±25%).
 func backoffWithJitter(base, max time.Duration, attempt int) time.Duration {
-	delay := base << uint(attempt) // base * 2^attempt
-	if delay > max {
-		delay = max
-	}
+	delay := min(
+		// base * 2^attempt
+		base<<uint(attempt), max)
 
 	// Jitter: ±25% of delay
 	quarter := delay / 4

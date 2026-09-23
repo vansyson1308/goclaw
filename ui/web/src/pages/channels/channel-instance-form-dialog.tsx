@@ -1,4 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useTranslation } from "react-i18next";
 import {
   Dialog,
   DialogContent,
@@ -7,29 +10,18 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Switch } from "@/components/ui/switch";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import type { ChannelInstanceData, ChannelInstanceInput } from "./hooks/use-channel-instances";
 import type { AgentData } from "@/types/agent";
-import { slugify, isValidSlug } from "@/lib/slug";
-import { credentialsSchema, configSchema } from "./channel-schemas";
-import { ChannelFields } from "./channel-fields";
+import { credentialsSchema, configSchema, wizardConfig, type FieldDef } from "./channel-schemas";
+import { wizardAuthSteps, wizardConfigSteps } from "./channel-wizard-registry";
+import { CHANNEL_TYPES } from "@/constants/channels";
+import { channelInstanceSchema, type ChannelInstanceFormData } from "@/schemas/channel.schema";
+import { ChannelInstanceFormStep } from "./channel-instance-form-step";
+import { flattenConfig, unflattenConfig } from "@/lib/config-flatten";
+import { BitrixPortalCreateModal } from "./bitrix24/bitrix-portal-create-modal";
+import { useBitrixPortals } from "./bitrix24/use-bitrix-portals";
 
-const CHANNEL_TYPES = [
-  { value: "telegram", label: "Telegram" },
-  { value: "discord", label: "Discord" },
-  { value: "feishu", label: "Feishu / Lark" },
-  { value: "zalo_oa", label: "Zalo OA" },
-  { value: "whatsapp", label: "WhatsApp" },
-] as const;
+type WizardStep = "form" | "auth" | "config";
 
 interface ChannelInstanceFormDialogProps {
   open: boolean;
@@ -37,6 +29,7 @@ interface ChannelInstanceFormDialogProps {
   instance?: ChannelInstanceData | null;
   agents: AgentData[];
   onSubmit: (data: ChannelInstanceInput) => Promise<unknown>;
+  onUpdate?: (id: string, data: Partial<ChannelInstanceInput>) => Promise<unknown>;
 }
 
 export function ChannelInstanceFormDialog({
@@ -45,29 +38,93 @@ export function ChannelInstanceFormDialog({
   instance,
   agents,
   onSubmit,
+  onUpdate,
 }: ChannelInstanceFormDialogProps) {
-  const [name, setName] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [channelType, setChannelType] = useState("telegram");
-  const [agentId, setAgentId] = useState("");
+  const { t } = useTranslation("channels");
+
   const [credsValues, setCredsValues] = useState<Record<string, unknown>>({});
   const [configValues, setConfigValues] = useState<Record<string, unknown>>({});
-  const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [step, setStep] = useState<WizardStep>("form");
+  const [createdInstanceId, setCreatedInstanceId] = useState<string | null>(null);
+  const [authCompleted, setAuthCompleted] = useState(false);
+  const [portalModalOpen, setPortalModalOpen] = useState(false);
+  const [resumePortalName, setResumePortalName] = useState<string | undefined>(undefined);
+  // Cache portal list so submit can verify the chosen portal is `installed`
+  // before calling the channel create RPC — prevents creating a channel that
+  // would fail at Start() because the portal hasn't completed authorization.
+  const portalsQuery = useBitrixPortals({ enabled: open });
+
+  const form = useForm<ChannelInstanceFormData>({
+    resolver: zodResolver(channelInstanceSchema),
+    mode: "onChange",
+    defaultValues: {
+      name: "",
+      displayName: "",
+      channelType: "telegram",
+      agentId: "",
+      enabled: true,
+    },
+  });
+
+  const channelType = form.watch("channelType");
+  const wizard = wizardConfig[channelType];
+  const hasWizard = !instance && !!wizard;
+  const channelLabel = CHANNEL_TYPES.find((ct) => ct.value === channelType)?.label ?? channelType;
+
+  const totalSteps = hasWizard ? 1 + wizard!.steps.length : 1;
+  const currentStepNum = step === "form" ? 1 : (wizard?.steps.indexOf(step as "auth" | "config") ?? 0) + 2;
+
+  const getNextWizardStep = useCallback((current: WizardStep): "auth" | "config" | null => {
+    if (!wizard) return null;
+    if (current === "form") return wizard.steps[0] ?? null;
+    const idx = wizard.steps.indexOf(current as "auth" | "config");
+    return idx >= 0 ? wizard.steps[idx + 1] ?? null : null;
+  }, [wizard]);
 
   useEffect(() => {
     if (open) {
-      setName(instance?.name ?? "");
-      setDisplayName(instance?.display_name ?? "");
-      setChannelType(instance?.channel_type ?? "telegram");
-      setAgentId(instance?.agent_id ?? (agents[0]?.id ?? ""));
-      setCredsValues({}); // never pre-fill credentials
-      setConfigValues(instance?.config ? { ...instance.config } : {});
-      setEnabled(instance?.enabled ?? true);
+      form.reset({
+        name: instance?.name ?? "",
+        displayName: instance?.display_name ?? "",
+        channelType: instance?.channel_type ?? "telegram",
+        agentId: instance?.agent_id ?? (agents[0]?.id ?? ""),
+        enabled: instance?.enabled ?? true,
+      });
+      setCredsValues({});
+
+      const ct = instance?.channel_type ?? "telegram";
+      const schema = configSchema[ct] ?? [];
+      const defaults: Record<string, unknown> = {};
+      for (const f of schema) {
+        if (f.defaultValue !== undefined) defaults[f.key] = f.defaultValue;
+      }
+      const merged: Record<string, unknown> = { ...defaults, ...flattenConfig((instance?.config ?? {}) as Record<string, unknown>) };
+      const boolSelectKeys = new Set(
+        schema.filter((f: FieldDef) => f.type === "select" && f.options?.some((o) => o.value === "true")).map((f: FieldDef) => f.key),
+      );
+      for (const key of boolSelectKeys) {
+        if (typeof merged[key] === "boolean") merged[key] = String(merged[key]);
+        else if (merged[key] === undefined || merged[key] === null) merged[key] = "inherit";
+      }
+      setConfigValues(merged);
       setError("");
+      setStep("form");
+      setCreatedInstanceId(null);
+      setAuthCompleted(false);
     }
-  }, [open, instance, agents]);
+  }, [open, instance, agents, form]);
+
+  useEffect(() => {
+    if (step !== "auth" || !authCompleted) return;
+    const next = getNextWizardStep("auth");
+    const id = setTimeout(() => {
+      if (next) setStep(next);
+      else onOpenChange(false);
+    }, 1200);
+    return () => clearTimeout(id);
+  }, [step, authCompleted, getNextWizardStep, onOpenChange]);
 
   const handleCredsChange = useCallback((key: string, value: unknown) => {
     setCredsValues((prev) => ({ ...prev, [key]: value }));
@@ -77,36 +134,78 @@ export function ChannelInstanceFormDialog({
     setConfigValues((prev) => ({ ...prev, [key]: value }));
   }, []);
 
-  const handleSubmit = async () => {
-    if (!name.trim()) {
-      setError("Name is required");
-      return;
-    }
-    if (!isValidSlug(name.trim())) {
-      setError("Name must be a valid slug (lowercase letters, numbers, hyphens only)");
-      return;
-    }
-    if (!agentId) {
-      setError("Agent is required");
-      return;
+  const coerceSelects = (cfg: Record<string, unknown>, schema: FieldDef[]) => {
+    const selectKeys = new Set(schema.filter((f) => f.type === "select").map((f) => f.key));
+    for (const key of selectKeys) {
+      if (cfg[key] === "inherit") delete cfg[key];
     }
 
-    // Validate required credentials on create
+    const boolSelectKeys = new Set(
+      schema.filter((f) => f.type === "select" && f.options?.some((o) => o.value === "true")).map((f) => f.key),
+    );
+    for (const key of boolSelectKeys) {
+      const v = cfg[key];
+      if (v === "true") cfg[key] = true;
+      else if (v === "false") cfg[key] = false;
+      else delete cfg[key];
+    }
+  };
+
+  const handleSubmit = form.handleSubmit(async (values) => {
     if (!instance) {
-      const schema = credentialsSchema[channelType] ?? [];
-      const missing = schema.filter((f) => f.required && !credsValues[f.key]);
+      const schema = credentialsSchema[values.channelType] ?? [];
+      const missing = schema.filter((f: FieldDef) => f.required && !credsValues[f.key]);
       if (missing.length > 0) {
-        setError(`Required: ${missing.map((f) => f.label).join(", ")}`);
+        setError(t("form.errors.requiredFields", { fields: missing.map((f: FieldDef) => f.label).join(", ") }));
         return;
       }
     }
 
-    // Build clean config (strip undefined/empty values)
     const cleanConfig = Object.fromEntries(
       Object.entries(configValues).filter(([, v]) => v !== undefined && v !== "" && v !== null),
     );
+    coerceSelects(cleanConfig, configSchema[values.channelType] ?? []);
 
-    // Build credentials JSON from field values (only non-empty values)
+    // Drop the legacy bitrix24 public_url field if it leaked from an older
+    // channel row's config — gateway now derives the URL from the portal's
+    // install callback (see plans/260513-1648-bitrix24-portal-self-service-ux).
+    // Keeping it in submit re-saves dead data forever.
+    if (values.channelType === "bitrix24") {
+      delete cleanConfig.public_url;
+    }
+
+    // Config required check (create-only): validate after cleanConfig is built so empty strings are caught.
+    if (!instance) {
+      const cfgSchema = configSchema[values.channelType] ?? [];
+      const missingCfg = cfgSchema.filter(
+        (f: FieldDef) => f.required && (cleanConfig[f.key] === undefined || cleanConfig[f.key] === "" || cleanConfig[f.key] === null),
+      );
+      if (missingCfg.length > 0) {
+        setError(t("form.errors.requiredFields", { fields: missingCfg.map((f: FieldDef) => f.label).join(", ") }));
+        return;
+      }
+    }
+
+    // Bitrix24 portal must be installed before a channel can reference it —
+    // the channel runtime calls imbot.register on Start() which needs OAuth
+    // tokens. Block here so the user gets a clear error instead of a
+    // mysterious "channel won't start" later. Edit flow skipped because the
+    // portal may have been valid when the channel was first created.
+    if (!instance && values.channelType === "bitrix24" && cleanConfig.portal) {
+      const portals = portalsQuery.data ?? [];
+      const selected = portals.find((p) => p.name === cleanConfig.portal);
+      if (!selected) {
+        setError(t("bitrix24.errors.portalRequired", { defaultValue: "Please select a portal." }));
+        return;
+      }
+      if (!selected.installed) {
+        setError(t("bitrix24.errors.portalNotInstalled", {
+          defaultValue: "This portal has not completed authorization. Authorize it before creating a channel.",
+        }));
+        return;
+      }
+    }
+
     const cleanCreds = Object.fromEntries(
       Object.entries(credsValues).filter(([, v]) => v !== undefined && v !== "" && v !== null),
     );
@@ -115,149 +214,158 @@ export function ChannelInstanceFormDialog({
     setError("");
     try {
       const data: ChannelInstanceInput = {
-        name: name.trim(),
-        display_name: displayName.trim() || undefined,
-        channel_type: channelType,
-        agent_id: agentId,
-        config: Object.keys(cleanConfig).length > 0 ? cleanConfig : undefined,
-        enabled,
+        name: values.name,
+        display_name: values.displayName?.trim() || undefined,
+        channel_type: values.channelType,
+        agent_id: values.agentId,
+        config: Object.keys(cleanConfig).length > 0 ? unflattenConfig(cleanConfig) : undefined,
+        enabled: values.enabled,
       };
-      // Only send credentials if user entered something
-      if (Object.keys(cleanCreds).length > 0) {
-        data.credentials = cleanCreds;
+      if (Object.keys(cleanCreds).length > 0) data.credentials = cleanCreds;
+
+      const result = await onSubmit(data);
+
+      if (hasWizard && wizard) {
+        const res = result as Record<string, unknown> | undefined;
+        const firstStep = wizard.steps[0];
+        if (typeof res?.id === "string" && firstStep) {
+          setCreatedInstanceId(res.id);
+          setStep(firstStep);
+        } else {
+          onOpenChange(false);
+        }
+      } else {
+        onOpenChange(false);
       }
-      await onSubmit(data);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t("form.errors.failedSave"));
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  const handleConfigDone = async () => {
+    if (!createdInstanceId || !onUpdate) { onOpenChange(false); return; }
+    const cleanConfig = Object.fromEntries(
+      Object.entries(configValues).filter(([, v]) => v !== undefined && v !== "" && v !== null),
+    );
+    coerceSelects(cleanConfig, configSchema[channelType] ?? []);
+    setLoading(true);
+    setError("");
+    try {
+      await onUpdate(createdInstanceId, { config: unflattenConfig(cleanConfig) });
       onOpenChange(false);
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : "Failed to save");
+      setError(err instanceof Error ? err.message : t("form.errors.failedSaveConfig"));
     } finally {
       setLoading(false);
     }
   };
 
-  const credsFields = credentialsSchema[channelType] ?? [];
-  const cfgFields = configSchema[channelType] ?? [];
+  const handleSkipAuth = () => {
+    const next = getNextWizardStep("auth");
+    if (next) setStep(next);
+    else onOpenChange(false);
+  };
+
+  const canClose = step !== "auth";
+  const AuthStep = wizardAuthSteps[channelType];
+  const ConfigStep = wizardConfigSteps[channelType];
+
+  const submitLabel = loading
+    ? t("form.saving")
+    : instance
+      ? t("form.update")
+      : (wizard?.createLabel ? t(wizard.createLabel) : t("form.create"));
+
+  const dialogTitle = instance
+    ? t("form.editTitle")
+    : step === "form"
+      ? t("form.createTitle")
+      : step === "auth"
+        ? t("form.authenticate", { label: channelLabel })
+        : t("form.configure", { label: channelLabel });
 
   return (
-    <Dialog open={open} onOpenChange={(v) => !loading && onOpenChange(v)}>
-      <DialogContent className="max-h-[85vh] max-w-lg flex flex-col">
+    <Dialog open={open} onOpenChange={(v) => { if (!loading && canClose) onOpenChange(v); }}>
+      <DialogContent className="max-h-[85vh] flex flex-col">
         <DialogHeader>
-          <DialogTitle>
-            {instance ? "Edit Channel Instance" : "Create Channel Instance"}
-          </DialogTitle>
+          <DialogTitle>{dialogTitle}</DialogTitle>
+          {hasWizard && (
+            <p className="text-xs text-muted-foreground">
+              {t("form.step", { current: currentStepNum, total: totalSteps })}
+            </p>
+          )}
         </DialogHeader>
 
-        <div className="grid gap-4 py-2 overflow-y-auto min-h-0">
-          {/* Basic fields */}
-          <div className="grid gap-1.5">
-            <Label htmlFor="ci-name">Name *</Label>
-            <Input
-              id="ci-name"
-              value={name}
-              onChange={(e) => setName(slugify(e.target.value))}
-              placeholder="my-telegram-bot"
-              disabled={!!instance}
-            />
-            <p className="text-xs text-muted-foreground">
-              Unique slug used as channel identifier
-            </p>
-          </div>
+        {step === "form" && (
+          <ChannelInstanceFormStep
+            form={form}
+            instance={instance}
+            agents={agents}
+            credsValues={credsValues}
+            configValues={configValues}
+            onCredsChange={handleCredsChange}
+            onConfigChange={handleConfigChange}
+            setConfigValues={setConfigValues}
+            error={error}
+            loading={loading}
+            onCancel={() => onOpenChange(false)}
+            onSubmit={handleSubmit}
+            submitLabel={submitLabel}
+            onPortalCreateRequest={channelType === "bitrix24" ? () => {
+              setResumePortalName(undefined);
+              setPortalModalOpen(true);
+            } : undefined}
+            onPortalResumeAuthorize={channelType === "bitrix24" ? (portalName) => {
+              setResumePortalName(portalName);
+              setPortalModalOpen(true);
+            } : undefined}
+          />
+        )}
 
-          <div className="grid gap-1.5">
-            <Label htmlFor="ci-display">Display Name</Label>
-            <Input
-              id="ci-display"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Sales Bot"
-            />
-          </div>
+        {step === "auth" && createdInstanceId && AuthStep && (
+          <AuthStep
+            instanceId={createdInstanceId}
+            onComplete={() => setAuthCompleted(true)}
+            onSkip={handleSkipAuth}
+          />
+        )}
 
-          <div className="grid gap-1.5">
-            <Label>Channel Type *</Label>
-            <Select value={channelType} onValueChange={setChannelType} disabled={!!instance}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {CHANNEL_TYPES.map((ct) => (
-                  <SelectItem key={ct.value} value={ct.value}>
-                    {ct.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="grid gap-1.5">
-            <Label>Agent *</Label>
-            <Select value={agentId} onValueChange={setAgentId}>
-              <SelectTrigger>
-                <SelectValue placeholder="Select agent" />
-              </SelectTrigger>
-              <SelectContent>
-                {agents.map((a) => (
-                  <SelectItem key={a.id} value={a.id}>
-                    {a.display_name || a.agent_key}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Credentials section */}
-          {credsFields.length > 0 && (
-            <fieldset className="rounded-md border p-3 space-y-3">
-              <legend className="px-1 text-sm font-medium">
-                Credentials
-                {instance && (
-                  <span className="text-xs font-normal text-muted-foreground ml-1">
-                    (leave blank to keep current)
-                  </span>
-                )}
-              </legend>
-              <ChannelFields
-                fields={credsFields}
-                values={credsValues}
-                onChange={handleCredsChange}
-                idPrefix="ci-cred"
-                isEdit={!!instance}
+        {step === "config" && createdInstanceId && ConfigStep && (
+          <>
+            <div className="py-2 -mx-4 px-4 sm:-mx-6 sm:px-6 overflow-y-auto min-h-0">
+              <ConfigStep
+                instanceId={createdInstanceId}
+                authCompleted={authCompleted}
+                configValues={configValues}
+                onConfigChange={handleConfigChange}
               />
-              <p className="text-xs text-muted-foreground">
-                Encrypted server-side. Never returned in API responses.
-              </p>
-            </fieldset>
-          )}
-
-          {/* Config section */}
-          {cfgFields.length > 0 && (
-            <fieldset className="rounded-md border p-3 space-y-3">
-              <legend className="px-1 text-sm font-medium">Configuration</legend>
-              <ChannelFields
-                fields={cfgFields}
-                values={configValues}
-                onChange={handleConfigChange}
-                idPrefix="ci-cfg"
-              />
-            </fieldset>
-          )}
-
-          <div className="flex items-center gap-2">
-            <Switch id="ci-enabled" checked={enabled} onCheckedChange={setEnabled} />
-            <Label htmlFor="ci-enabled">Enabled</Label>
-          </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>
-            Cancel
-          </Button>
-          <Button onClick={handleSubmit} disabled={loading}>
-            {loading ? "Saving..." : instance ? "Update" : "Create"}
-          </Button>
-        </DialogFooter>
+              {error && <p className="text-sm text-destructive mt-2">{error}</p>}
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => onOpenChange(false)} disabled={loading}>{t("form.skip")}</Button>
+              <Button onClick={handleConfigDone} disabled={loading}>{loading ? t("form.saving") : t("form.done")}</Button>
+            </DialogFooter>
+          </>
+        )}
       </DialogContent>
+      {channelType === "bitrix24" && (
+        <BitrixPortalCreateModal
+          open={portalModalOpen}
+          onOpenChange={(v) => {
+            setPortalModalOpen(v);
+            if (!v) setResumePortalName(undefined);
+          }}
+          resumePortalName={resumePortalName}
+          onCreated={(portalName) => {
+            setPortalModalOpen(false);
+            setResumePortalName(undefined);
+            // Auto-select the just-installed (or resumed) portal in the channel form.
+            handleConfigChange("portal", portalName);
+          }}
+        />
+      )}
     </Dialog>
   );
 }

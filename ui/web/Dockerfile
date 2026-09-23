@@ -18,8 +18,9 @@ RUN pnpm build
 # ── Stage 2: Serve ──
 FROM nginx:1.27-alpine
 
-# Copy built assets
-COPY --from=builder /app/dist /usr/share/nginx/html
+# Copy built assets — force 0755 so the nginx worker (non-root) can read them
+# regardless of pnpm's build-time umask (see #761).
+COPY --chmod=0755 --from=builder /app/dist /usr/share/nginx/html
 
 # Copy nginx config
 COPY nginx.conf /etc/nginx/conf.d/default.conf
@@ -27,4 +28,4 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:80/ || exit 1
+    CMD wget -qO- http://127.0.0.1:80/ || exit 1

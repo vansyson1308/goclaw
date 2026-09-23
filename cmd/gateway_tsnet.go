@@ -4,6 +4,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,7 +45,6 @@ func initTailscale(ctx context.Context, cfg *config.Config, mux http.Handler) fu
 	}
 	if err != nil {
 		slog.Warn("Tailscale listener failed to start", "error", err)
-		srv.Close()
 		return nil
 	}
 
@@ -59,7 +59,7 @@ func initTailscale(ctx context.Context, cfg *config.Config, mux http.Handler) fu
 
 	httpSrv := &http.Server{Handler: mux}
 	go func() {
-		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Warn("Tailscale HTTP server error", "error", err)
 		}
 	}()

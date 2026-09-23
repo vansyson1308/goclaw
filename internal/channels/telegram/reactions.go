@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -40,15 +41,32 @@ var telegramSupportedEmojis = map[string]bool{
 // First emoji is preferred; fallback to next if chat restricts it.
 // Ref: TS src/telegram/status-reaction-variants.ts
 var statusReactionVariants = map[string][]string{
-	"queued":    {"👀", "👍", "🔥"},
+	"queued":    {"👀", "🙏", "🤝"},
 	"thinking":  {"🤔", "🤓", "👀"},
-	"tool":      {"🔥", "⚡", "👍"},
-	"coding":    {"👨\u200d💻", "🔥", "⚡"},
-	"web":       {"⚡", "🔥", "👍"},
+	"tool":      {"✍", "⚡", "🔥"},
+	"coding":    {"👨\u200d💻", "✍", "🤓"},
+	"web":       {"⚡", "🌚", "🔥"},
 	"done":      {"👍", "🎉", "💯"},
-	"error":     {"😱", "😨", "🤯"},
-	"stallSoft": {"🥱", "😴", "🤔"},
-	"stallHard": {"😨", "😱", "⚡"},
+	"error":     {"💔", "😱", "😨"},
+	"stallSoft": {"🥱", "😴", "😐"},
+	"stallHard": {"😨", "🤯", "😱"},
+}
+
+// ReactionLegend returns the primary emoji for each status, used by the /reactions command.
+var reactionLegend = []struct {
+	Status string
+	Emoji  string
+	Desc   string
+}{
+	{"queued", "👀", "Queued — waiting to process"},
+	{"thinking", "🤔", "Thinking — processing your request"},
+	{"tool", "✍", "Tool — executing a tool"},
+	{"coding", "👨\u200d💻", "Coding — running code"},
+	{"web", "⚡", "Web — browsing / API call"},
+	{"done", "👍", "Done — completed"},
+	{"error", "💔", "Error — something went wrong"},
+	{"stallSoft", "🥱", "Stall — no activity for 10s"},
+	{"stallHard", "😨", "Stall — no activity for 30s"},
 }
 
 // resolveReactionEmoji picks the first supported emoji for a given status.
@@ -136,7 +154,7 @@ func (rc *StatusReactionController) SetStatus(ctx context.Context, status string
 
 		emoji := resolveReactionEmoji(rc.lastStatus, nil)
 		if emoji != "" {
-			rc.applyReaction(ctx, emoji)
+			rc.applyReaction(context.Background(), emoji)
 		}
 	})
 }
@@ -179,7 +197,7 @@ func (rc *StatusReactionController) applyReaction(ctx context.Context, emoji str
 }
 
 // resetStallTimer resets the stall detection timer (must hold mu lock).
-func (rc *StatusReactionController) resetStallTimer(ctx context.Context) {
+func (rc *StatusReactionController) resetStallTimer(_ context.Context) {
 	rc.cancelStall()
 
 	rc.stallTimer = time.AfterFunc(stallSoftMs, func() {
@@ -192,7 +210,7 @@ func (rc *StatusReactionController) resetStallTimer(ctx context.Context) {
 
 		emoji := resolveReactionEmoji("stallSoft", nil)
 		if emoji != "" {
-			rc.applyReaction(ctx, emoji)
+			rc.applyReaction(context.Background(), emoji)
 		}
 
 		// Schedule hard stall
@@ -206,7 +224,7 @@ func (rc *StatusReactionController) resetStallTimer(ctx context.Context) {
 
 			emoji := resolveReactionEmoji("stallHard", nil)
 			if emoji != "" {
-				rc.applyReaction(ctx, emoji)
+				rc.applyReaction(context.Background(), emoji)
 			}
 		})
 	})
@@ -231,9 +249,9 @@ func (rc *StatusReactionController) cancelStall() {
 // --- ReactionChannel implementation ---
 
 // OnReactionEvent handles agent status change events and updates the reaction emoji.
-// messageID is the original user message that triggered the agent run.
+// messageID is the original user message that triggered the agent run (string for cross-platform compat).
 // chatID here is the localKey (composite key with :topic:N suffix for forum topics).
-func (c *Channel) OnReactionEvent(ctx context.Context, chatID string, messageID int, status string) error {
+func (c *Channel) OnReactionEvent(ctx context.Context, chatID string, messageID string, status string) error {
 	if c.config.ReactionLevel == "" || c.config.ReactionLevel == "off" {
 		return nil
 	}
@@ -243,6 +261,11 @@ func (c *Channel) OnReactionEvent(ctx context.Context, chatID string, messageID 
 		return nil
 	}
 
+	msgID, err := strconv.Atoi(messageID)
+	if err != nil || msgID == 0 {
+		return nil // not a Telegram message ID
+	}
+
 	id, err := parseRawChatID(chatID)
 	if err != nil {
 		return err
@@ -250,9 +273,12 @@ func (c *Channel) OnReactionEvent(ctx context.Context, chatID string, messageID 
 
 	// Get or create reaction controller for this message.
 	// Key by messageID so concurrent runs in the same chat don't clash.
-	key := fmt.Sprintf("%s:%d", chatID, messageID)
-	val, _ := c.reactions.LoadOrStore(key, newStatusReactionController(c.bot, id, messageID))
-	rc := val.(*StatusReactionController)
+	key := fmt.Sprintf("%s:%s", chatID, messageID)
+	val, _ := c.reactions.LoadOrStore(key, newStatusReactionController(c.bot, id, msgID))
+	rc, ok := val.(*StatusReactionController)
+	if !ok {
+		return nil
+	}
 
 	rc.SetStatus(ctx, status)
 
@@ -265,23 +291,29 @@ func (c *Channel) OnReactionEvent(ctx context.Context, chatID string, messageID 
 }
 
 // ClearReaction removes the reaction from a message.
-func (c *Channel) ClearReaction(ctx context.Context, chatID string, messageID int) error {
+func (c *Channel) ClearReaction(ctx context.Context, chatID string, messageID string) error {
+	msgID, err := strconv.Atoi(messageID)
+	if err != nil || msgID == 0 {
+		return nil
+	}
+
 	id, err := parseRawChatID(chatID)
 	if err != nil {
 		return err
 	}
 
 	// Stop and remove controller if exists
-	key := fmt.Sprintf("%s:%d", chatID, messageID)
+	key := fmt.Sprintf("%s:%s", chatID, messageID)
 	if val, ok := c.reactions.LoadAndDelete(key); ok {
-		rc := val.(*StatusReactionController)
-		rc.Stop()
+		if rc, ok := val.(*StatusReactionController); ok {
+			rc.Stop()
+		}
 	}
 
 	// Clear reaction on the message
 	return c.bot.SetMessageReaction(ctx, &telego.SetMessageReactionParams{
 		ChatID:    tu.ID(id),
-		MessageID: messageID,
+		MessageID: msgID,
 		Reaction:  []telego.ReactionType{},
 	})
 }

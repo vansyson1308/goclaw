@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { Plus, Trash2, Users } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
+import { Combobox } from "@/components/ui/combobox";
 import {
   Select,
   SelectContent,
@@ -13,15 +14,18 @@ import {
 } from "@/components/ui/select";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { useHttp } from "@/hooks/use-ws";
-import type { AgentShareData } from "@/types/agent";
+import { useContactPicker } from "@/hooks/use-contact-picker";
+import { useContactResolver } from "@/hooks/use-contact-resolver";
+import { useAgentShares } from "../hooks/use-agent-shares";
+import type { ChannelContact } from "@/types/contact";
 
 interface AgentSharesTabProps {
   agentId: string;
 }
 
 const ROLE_OPTIONS = [
-  { value: "user", label: "User", description: "Can use the agent and chat" },
-  { value: "viewer", label: "Viewer", description: "Read-only access" },
+  { value: "user" },
+  { value: "viewer" },
 ] as const;
 
 function roleBadgeVariant(role: string) {
@@ -33,41 +37,41 @@ function roleBadgeVariant(role: string) {
 }
 
 export function AgentSharesTab({ agentId }: AgentSharesTabProps) {
+  const { t } = useTranslation("agents");
   const http = useHttp();
-  const [shares, setShares] = useState<AgentShareData[]>([]);
-  const [loading, setLoading] = useState(false);
+  const { shares, loading, addShare, revokeShare } = useAgentShares(agentId);
   const [newUserId, setNewUserId] = useState("");
   const [newRole, setNewRole] = useState("user");
   const [revokeTarget, setRevokeTarget] = useState<string | null>(null);
 
-  const loadShares = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await http.get<{ shares: AgentShareData[] }>(
-        `/v1/agents/${agentId}/shares`,
-      );
-      setShares(res.shares ?? []);
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
-  }, [http, agentId]);
+  // Contact picker for the add form
+  const listContacts = useCallback(
+    async (search: string): Promise<ChannelContact[]> => {
+      const res = await http.get<{ contacts: ChannelContact[] }>("/v1/contacts", {
+        search,
+        limit: "20",
+      });
+      return res.contacts ?? [];
+    },
+    [http],
+  );
+  const { options, searchContacts } = useContactPicker(listContacts);
 
-  useEffect(() => {
-    loadShares();
-  }, [loadShares]);
+  // Resolve display names for existing shares
+  const shareUserIDs = useMemo(() => shares.map((s) => s.user_id), [shares]);
+  const { resolve } = useContactResolver(shareUserIDs);
 
-  const addShare = async () => {
+  const handleUserIdChange = (val: string) => {
+    setNewUserId(val);
+    searchContacts(val);
+  };
+
+  const handleAddShare = async () => {
     if (!newUserId.trim()) return;
     try {
-      await http.post(`/v1/agents/${agentId}/shares`, {
-        user_id: newUserId.trim(),
-        role: newRole,
-      });
+      await addShare(newUserId.trim(), newRole);
       setNewUserId("");
       setNewRole("user");
-      loadShares();
     } catch {
       // ignore
     }
@@ -77,22 +81,19 @@ export function AgentSharesTab({ agentId }: AgentSharesTabProps) {
     <div className="max-w-2xl space-y-6">
       {/* Add share form */}
       <div className="rounded-lg border p-4">
-        <h3 className="mb-3 text-sm font-medium">Grant Access</h3>
-        <div className="flex items-end gap-3">
+        <h3 className="mb-3 text-sm font-medium">{t("shares.grantAccess")}</h3>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
           <div className="flex-1 space-y-1.5">
-            <Label htmlFor="shareUserId">User ID</Label>
-            <Input
-              id="shareUserId"
+            <Label htmlFor="shareUserId">{t("shares.userId")}</Label>
+            <Combobox
               value={newUserId}
-              onChange={(e) => setNewUserId(e.target.value)}
-              placeholder="Enter user ID..."
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && newUserId.trim()) addShare();
-              }}
+              onChange={handleUserIdChange}
+              options={options}
+              placeholder={t("shares.userIdPlaceholder")}
             />
           </div>
-          <div className="w-36 space-y-1.5">
-            <Label>Role</Label>
+          <div className="w-full space-y-1.5 sm:w-36">
+            <Label>{t("shares.role")}</Label>
             <Select value={newRole} onValueChange={setNewRole}>
               <SelectTrigger>
                 <SelectValue />
@@ -100,76 +101,91 @@ export function AgentSharesTab({ agentId }: AgentSharesTabProps) {
               <SelectContent>
                 {ROLE_OPTIONS.map((opt) => (
                   <SelectItem key={opt.value} value={opt.value}>
-                    {opt.label}
+                    {t(`shares.role.${opt.value}`)}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </div>
-          <Button onClick={addShare} disabled={!newUserId.trim()} className="gap-1.5">
+          <Button onClick={handleAddShare} disabled={!newUserId.trim()} className="gap-1.5">
             <Plus className="h-4 w-4" />
-            Share
+            {t("shares.share")}
           </Button>
         </div>
       </div>
 
       {/* Share list */}
       {loading && shares.length === 0 ? (
-        <div className="py-8 text-center text-sm text-muted-foreground">Loading shares...</div>
+        <div className="py-8 text-center text-sm text-muted-foreground">{t("shares.loadingShares")}</div>
       ) : shares.length === 0 ? (
         <div className="flex flex-col items-center gap-2 py-8 text-center">
           <Users className="h-8 w-8 text-muted-foreground/50" />
-          <p className="text-sm text-muted-foreground">No shares yet</p>
+          <p className="text-sm text-muted-foreground">{t("shares.noShares")}</p>
           <p className="text-xs text-muted-foreground">
-            Share this agent with other users by entering their User ID above.
+            {t("shares.noSharesDesc")}
           </p>
         </div>
       ) : (
-        <div className="rounded-lg border">
-          <div className="grid grid-cols-[1fr_100px_48px] items-center gap-2 border-b bg-muted/50 px-4 py-2.5 text-xs font-medium text-muted-foreground">
-            <span>User</span>
-            <span>Role</span>
+        <div className="overflow-x-auto rounded-lg border">
+          <div className="grid min-w-[300px] grid-cols-[1fr_100px_48px] items-center gap-2 border-b bg-muted/50 px-4 py-2.5 text-xs font-medium text-muted-foreground">
+            <span>{t("shares.user")}</span>
+            <span>{t("shares.role")}</span>
             <span />
           </div>
-          {shares.map((share) => (
-            <div
-              key={share.user_id}
-              className="grid grid-cols-[1fr_100px_48px] items-center gap-2 border-b px-4 py-3 last:border-0"
-            >
-              <div>
-                <span className="text-sm font-medium">{share.user_id}</span>
-                {share.granted_by && (
-                  <span className="ml-2 text-xs text-muted-foreground">
-                    by {share.granted_by}
-                  </span>
-                )}
-              </div>
-              <Badge variant={roleBadgeVariant(share.role)}>{share.role}</Badge>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="h-8 w-8"
-                onClick={() => setRevokeTarget(share.user_id)}
+          {shares.map((share) => {
+            const contact = resolve(share.user_id);
+            const contactByGrant = share.granted_by ? resolve(share.granted_by) : null;
+            return (
+              <div
+                key={share.user_id}
+                className="grid min-w-[300px] grid-cols-[1fr_100px_48px] items-center gap-2 border-b px-4 py-3 last:border-0"
               >
-                <Trash2 className="h-3.5 w-3.5 text-destructive" />
-              </Button>
-            </div>
-          ))}
+                <div>
+                  <span className="text-sm font-medium">
+                    {contact?.display_name ?? share.user_id}
+                  </span>
+                  {contact?.display_name && (
+                    <span className="ml-1.5 text-xs text-muted-foreground font-mono">
+                      {share.user_id}
+                    </span>
+                  )}
+                  {contact?.username && (
+                    <span className="ml-1.5 text-xs text-muted-foreground">
+                      @{contact.username}
+                    </span>
+                  )}
+                  {share.granted_by && (
+                    <span className="ml-2 text-xs text-muted-foreground">
+                      by {contactByGrant?.display_name ?? share.granted_by}
+                    </span>
+                  )}
+                </div>
+                <Badge variant={roleBadgeVariant(share.role)}>{share.role}</Badge>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => setRevokeTarget(share.user_id)}
+                >
+                  <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                </Button>
+              </div>
+            );
+          })}
         </div>
       )}
 
       <ConfirmDialog
         open={!!revokeTarget}
         onOpenChange={() => setRevokeTarget(null)}
-        title="Revoke Share"
-        description={`Revoke access for user "${revokeTarget}"? They will no longer be able to use this agent.`}
-        confirmLabel="Revoke"
+        title={t("shares.revokeTitle")}
+        description={t("shares.revokeDesc", { userId: revokeTarget })}
+        confirmLabel={t("shares.revoke")}
         variant="destructive"
         onConfirm={async () => {
           if (revokeTarget) {
             try {
-              await http.delete(`/v1/agents/${agentId}/shares/${revokeTarget}`);
-              loadShares();
+              await revokeShare(revokeTarget);
             } catch {
               // ignore
             }

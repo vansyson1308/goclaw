@@ -1,101 +1,85 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import i18next from "i18next";
 import { useHttp } from "@/hooks/use-ws";
+import { queryKeys } from "@/lib/query-keys";
+import { toast } from "@/stores/use-toast-store";
+import type { MCPServerData, MCPServerInput, MCPAgentGrant, MCPToolInfo, MCPUserCredentialStatus, MCPUserCredentialInput, MCPOAuthStatus } from "@/types/mcp";
 
-export interface MCPServerData {
-  id: string;
-  name: string;
-  display_name: string;
-  transport: "stdio" | "sse" | "streamable-http";
-  command: string;
-  args: string[] | null;
-  url: string;
-  headers: Record<string, string> | null;
-  env: Record<string, string> | null;
-  tool_prefix: string;
-  timeout_sec: number;
-  enabled: boolean;
-  created_by: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface MCPServerInput {
-  name: string;
-  display_name?: string;
-  transport: string;
-  command?: string;
-  args?: string[];
-  url?: string;
-  headers?: Record<string, string>;
-  tool_prefix?: string;
-  timeout_sec?: number;
-  enabled?: boolean;
-}
-
-export interface MCPAgentGrant {
-  id: string;
-  server_id: string;
-  agent_id: string;
-  enabled: boolean;
-  tool_allow: string[] | null;
-  tool_deny: string[] | null;
-  granted_by: string;
-  created_at: string;
-}
+export type { MCPServerData, MCPServerInput, MCPAgentGrant, MCPToolInfo, MCPUserCredentialStatus, MCPUserCredentialInput, MCPOAuthStatus };
 
 export function useMCP() {
   const http = useHttp();
-  const [servers, setServers] = useState<MCPServerData[]>([]);
-  const [loading, setLoading] = useState(false);
+  const queryClient = useQueryClient();
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
+  const { data: servers = [], isLoading: loading, isFetching: fetching } = useQuery({
+    queryKey: queryKeys.mcp.all,
+    queryFn: async () => {
       const res = await http.get<{ servers: MCPServerData[] }>("/v1/mcp/servers");
-      setServers(res.servers ?? []);
-    } catch {
-      // ignore
-    } finally {
-      setLoading(false);
-    }
-  }, [http]);
+      return res.servers ?? [];
+    },
+    staleTime: 60_000,
+  });
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  const invalidate = useCallback(
+    () => queryClient.invalidateQueries({ queryKey: queryKeys.mcp.all }),
+    [queryClient],
+  );
 
   const createServer = useCallback(
     async (data: MCPServerInput) => {
-      const res = await http.post<MCPServerData>("/v1/mcp/servers", data);
-      await load();
-      return res;
+      try {
+        const res = await http.post<MCPServerData>("/v1/mcp/servers", data);
+        await invalidate();
+        toast.success(i18next.t("mcp:toast.created"));
+        return res;
+      } catch (err) {
+        toast.error(i18next.t("mcp:toast.failedCreate"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
-    [http, load],
+    [http, invalidate],
   );
 
   const updateServer = useCallback(
     async (id: string, data: Partial<MCPServerInput>) => {
-      await http.put(`/v1/mcp/servers/${id}`, data);
-      await load();
+      try {
+        if (data.enabled !== undefined) {
+          queryClient.setQueryData<MCPServerData[]>(queryKeys.mcp.all, (old) =>
+            old?.map((s) => (s.id === id ? { ...s, enabled: data.enabled! } : s)),
+          );
+        }
+        await http.put(`/v1/mcp/servers/${id}`, data);
+        await invalidate();
+        toast.success(i18next.t("mcp:toast.updated"));
+      } catch (err) {
+        toast.error(i18next.t("mcp:toast.failedUpdate"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
-    [http, load],
+    [http, invalidate],
   );
 
   const deleteServer = useCallback(
     async (id: string) => {
-      await http.delete(`/v1/mcp/servers/${id}`);
-      await load();
+      try {
+        await http.delete(`/v1/mcp/servers/${id}`);
+        await invalidate();
+        toast.success(i18next.t("mcp:toast.deleted"));
+      } catch (err) {
+        toast.error(i18next.t("mcp:toast.failedDelete"), err instanceof Error ? err.message : "");
+        throw err;
+      }
     },
-    [http, load],
+    [http, invalidate],
   );
 
   const listAgentGrants = useCallback(
-    async (_serverId: string) => {
-      // Backend provides per-agent listing, not per-server.
-      // Grants dialog handles this by accepting agent IDs.
-      return [] as MCPAgentGrant[];
+    async (serverId: string) => {
+      const res = await http.get<{ grants: MCPAgentGrant[] }>(`/v1/mcp/servers/${serverId}/grants`);
+      return res.grants ?? [];
     },
-    [],
+    [http],
   );
 
   const grantAgent = useCallback(
@@ -124,10 +108,89 @@ export function useMCP() {
     [http],
   );
 
+  const testConnection = useCallback(
+    async (data: { server_id?: string; transport: string; command?: string; args?: string[]; url?: string; headers?: Record<string, string>; env?: Record<string, string> }) => {
+      return http.post<{ success: boolean; tool_count?: number; error?: string }>("/v1/mcp/servers/test", data);
+    },
+    [http],
+  );
+
+  const reconnectServer = useCallback(
+    async (id: string) => {
+      try {
+        await http.post(`/v1/mcp/servers/${id}/reconnect`, {});
+        toast.success(i18next.t("mcp:toast.reconnected"));
+      } catch (err) {
+        toast.error(i18next.t("mcp:toast.failedReconnect"), err instanceof Error ? err.message : "");
+        throw err;
+      }
+    },
+    [http],
+  );
+
+  const listServerTools = useCallback(
+    async (serverId: string) => {
+      const res = await http.get<{ tools: MCPToolInfo[] }>(`/v1/mcp/servers/${serverId}/tools`);
+      return res.tools ?? [];
+    },
+    [http],
+  );
+
+  const getUserCredentials = useCallback(
+    async (serverId: string, userId?: string) => {
+      const qs = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+      return http.get<MCPUserCredentialStatus>(`/v1/mcp/servers/${serverId}/user-credentials${qs}`);
+    },
+    [http],
+  );
+
+  const setUserCredentials = useCallback(
+    async (serverId: string, creds: MCPUserCredentialInput, userId?: string) => {
+      const qs = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+      await http.put(`/v1/mcp/servers/${serverId}/user-credentials${qs}`, creds);
+    },
+    [http],
+  );
+
+  const deleteUserCredentials = useCallback(
+    async (serverId: string, userId?: string) => {
+      const qs = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+      await http.delete(`/v1/mcp/servers/${serverId}/user-credentials${qs}`);
+    },
+    [http],
+  );
+
+  const startOAuth = useCallback(
+    async (serverId: string, mcpUrl: string, userId?: string) => {
+      return http.post<{ auth_url: string; state: string; client_id: string; issuer: string; completed?: boolean }>(
+        "/v1/mcp/oauth/start",
+        { server_id: serverId, mcp_url: mcpUrl, user_id: userId ?? "" },
+      );
+    },
+    [http],
+  );
+
+  const getOAuthStatus = useCallback(
+    async (serverId: string, userId?: string) => {
+      const qs = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+      return http.get<MCPOAuthStatus>(`/v1/mcp/oauth/status/${serverId}${qs}`);
+    },
+    [http],
+  );
+
+  const revokeOAuth = useCallback(
+    async (serverId: string, userId?: string) => {
+      const qs = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
+      await http.delete(`/v1/mcp/oauth/token/${serverId}${qs}`);
+    },
+    [http],
+  );
+
   return {
     servers,
     loading,
-    refresh: load,
+    fetching,
+    refresh: invalidate,
     createServer,
     updateServer,
     deleteServer,
@@ -135,5 +198,14 @@ export function useMCP() {
     grantAgent,
     revokeAgent,
     listGrantsByAgent,
+    testConnection,
+    reconnectServer,
+    listServerTools,
+    getUserCredentials,
+    setUserCredentials,
+    deleteUserCredentials,
+    startOAuth,
+    getOAuthStatus,
+    revokeOAuth,
   };
 }

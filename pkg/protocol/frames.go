@@ -30,27 +30,27 @@ type RequestFrame struct {
 
 // ResponseFrame is sent by the server in response to a request.
 type ResponseFrame struct {
-	Type    string      `json:"type"`          // always "res"
-	ID      string      `json:"id"`            // matches request ID
-	OK      bool        `json:"ok"`            // true if success
-	Payload interface{} `json:"payload,omitempty"` // response data (when ok=true)
+	Type    string      `json:"type"`              // always "res"
+	ID      string      `json:"id"`                // matches request ID
+	OK      bool        `json:"ok"`                // true if success
+	Payload any         `json:"payload,omitempty"` // response data (when ok=true)
 	Error   *ErrorShape `json:"error,omitempty"`   // error info (when ok=false)
 }
 
 // ErrorShape describes a protocol error.
 type ErrorShape struct {
-	Code         string      `json:"code"`
-	Message      string      `json:"message"`
-	Details      interface{} `json:"details,omitempty"`
-	Retryable    bool        `json:"retryable,omitempty"`
-	RetryAfterMs int         `json:"retryAfterMs,omitempty"`
+	Code         string `json:"code"`
+	Message      string `json:"message"`
+	Details      any    `json:"details,omitempty"`
+	Retryable    bool   `json:"retryable,omitempty"`
+	RetryAfterMs int    `json:"retryAfterMs,omitempty"`
 }
 
 // EventFrame is pushed from server to client without a preceding request.
 type EventFrame struct {
 	Type         string        `json:"type"`                   // always "event"
 	Event        string        `json:"event"`                  // event name
-	Payload      interface{}   `json:"payload,omitempty"`      // event data
+	Payload      any           `json:"payload,omitempty"`      // event data
 	Seq          int64         `json:"seq,omitempty"`          // ordering sequence number
 	StateVersion *StateVersion `json:"stateVersion,omitempty"` // version counters for state sync
 }
@@ -62,7 +62,7 @@ type StateVersion struct {
 }
 
 // NewOKResponse creates a success response frame.
-func NewOKResponse(id string, payload interface{}) *ResponseFrame {
+func NewOKResponse(id string, payload any) *ResponseFrame {
 	return &ResponseFrame{
 		Type:    FrameTypeResponse,
 		ID:      id,
@@ -85,7 +85,7 @@ func NewErrorResponse(id string, code, message string) *ResponseFrame {
 }
 
 // NewEvent creates an event frame.
-func NewEvent(event string, payload interface{}) *EventFrame {
+func NewEvent(event string, payload any) *EventFrame {
 	return &EventFrame{
 		Type:    FrameTypeEvent,
 		Event:   event,

@@ -1,0 +1,89 @@
+{
+  "title": "Missions",
+  "description": "Give an agent an objective with acceptance checks. Success is judged by the checks, not by what the agent says.",
+  "newMission": "New mission",
+  "disabledTitle": "Missions are disabled on this gateway",
+  "disabledHint": "Set GOCLAW_MISSIONS=1 (and GOCLAW_MISSIONS_SOURCE_ROOT) and restart the gateway. Verifier commands run on the host executor.",
+  "emptyTitle": "No missions yet",
+  "emptyDescription": "Create a mission from a contract to see verified results here.",
+  "col": {
+    "status": "Status",
+    "title": "Mission",
+    "agent": "Agent",
+    "created": "Created",
+    "cost": "Cost"
+  },
+  "costUnknown": "unknown",
+  "status": {
+    "planned": "Planned",
+    "preparing": "Preparing",
+    "running": "Running",
+    "verifying": "Verifying",
+    "succeeded": "Succeeded",
+    "partial": "Partial",
+    "failed": "Failed",
+    "blocked": "Blocked",
+    "cancelled": "Cancelled"
+  },
+  "result": {
+    "pass": "pass",
+    "fail": "fail",
+    "error": "error"
+  },
+  "create": {
+    "title": "New mission",
+    "hint": "Paste or edit a mission contract (JSON). Paths are relative to the gateway's mission source root.",
+    "contractLabel": "Mission contract JSON",
+    "invalidJson": "Not valid JSON: {{error}}",
+    "created": "Mission started",
+    "creating": "Starting…",
+    "submit": "Start mission"
+  },
+  "common": {
+    "cancel": "Cancel",
+    "back": "Back"
+  },
+  "detail": {
+    "back": "All missions",
+    "notFound": "Mission not found",
+    "inProgress": "in progress",
+    "cancel": "Cancel mission",
+    "tokens": "Tokens (in / out)",
+    "cost": "Cost",
+    "executor": "Verifier executor",
+    "finished": "Finished",
+    "criteria": "Acceptance criteria",
+    "criteriaPending": "Checks run after the agent finishes.",
+    "criteriaNone": "No checks were evaluated.",
+    "changedFiles": "Changed files",
+    "noChanges": "No file changes.",
+    "diff": "Diff",
+    "diffTruncated": "Diff truncated (256 KiB limit).",
+    "summary": "Agent summary",
+    "summaryHint": "The agent's own narrative. It is not evidence; the checks above are.",
+    "events": "Timeline",
+    "confirmCancel": "Cancel this mission?",
+    "confirmCancelHint": "The agent run is stopped and the mission is marked cancelled.",
+    "cancelled": "Mission cancelled",
+    "provesChange": "proves change",
+    "baseline": "baseline: {{status}}",
+    "expectedTest": "expected test {{name}}: {{status}}",
+    "attempt": "Attempt",
+    "usageIncomplete": "An attempt ended without reporting its usage (for example the gateway restarted), so token and cost totals are a lower bound.",
+    "toolCalls": "Tool calls",
+    "toolCallsHint": "Recorded before each call ran. \"Started\" without an outcome means the result was never acknowledged.",
+    "noToolCalls": "No tool calls recorded.",
+    "receiptAttempt": "#",
+    "receiptTool": "Tool",
+    "receiptClass": "Class",
+    "receiptStatus": "Result",
+    "receiptDuration": "Duration"
+  },
+  "costAtLeast": "at least {{value}}",
+  "receipt": {
+    "denied": "denied",
+    "started": "started (no outcome)",
+    "ok": "ok",
+    "error": "error"
+  }
+}

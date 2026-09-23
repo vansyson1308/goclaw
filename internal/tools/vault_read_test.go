@@ -1,0 +1,1165 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+)
+
+// fakeVaultStore embeds store.VaultStore (nil) so the struct satisfies the
+// interface at compile time. Methods used by vault_read.Execute are
+// implemented; others would nil-panic if called.
+type fakeVaultStore struct {
+	store.VaultStore
+	byID       map[string]*store.VaultDocument // key: tenantID + ":" + docID
+	outlinks   map[string][]store.VaultLink    // key: tenantID + ":" + docID
+	outLinkErr error                           // injected error for GetOutLinks
+	targetsErr error                           // injected error for GetDocumentsByIDs
+}
+
+func (f *fakeVaultStore) GetDocumentByID(ctx context.Context, tenantID, id string) (*store.VaultDocument, error) {
+	if f.byID == nil {
+		return nil, os.ErrNotExist
+	}
+	doc, ok := f.byID[tenantID+":"+id]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return doc, nil
+}
+
+func (f *fakeVaultStore) GetOutLinks(ctx context.Context, tenantID, docID string) ([]store.VaultLink, error) {
+	if f.outLinkErr != nil {
+		return nil, f.outLinkErr
+	}
+	if f.outlinks == nil {
+		return nil, nil
+	}
+	return f.outlinks[tenantID+":"+docID], nil
+}
+
+func (f *fakeVaultStore) GetDocumentsByIDs(ctx context.Context, tenantID string, docIDs []string) ([]store.VaultDocument, error) {
+	if f.targetsErr != nil {
+		return nil, f.targetsErr
+	}
+	out := make([]store.VaultDocument, 0, len(docIDs))
+	for _, id := range docIDs {
+		if d, ok := f.byID[tenantID+":"+id]; ok {
+			out = append(out, *d)
+		}
+	}
+	return out, nil
+}
+
+// newVaultReadTestTool builds a VaultReadTool with a temp workspace and a
+// fake store pre-seeded with docs.
+//
+// The tool is given the GLOBAL workspace root, mirroring boot wiring. The
+// returned path is the TENANT-scoped root of the first seeded doc — the
+// directory the tool resolves per request, and therefore where test content
+// must be written. Tests set no slug on the context, so the tenant directory
+// is UUID-named (see config.TenantWorkspace).
+func newVaultReadTestTool(t *testing.T, docs ...*store.VaultDocument) (*VaultReadTool, string) {
+	t.Helper()
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: make(map[string]*store.VaultDocument)}
+	for _, d := range docs {
+		fake.byID[d.TenantID+":"+d.ID] = d
+	}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+
+	contentRoot := base
+	if len(docs) > 0 {
+		if tid, err := uuid.Parse(docs[0].TenantID); err == nil {
+			contentRoot = config.TenantWorkspace(base, tid, "")
+		}
+	}
+	return tool, contentRoot
+}
+
+// writeFile creates a file under workspace with the given relative path.
+func writeFile(t *testing.T, ws, rel, content string) {
+	t.Helper()
+	full := filepath.Join(ws, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// writeBytes creates a file with raw bytes (for binary content tests).
+func writeBytes(t *testing.T, ws, rel string, b []byte) {
+	t.Helper()
+	full := filepath.Join(ws, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(full, b, 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+func makeCtx(tenantID, agentID uuid.UUID) context.Context {
+	ctx := context.Background()
+	if tenantID != uuid.Nil {
+		ctx = store.WithTenantID(ctx, tenantID)
+	}
+	if agentID != uuid.Nil {
+		ctx = store.WithAgentID(ctx, agentID)
+	}
+	return ctx
+}
+
+func makeCtxWithTeam(tenantID, agentID uuid.UUID, teamID string) context.Context {
+	ctx := makeCtx(tenantID, agentID)
+	return store.WithRunContext(ctx, &store.RunContext{
+		TenantID: tenantID,
+		AgentID:  agentID,
+		TeamID:   teamID,
+	})
+}
+
+// --- 1. shared scope → allow, content returned. ---
+func TestVaultRead_SharedScope_Allow(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "shared/notes.md", Title: "Notes",
+		DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "shared/notes.md", "hello world")
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "hello world") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "Notes") {
+		t.Fatalf("title missing: %s", res.ForLLM)
+	}
+}
+
+// --- 2. personal scope, AgentID matches ctx → allow. ---
+func TestVaultRead_PersonalScope_Match_Allow(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	aid := agentID.String()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		AgentID: &aid, Scope: "personal", Path: "memo.md",
+		Title: "Memo", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "memo.md", "personal body")
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "personal body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// --- 3. personal scope, AgentID mismatch → deny. ---
+func TestVaultRead_PersonalScope_Mismatch_Deny(t *testing.T) {
+	tenantID := uuid.New()
+	agentA := uuid.New()
+	agentB := uuid.New()
+	docID := uuid.New()
+	aid := agentA.String()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		AgentID: &aid, Scope: "personal", Path: "memo.md",
+		Title: "Memo", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "memo.md", "personal body")
+
+	res := tool.Execute(makeCtx(tenantID, agentB),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "not accessible") {
+		t.Fatalf("expected access denied, got: %s", res.ForLLM)
+	}
+}
+
+// --- 4. team scope, RunContext.TeamID matches → allow. ---
+func TestVaultRead_TeamScope_Match_Allow(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	teamID := uuid.New().String()
+	tid := teamID
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		TeamID: &tid, Scope: "team", Path: "team/doc.md",
+		Title: "Team Doc", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "team/doc.md", "team body")
+
+	res := tool.Execute(makeCtxWithTeam(tenantID, agentID, teamID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "team body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// --- 5. team scope, no run-context / mismatch → deny. ---
+func TestVaultRead_TeamScope_NoContext_Deny(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	tid := uuid.New().String()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		TeamID: &tid, Scope: "team", Path: "team/doc.md",
+		Title: "Team Doc", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "team/doc.md", "team body")
+
+	// no team in ctx.
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError {
+		t.Fatalf("expected deny, got: %s", res.ForLLM)
+	}
+
+	// mismatched team in ctx.
+	res2 := tool.Execute(makeCtxWithTeam(tenantID, agentID, uuid.New().String()),
+		map[string]any{"doc_id": docID.String()})
+	if !res2.IsError {
+		t.Fatalf("expected deny on mismatch, got: %s", res2.ForLLM)
+	}
+}
+
+// --- 5a. isolated team, cross-chat doc → deny. ---
+func TestVaultRead_TeamScope_IsolatedCrossChat_Deny(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	teamID := uuid.New().String()
+	tid := teamID
+	chatA := "chatA"
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		TeamID: &tid, ChatID: &chatA,
+		Scope: "team", Path: "team/doc.md",
+		Title: "Team Doc", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "team/doc.md", "team body")
+
+	// Caller bound to chatB in isolated team → deny.
+	ctx := store.WithRunContext(
+		makeCtx(tenantID, agentID),
+		&store.RunContext{
+			TenantID: tenantID, AgentID: agentID,
+			TeamID: teamID, TeamIsolated: true, WorkspaceChatID: "chatB",
+		})
+	res := tool.Execute(ctx, map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "not accessible") {
+		t.Fatalf("expected cross-chat deny, got: %s", res.ForLLM)
+	}
+}
+
+// --- 5b. isolated team, same-chat doc → allow. ---
+func TestVaultRead_TeamScope_IsolatedSameChat_Allow(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	teamID := uuid.New().String()
+	tid := teamID
+	chatA := "chatA"
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		TeamID: &tid, ChatID: &chatA,
+		Scope: "team", Path: "team/doc.md",
+		Title: "Team Doc", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "team/doc.md", "team body")
+
+	ctx := store.WithRunContext(
+		makeCtx(tenantID, agentID),
+		&store.RunContext{
+			TenantID: tenantID, AgentID: agentID,
+			TeamID: teamID, TeamIsolated: true, WorkspaceChatID: "chatA",
+		})
+	res := tool.Execute(ctx, map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("expected allow for same-chat, got error: %s", res.ForLLM)
+	}
+}
+
+// --- 5c. isolated team, team-wide doc (chat_id NULL) → allow regardless of chat. ---
+func TestVaultRead_TeamScope_IsolatedTeamWide_Allow(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	teamID := uuid.New().String()
+	tid := teamID
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		TeamID: &tid, ChatID: nil, // team-wide
+		Scope: "team", Path: "team/doc.md",
+		Title: "Team Doc", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "team/doc.md", "team body")
+
+	ctx := store.WithRunContext(
+		makeCtx(tenantID, agentID),
+		&store.RunContext{
+			TenantID: tenantID, AgentID: agentID,
+			TeamID: teamID, TeamIsolated: true, WorkspaceChatID: "chatZ",
+		})
+	res := tool.Execute(ctx, map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("team-wide doc should be accessible in isolated team, got: %s", res.ForLLM)
+	}
+}
+
+// --- 6. cross-tenant (different tenant in ctx) → not-found. ---
+func TestVaultRead_CrossTenant_NotFound(t *testing.T) {
+	tenantA := uuid.New()
+	tenantB := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantA.String(),
+		Scope: "shared", Path: "a.md", Title: "A", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "a.md", "body")
+
+	res := tool.Execute(makeCtx(tenantB, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "not found") {
+		t.Fatalf("expected not found, got: %s", res.ForLLM)
+	}
+}
+
+// --- 7. missing doc id → not-found. ---
+func TestVaultRead_MissingDoc_NotFound(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	tool, _ := newVaultReadTestTool(t)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": uuid.New().String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "not found") {
+		t.Fatalf("expected not found, got: %s", res.ForLLM)
+	}
+}
+
+// --- 8. invalid UUID → arg error. ---
+func TestVaultRead_InvalidUUID(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	tool, _ := newVaultReadTestTool(t)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": "not-a-uuid"})
+	if !res.IsError || !strings.Contains(res.ForLLM, "invalid doc_id") {
+		t.Fatalf("expected invalid doc_id error, got: %s", res.ForLLM)
+	}
+}
+
+// --- 9. media DocType → rejected with hint. ---
+func TestVaultRead_MediaDocType_Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "pic.png", Title: "Pic", DocType: "media",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "pic.png", "pretend-png")
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "read_image") {
+		t.Fatalf("expected media-handler hint, got: %s", res.ForLLM)
+	}
+}
+
+// --- 10. binary extension even when DocType!=media → rejected by blocklist. ---
+func TestVaultRead_BinaryExtension_Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "report.PDF", Title: "Rep", DocType: "document",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	writeFile(t, ws, "report.PDF", "%PDF-1.7")
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, ".pdf") {
+		t.Fatalf("expected pdf blocklist error, got: %s", res.ForLLM)
+	}
+}
+
+// --- 11. text extension but binary bytes → rejected by UTF-8 sniff. ---
+func TestVaultRead_BinaryContent_UTF8Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "blob.txt", Title: "Blob", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// Invalid UTF-8: stray 0xC3 byte with no continuation.
+	writeBytes(t, ws, "blob.txt", []byte{0xC3, 0x28, 0xFF, 0xFE, 0xFD})
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "UTF-8") {
+		t.Fatalf("expected UTF-8 rejection, got: %s", res.ForLLM)
+	}
+}
+
+// --- 12. oversize file → truncated with marker. ---
+func TestVaultRead_Oversize_Truncated(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "big.md", Title: "Big", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// 30KB of 'a' — fits in UTF-8 sniff check, but larger than max_bytes below.
+	big := strings.Repeat("a", 30_000)
+	writeFile(t, ws, "big.md", big)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String(), "max_bytes": float64(10_000)})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "truncated") {
+		t.Fatalf("expected truncation marker, got: %s", res.ForLLM)
+	}
+}
+
+// --- 12b. non-ASCII text whose rune straddles the sniff window → readable. ---
+func TestVaultRead_MultibyteRuneAtSniffBoundary_Allowed(t *testing.T) {
+	// The sniff window ends at vaultReadUTF8SniffBytes. Pad with ASCII so the
+	// window ends inside a multi-byte rune, leaving 1 or 2 bytes of it dangling.
+	cases := []struct {
+		name    string
+		padding int
+		char    string // 2-byte and 3-byte Vietnamese characters
+	}{
+		{"two-byte rune split", vaultReadUTF8SniffBytes - 1, "â"},
+		{"three-byte rune split after one byte", vaultReadUTF8SniffBytes - 1, "ấ"},
+		{"three-byte rune split after two bytes", vaultReadUTF8SniffBytes - 2, "ấ"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tenantID := uuid.New()
+			agentID := uuid.New()
+			docID := uuid.New()
+			doc := &store.VaultDocument{
+				ID: docID.String(), TenantID: tenantID.String(),
+				Scope: "shared", Path: "npk.md", Title: "NPK", DocType: "note",
+			}
+			tool, ws := newVaultReadTestTool(t, doc)
+			// ~25KB total so the file is well past the sniff window.
+			body := strings.Repeat("a", tc.padding) + strings.Repeat(tc.char+" phân bón ", 2000)
+			if len(body) <= vaultReadUTF8SniffBytes {
+				t.Fatalf("fixture must exceed the sniff window, got %d bytes", len(body))
+			}
+			if utf8.ValidString(body[:vaultReadUTF8SniffBytes]) {
+				t.Fatalf("fixture must split a rune at the sniff boundary")
+			}
+			writeFile(t, ws, "npk.md", body)
+
+			res := tool.Execute(makeCtx(tenantID, agentID),
+				map[string]any{"doc_id": docID.String()})
+			if res.IsError {
+				t.Fatalf("valid UTF-8 document rejected: %s", res.ForLLM)
+			}
+			if !strings.Contains(res.ForLLM, "phân bón") {
+				t.Fatalf("expected document content, got: %.120s", res.ForLLM)
+			}
+		})
+	}
+}
+
+// --- 12c. binary content past the sniff window → still rejected. ---
+func TestVaultRead_LargeBinaryContent_UTF8Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "renamed-png.md", Title: "Blob", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// PNG magic bytes plus 20KB of invalid sequences: trimming the tail of the
+	// sniff window must not rescue this.
+	blob := append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A},
+		bytes.Repeat([]byte{0xFF, 0xFE, 0xC3, 0x28}, 5000)...)
+	writeBytes(t, ws, "renamed-png.md", blob)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "UTF-8") {
+		t.Fatalf("expected UTF-8 rejection, got: %.120s", res.ForLLM)
+	}
+}
+
+// --- 12d. broken byte at the end of a file shorter than the sniff window. ---
+func TestVaultRead_ShortFileTrailingBrokenByte_Rejected(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "short.md", Title: "Short", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// Nothing is truncated here, so the trailing 0xC3 is the file's own byte
+	// and must still be reported as broken.
+	writeBytes(t, ws, "short.md", append([]byte("bảng giá phân bón"), 0xC3))
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "UTF-8") {
+		t.Fatalf("expected UTF-8 rejection, got: %.120s", res.ForLLM)
+	}
+}
+
+// --- 12e. max_bytes landing inside a rune → no broken character in output. ---
+func TestVaultRead_MaxBytes_CutInsideRune_NoReplacementChar(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "gia.md", Title: "Gia", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	body := strings.Repeat("ấm ", 500) // 5 bytes per repetition
+	writeFile(t, ws, "gia.md", body)
+
+	// 101 is not a multiple of 5, so the cap falls inside the 3-byte "ấ".
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String(), "max_bytes": float64(101)})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "truncated") {
+		t.Fatalf("expected truncation marker, got: %.120s", res.ForLLM)
+	}
+	if strings.ContainsRune(res.ForLLM, utf8.RuneError) {
+		t.Fatalf("truncated output contains a broken character: %q", res.ForLLM)
+	}
+}
+
+// --- 13. symlink escaping workspace → denied. ---
+func TestVaultRead_SymlinkEscape_Denied(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "escape.md", Title: "Esc", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+
+	// Create target outside workspace.
+	outside := t.TempDir()
+	target := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(target, []byte("leak"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	// Symlink ws/escape.md → outside/secret.txt.
+	if err := os.Symlink(target, filepath.Join(ws, "escape.md")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "outside workspace") {
+		t.Fatalf("expected symlink escape denied, got: %s", res.ForLLM)
+	}
+}
+
+// --- Outlinks footer tests -------------------------------------------------
+
+// sharedDoc returns a minimal shared-scope vault doc.
+func sharedDoc(tenantID uuid.UUID, title, path string) *store.VaultDocument {
+	return &store.VaultDocument{
+		ID: uuid.New().String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: path, Title: title, DocType: "note",
+	}
+}
+
+// personalDoc returns a personal-scope doc owned by agentID.
+func personalDoc(tenantID, agentID uuid.UUID, title, path string) *store.VaultDocument {
+	aid := agentID.String()
+	return &store.VaultDocument{
+		ID: uuid.New().String(), TenantID: tenantID.String(),
+		AgentID: &aid, Scope: "personal", Path: path, Title: title, DocType: "note",
+	}
+}
+
+// teamDoc returns a team-scope doc bound to teamID.
+func teamDoc(tenantID uuid.UUID, teamID, title, path string) *store.VaultDocument {
+	tid := teamID
+	return &store.VaultDocument{
+		ID: uuid.New().String(), TenantID: tenantID.String(),
+		TeamID: &tid, Scope: "team", Path: path, Title: title, DocType: "note",
+	}
+}
+
+// seedWithLinks extends the fake store's outlinks map.
+func seedLinks(tool *VaultReadTool, tenantID, fromID string, links []store.VaultLink) {
+	f := tool.vaultStore.(*fakeVaultStore)
+	if f.outlinks == nil {
+		f.outlinks = make(map[string][]store.VaultLink)
+	}
+	f.outlinks[tenantID+":"+fromID] = links
+}
+
+// --- Case 1: outlinks present, all in scope → listed in order. ---
+func TestVaultReadOutlinks_AllInScope_Listed(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tA := sharedDoc(tenantID, "Target A", "a.md")
+	tB := sharedDoc(tenantID, "Target B", "b.md")
+	tool, ws := newVaultReadTestTool(t, src, tA, tB)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: tA.ID, LinkType: "wikilink"},
+		{ToDocID: tB.ID, LinkType: "reference"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("missing Links heading: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "Target A — id: "+tA.ID+" (wikilink)") {
+		t.Fatalf("target A line missing/wrong: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "Target B — id: "+tB.ID+" (reference)") {
+		t.Fatalf("target B line missing/wrong: %s", res.ForLLM)
+	}
+	// Order preserved (A before B).
+	if strings.Index(res.ForLLM, "Target A") > strings.Index(res.ForLLM, "Target B") {
+		t.Fatalf("order not preserved: %s", res.ForLLM)
+	}
+}
+
+// --- Case 2: outlink to personal doc owned by another agent → dropped. ---
+func TestVaultReadOutlinks_PersonalOtherAgent_Dropped(t *testing.T) {
+	tenantID := uuid.New()
+	agentSelf := uuid.New()
+	agentOther := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	other := personalDoc(tenantID, agentOther, "Other Memo", "other.md")
+	tool, ws := newVaultReadTestTool(t, src, other)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: other.ID, LinkType: "wikilink"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentSelf), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "Other Memo") {
+		t.Fatalf("leaked other-agent personal doc: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("empty Links heading should not appear: %s", res.ForLLM)
+	}
+}
+
+// --- Case 3: outlink to team doc from different team → dropped. ---
+func TestVaultReadOutlinks_TeamOtherTeam_Dropped(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	teamSelf := uuid.New().String()
+	teamOther := uuid.New().String()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	target := teamDoc(tenantID, teamOther, "Other Team Doc", "ot.md")
+	tool, ws := newVaultReadTestTool(t, src, target)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: target.ID, LinkType: "wikilink"},
+	})
+
+	res := tool.Execute(makeCtxWithTeam(tenantID, agentID, teamSelf),
+		map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "Other Team Doc") {
+		t.Fatalf("leaked other-team doc: %s", res.ForLLM)
+	}
+}
+
+// --- Case 4: outlink to shared doc → always included. ---
+func TestVaultReadOutlinks_Shared_Included(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tgt := sharedDoc(tenantID, "Shared Target", "st.md")
+	tool, ws := newVaultReadTestTool(t, src, tgt)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: tgt.ID, LinkType: "wikilink"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "Shared Target") {
+		t.Fatalf("shared target missing: %s", res.ForLLM)
+	}
+}
+
+// --- Case 5: task_attachment link type → dropped by type filter. ---
+func TestVaultReadOutlinks_TaskAttachment_Dropped(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tgt := sharedDoc(tenantID, "Task Target", "tk.md")
+	tool, ws := newVaultReadTestTool(t, src, tgt)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: tgt.ID, LinkType: "task_attachment"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("footer should be absent for task_attachment only: %s", res.ForLLM)
+	}
+}
+
+// --- Case 6: broken link (target doc deleted) → dropped silently. ---
+func TestVaultReadOutlinks_BrokenLink_Dropped(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	ghostID := uuid.New().String()
+	tool, ws := newVaultReadTestTool(t, src) // ghost not seeded
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: ghostID, LinkType: "wikilink"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("footer should be absent when only broken links: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, ghostID) {
+		t.Fatalf("ghost id leaked: %s", res.ForLLM)
+	}
+}
+
+// --- Case 7: self-link → dropped. ---
+func TestVaultReadOutlinks_SelfLink_Dropped(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tool, ws := newVaultReadTestTool(t, src)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: src.ID, LinkType: "wikilink"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("self-link should not produce footer: %s", res.ForLLM)
+	}
+}
+
+// --- Case 8: >20 valid links → capped with overflow marker. ---
+func TestVaultReadOutlinks_Overflow_Capped(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	docs := []*store.VaultDocument{src}
+	links := []store.VaultLink{}
+	for i := range 25 {
+		d := sharedDoc(tenantID, fmt.Sprintf("T%02d", i), fmt.Sprintf("t%02d.md", i))
+		docs = append(docs, d)
+		links = append(links, store.VaultLink{ToDocID: d.ID, LinkType: "wikilink"})
+	}
+	tool, ws := newVaultReadTestTool(t, docs...)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, links)
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "…[5 more links omitted]") {
+		t.Fatalf("expected overflow marker for 25→20 cap: %s", res.ForLLM)
+	}
+	// Count rendered link lines (prefix "- T").
+	n := strings.Count(res.ForLLM, "\n- T")
+	if n != 20 {
+		t.Fatalf("expected 20 kept links, got %d", n)
+	}
+}
+
+// --- Case 9: zero valid links → no heading at all. ---
+func TestVaultReadOutlinks_ZeroValid_NoHeading(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tool, ws := newVaultReadTestTool(t, src)
+	writeFile(t, ws, "src.md", "body")
+	// no links seeded.
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("should not emit empty heading: %s", res.ForLLM)
+	}
+}
+
+// --- Case 10: dedup same target via wikilink + reference → shown once. ---
+func TestVaultReadOutlinks_Dedup_ByTarget(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tgt := sharedDoc(tenantID, "DupTarget", "dup.md")
+	tool, ws := newVaultReadTestTool(t, src, tgt)
+	writeFile(t, ws, "src.md", "body")
+	seedLinks(tool, tenantID.String(), src.ID, []store.VaultLink{
+		{ToDocID: tgt.ID, LinkType: "wikilink"},
+		{ToDocID: tgt.ID, LinkType: "reference"},
+	})
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if n := strings.Count(res.ForLLM, "DupTarget"); n != 1 {
+		t.Fatalf("expected 1 occurrence of DupTarget, got %d: %s", n, res.ForLLM)
+	}
+	// First link_type wins.
+	if !strings.Contains(res.ForLLM, "(wikilink)") {
+		t.Fatalf("expected first link_type wikilink to win: %s", res.ForLLM)
+	}
+}
+
+// --- Case: GetOutLinks error → read succeeds, footer empty. ---
+func TestVaultReadOutlinks_StoreError_NoFooter(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	src := sharedDoc(tenantID, "Source", "src.md")
+	tool, ws := newVaultReadTestTool(t, src)
+	writeFile(t, ws, "src.md", "body")
+	tool.vaultStore.(*fakeVaultStore).outLinkErr = os.ErrInvalid
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{"doc_id": src.ID})
+	if res.IsError {
+		t.Fatalf("store error must not fail read: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "body") {
+		t.Fatalf("body missing: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "## Links") {
+		t.Fatalf("footer must be absent on store error: %s", res.ForLLM)
+	}
+}
+
+// --- 14. max_bytes clamp to ceiling (1MB). ---
+func TestVaultRead_MaxBytes_ClampCeiling(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "c.md", Title: "C", DocType: "note",
+	}
+	tool, ws := newVaultReadTestTool(t, doc)
+	// 1.2MB body — should be truncated to 1MB hard ceiling regardless of arg.
+	body := bytes.Repeat([]byte("x"), 1_200_000)
+	writeBytes(t, ws, "c.md", body)
+
+	res := tool.Execute(makeCtx(tenantID, agentID), map[string]any{
+		"doc_id":    docID.String(),
+		"max_bytes": float64(5_000_000), // above ceiling
+	})
+	if res.IsError {
+		t.Fatalf("unexpected error: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "truncated") {
+		t.Fatalf("expected truncation marker for ceiling clamp, got head: %s", res.ForLLM[:min(200, len(res.ForLLM))])
+	}
+}
+
+// --- Namespace-fallback fakes -------------------------------------------------
+
+type fakeKGStoreRead struct {
+	store.KnowledgeGraphStore
+	byID map[string]*store.Entity
+}
+
+func (f *fakeKGStoreRead) GetEntity(ctx context.Context, agentID, userID, entityID string) (*store.Entity, error) {
+	if f.byID == nil {
+		return nil, nil
+	}
+	if e, ok := f.byID[entityID]; ok {
+		return e, nil
+	}
+	return nil, nil
+}
+
+type fakeEpisodicStoreRead struct {
+	store.EpisodicStore
+	byID map[string]*store.EpisodicSummary
+}
+
+func (f *fakeEpisodicStoreRead) Get(ctx context.Context, id string) (*store.EpisodicSummary, error) {
+	if f.byID == nil {
+		return nil, nil
+	}
+	if e, ok := f.byID[id]; ok {
+		return e, nil
+	}
+	return nil, nil
+}
+
+// --- 15. vault_read with KG id → namespace redirect (not "document not found"). ---
+func TestVaultRead_KGIDReturnsRedirect(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	kgID := uuid.New()
+
+	tool, _ := newVaultReadTestTool(t) // no vault docs seeded
+	kg := &fakeKGStoreRead{byID: map[string]*store.Entity{
+		kgID.String(): {ID: kgID.String(), Name: "KG_03", EntityType: "document"},
+	}}
+	tool.SetKGStore(kg)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": kgID.String()})
+	if !res.IsError {
+		t.Fatalf("expected error, got: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "document not found") {
+		t.Fatalf("should redirect, not say 'document not found': %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "knowledge_graph_search") {
+		t.Fatalf("redirect must reference knowledge_graph_search: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "entity_id") {
+		t.Fatalf("redirect must name 'entity_id' param so LLM can self-correct: %s", res.ForLLM)
+	}
+}
+
+// --- 16. vault_read with episodic id → namespace redirect. ---
+func TestVaultRead_EpisodicIDReturnsRedirect(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	epID := uuid.New()
+
+	tool, _ := newVaultReadTestTool(t)
+	ep := &fakeEpisodicStoreRead{byID: map[string]*store.EpisodicSummary{
+		epID.String(): {ID: epID},
+	}}
+	tool.SetEpisodicStore(ep)
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": epID.String()})
+	if !res.IsError {
+		t.Fatalf("expected error, got: %s", res.ForLLM)
+	}
+	if strings.Contains(res.ForLLM, "document not found") {
+		t.Fatalf("should redirect, not say 'document not found': %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "memory_expand") {
+		t.Fatalf("redirect must reference memory_expand: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "episodic_id") {
+		t.Fatalf("redirect must name 'episodic_id' so LLM can self-correct: %s", res.ForLLM)
+	}
+}
+
+// --- 17. vault_read with ID not in any store → preserves "document not found". ---
+func TestVaultRead_TrulyMissingReturnsNotFound(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+
+	tool, _ := newVaultReadTestTool(t)
+	tool.SetKGStore(&fakeKGStoreRead{})
+	tool.SetEpisodicStore(&fakeEpisodicStoreRead{})
+
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": uuid.New().String()})
+	if !res.IsError || !strings.Contains(res.ForLLM, "not found") {
+		t.Fatalf("expected document not found, got: %s", res.ForLLM)
+	}
+}
+
+// --- 18. Regression: non-master tenant content lives under tenants/<slug>/.
+// The tool holds the GLOBAL root, so a global-root join misses the file and
+// every non-master tenant reads ENOENT while vault_search (DB-only) still
+// returns the doc. Mirrors the production failure on tenant "alpha". ---
+func TestVaultRead_NonMasterTenant_ResolvesUnderTenantRoot(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "agents/ho-tro/Refund Flow.md",
+		Title: "Refund Flow", DocType: "note",
+	}
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: map[string]*store.VaultDocument{
+		tenantID.String() + ":" + docID.String(): doc,
+	}}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+
+	// Written by the tenant-aware write path; slug comes from context.
+	tenantRoot := config.TenantWorkspace(base, tenantID, "alpha")
+	writeFile(t, tenantRoot, "agents/ho-tro/Refund Flow.md", "refund body")
+
+	ctx := store.WithTenantSlug(makeCtx(tenantID, agentID), "alpha")
+	res := tool.Execute(ctx, map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("tenant doc must resolve under tenants/<slug>/, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "refund body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// --- 19. Master tenant keeps using the base root (no tenants/ segment), so
+// the fix above must not regress single-tenant and master installs. ---
+func TestVaultRead_MasterTenant_UsesBaseRoot(t *testing.T) {
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: store.MasterTenantID.String(),
+		Scope: "shared", Path: "agents/ho-tro/note.md",
+		Title: "Note", DocType: "note",
+	}
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: map[string]*store.VaultDocument{
+		store.MasterTenantID.String() + ":" + docID.String(): doc,
+	}}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+
+	// No tenants/ segment for master.
+	writeFile(t, base, "agents/ho-tro/note.md", "master body")
+
+	res := tool.Execute(makeCtx(store.MasterTenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("master doc must resolve at base root, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "master body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// --- 20. Slug absent from context (channel/cron runs) → fall back to the
+// TenantStore lookup, since a UUID-named directory would miss the slug-named
+// one the write path created. ---
+func TestVaultRead_SlugMissingFromContext_FallsBackToTenantStore(t *testing.T) {
+	tenantID := uuid.New()
+	agentID := uuid.New()
+	docID := uuid.New()
+	doc := &store.VaultDocument{
+		ID: docID.String(), TenantID: tenantID.String(),
+		Scope: "shared", Path: "agents/ho-tro/note.md",
+		Title: "Note", DocType: "note",
+	}
+	base := t.TempDir()
+	fake := &fakeVaultStore{byID: map[string]*store.VaultDocument{
+		tenantID.String() + ":" + docID.String(): doc,
+	}}
+	tool := NewVaultReadTool()
+	tool.SetVaultStore(fake)
+	tool.SetWorkspace(base)
+	tool.SetTenantStore(&fakeTenantStoreRead{slug: "alpha", id: tenantID})
+
+	writeFile(t, config.TenantWorkspace(base, tenantID, "alpha"),
+		"agents/ho-tro/note.md", "cron body")
+
+	// Context deliberately carries no slug.
+	res := tool.Execute(makeCtx(tenantID, agentID),
+		map[string]any{"doc_id": docID.String()})
+	if res.IsError {
+		t.Fatalf("slug fallback must resolve the doc, got: %s", res.ForLLM)
+	}
+	if !strings.Contains(res.ForLLM, "cron body") {
+		t.Fatalf("content missing: %s", res.ForLLM)
+	}
+}
+
+// fakeTenantStoreRead resolves a single tenant slug for the fallback path.
+type fakeTenantStoreRead struct {
+	store.TenantStore
+	id   uuid.UUID
+	slug string
+}
+
+func (f *fakeTenantStoreRead) GetTenant(_ context.Context, id uuid.UUID) (*store.TenantData, error) {
+	if id != f.id {
+		return nil, os.ErrNotExist
+	}
+	return &store.TenantData{ID: f.id, Slug: f.slug}, nil
+}

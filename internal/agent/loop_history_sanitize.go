@@ -1,0 +1,468 @@
+package agent
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/safego"
+)
+
+// limitHistoryTurns keeps only the last N user turns (and their associated
+// assistant/tool messages) from history. A "turn" = one user message plus
+// all subsequent non-user messages until the next user message.
+// Matching TS src/agents/pi-embedded-runner/history.ts limitHistoryTurns().
+func limitHistoryTurns(msgs []providers.Message, limit int) []providers.Message {
+	if limit <= 0 || len(msgs) == 0 {
+		return msgs
+	}
+
+	// Walk backwards counting user messages.
+	userCount := 0
+	lastUserIndex := len(msgs)
+
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			userCount++
+			if userCount > limit {
+				return msgs[lastUserIndex:]
+			}
+			lastUserIndex = i
+		}
+	}
+
+	return msgs
+}
+
+// sanitizeHistory repairs tool_use/tool_result pairing in session history.
+// Matching TS session-transcript-repair.ts sanitizeToolUseResultPairing().
+//
+// Problems this fixes:
+//   - Orphaned tool messages at start of history (after truncation)
+//   - tool_result without matching tool_use in preceding assistant message
+//   - assistant with tool_calls but missing tool_results
+//   - Duplicate tool call IDs across turns (legacy sessions before uniquifyToolCallIDs)
+//
+// Returns the cleaned messages and the number of messages that were dropped or synthesized.
+func sanitizeHistory(msgs []providers.Message) ([]providers.Message, int) {
+	if len(msgs) == 0 {
+		return msgs, 0
+	}
+
+	dropped := 0
+
+	// 1. Skip leading orphaned tool messages (no preceding assistant with tool_calls).
+	start := 0
+	for start < len(msgs) && msgs[start].Role == "tool" {
+		slog.Debug("sanitizeHistory: dropping orphaned tool message at history start",
+			"tool_call_id", msgs[start].ToolCallID)
+		dropped++
+		start++
+	}
+
+	if start >= len(msgs) {
+		return nil, dropped
+	}
+
+	// 2. Walk through messages ensuring tool_result follows matching tool_use
+	// and that roles alternate correctly (user↔assistant).
+	// Also dedup tool call IDs across the transcript for legacy sessions that
+	// may have persisted duplicates before the live uniquify fix was deployed.
+	var result []providers.Message
+	globalSeen := make(map[string]bool) // tracks IDs seen across entire transcript
+
+	for i := start; i < len(msgs); i++ {
+		msg := msgs[i]
+
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			// Deep-copy ToolCalls to avoid mutating the original session history.
+			oldCalls := msg.ToolCalls
+			msg.ToolCalls = make([]providers.ToolCall, len(oldCalls))
+			copy(msg.ToolCalls, oldCalls)
+
+			// Dedup: rewrite any ID that was already seen in an earlier turn or
+			// within the same turn. Uses a queue per original ID so multiple tool
+			// results with the same raw ID pair correctly in encounter order.
+			idQueue := make(map[string][]string, len(msg.ToolCalls)) // origID → []newID
+			expectedIDs := make(map[string]bool, len(msg.ToolCalls))
+			didDedup := false
+			for j := range msg.ToolCalls {
+				origID := msg.ToolCalls[j].ID
+				newID := origID
+				if globalSeen[origID] {
+					newID = fmt.Sprintf("%s_dedup_%d", origID, j)
+					slog.Debug("sanitizeHistory: dedup tool call ID", "orig", origID, "new", newID)
+					didDedup = true
+					dropped++ // count as change so cleaned history is persisted back to DB
+				}
+				msg.ToolCalls[j].ID = newID
+				globalSeen[newID] = true
+				idQueue[origID] = append(idQueue[origID], newID)
+				expectedIDs[newID] = true
+			}
+			// When dedup rewrites IDs, clear RawAssistantContent so the provider
+			// uses the corrected ToolCalls instead of raw JSON with stale IDs.
+			if didDedup {
+				msg.RawAssistantContent = nil
+			}
+
+			result = append(result, msg)
+
+			// Collect matching tool results that follow.
+			// Non-tool messages (warnings, nudges) interleaved between tool results
+			// are deferred until all tool results for this assistant turn are collected,
+			// maintaining contiguous tool_result grouping (#1177).
+			var deferredNonTool []providers.Message
+			for i+1 < len(msgs) {
+				next := msgs[i+1]
+				if next.Role == "tool" {
+					i++
+					if queue, ok := idQueue[next.ToolCallID]; ok && len(queue) > 0 {
+						newID := queue[0]
+						idQueue[next.ToolCallID] = queue[1:]
+						next.ToolCallID = newID
+						result = append(result, next)
+						delete(expectedIDs, newID)
+					} else {
+						slog.Debug("sanitizeHistory: dropping mismatched tool result",
+							"tool_call_id", next.ToolCallID)
+						dropped++
+					}
+				} else if next.Role != "assistant" && hasPendingToolResultAhead(msgs, i+2, idQueue) {
+					// Non-tool, non-assistant message with more tool results ahead — defer it.
+					i++
+					deferredNonTool = append(deferredNonTool, next)
+				} else {
+					break
+				}
+			}
+			// Flush deferred non-tool messages after all tool results.
+			result = append(result, deferredNonTool...)
+
+			// Synthesize missing tool results
+			for _, tc := range msg.ToolCalls {
+				if expectedIDs[tc.ID] {
+					slog.Debug("sanitizeHistory: synthesizing missing tool result", "tool_call_id", tc.ID)
+					result = append(result, providers.Message{
+						Role:       "tool",
+						Content:    "[Tool result missing — session was compacted]",
+						ToolCallID: tc.ID,
+						ToolName:   tc.Name,
+					})
+					dropped++
+				}
+			}
+		} else if msg.Role == "tool" {
+			// Orphaned tool message mid-history (no preceding assistant with matching tool_calls)
+			slog.Debug("sanitizeHistory: dropping orphaned tool message mid-history",
+				"tool_call_id", msg.ToolCallID)
+			dropped++
+		} else {
+			result = append(result, msg)
+		}
+	}
+
+	// 3. Fix role alternation: LLM APIs require user↔assistant alternation.
+	// Merge consecutive same-role messages (e.g. two user messages) into one,
+	// which can happen from bootstrap nudges, inject channel, or session corruption.
+	if len(result) > 1 {
+		merged := make([]providers.Message, 0, len(result))
+		merged = append(merged, result[0])
+		for j := 1; j < len(result); j++ {
+			prev := &merged[len(merged)-1]
+			curr := result[j]
+			// Only merge plain messages (no tool_calls, no tool role)
+			if curr.Role == prev.Role && curr.Role != "tool" && len(curr.ToolCalls) == 0 && len(prev.ToolCalls) == 0 {
+				slog.Debug("sanitizeHistory: merging consecutive same-role messages",
+					"role", curr.Role, "index", j)
+				prev.Content += "\n\n" + curr.Content
+				// Preserve media refs from merged message so compaction
+				// summary retains knowledge of shared media files.
+				if len(curr.MediaRefs) > 0 {
+					prev.MediaRefs = append(prev.MediaRefs, curr.MediaRefs...)
+				}
+				dropped++
+			} else {
+				merged = append(merged, curr)
+			}
+		}
+		result = merged
+	}
+
+	return result, dropped
+}
+
+// hasPendingToolResultAhead returns true if there is at least one tool-role
+// message after position start whose ToolCallID is still expected (present
+// in idQueue). Stops scanning at the next assistant message.
+func hasPendingToolResultAhead(msgs []providers.Message, start int, idQueue map[string][]string) bool {
+	for j := start; j < len(msgs); j++ {
+		if msgs[j].Role == "assistant" {
+			return false
+		}
+		if msgs[j].Role == "tool" {
+			if queue := idQueue[msgs[j].ToolCallID]; len(queue) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maybeSummarize truncates+summarizes session history when it grows large.
+//
+// midLoopCompacted signals that the final-request guard already had to compact
+// this session mid-loop. Because mid-loop compaction only mutates the run's
+// message buffer (never the session store), it is thrown away every turn —
+// causing an unbounded re-compaction loop AND stalling the cumulative compaction
+// count episodic depends on. When set, we lower the trigger threshold to a
+// unit-aligned "pressure threshold" so the compaction gets PERSISTED here.
+func (l *Loop) maybeSummarize(ctx context.Context, sessionKey string, midLoopCompacted bool) {
+	history := l.sessions.GetHistory(ctx, sessionKey)
+
+	// Use calibrated token estimation, adjusted for overhead.
+	// lastPromptTokens includes everything (system prompt, tools, context files, history).
+	// We subtract estimated overhead so the threshold comparison is history-only.
+	lastPT, lastMC := l.sessions.GetLastPromptTokens(ctx, sessionKey)
+	calibrationPT, calibrationMC := lastPT, lastMC
+	calibrationInvalid := l.contextWindow > 0 && lastPT > l.contextWindow
+	if calibrationInvalid {
+		calibrationPT = 0
+		calibrationMC = 0
+	}
+	overheadEstimate := l.estimateOverhead(history, calibrationPT, calibrationMC)
+	adjustedLastPT := max(calibrationPT-overheadEstimate, 0)
+	tokenEstimate := EstimateTokensWithCalibration(history, adjustedLastPT, calibrationMC)
+
+	// Resolve compaction threshold from config: token-only (no message count guard).
+	// Industry standard — Claude Code, Anthropic API, LangChain all use token-based thresholds.
+	historyShare := config.DefaultHistoryShare
+	if l.compactionCfg != nil && l.compactionCfg.MaxHistoryShare > 0 {
+		historyShare = l.compactionCfg.MaxHistoryShare
+	}
+
+	// Baseline (floor) threshold: history-only, MaxHistoryShare. Used when there was
+	// no mid-loop pressure this run — keeps normal sessions from over-compacting.
+	threshold := int(float64(l.contextWindow) * historyShare)
+	effectiveThreshold := threshold
+	if midLoopCompacted {
+		// Pressure threshold: align the unit + constants with the final-request guard by
+		// reusing compactionInputCap() (min(cw-maxTokens, cw*MaxRequestShare-maxTokens)),
+		// then subtract the fixed overhead estimate to compare against history-only
+		// tokenEstimate. The guard reads MaxRequestShare while this path historically read
+		// MaxHistoryShare — a DIFFERENT config field — so we must NOT rebuild the formula
+		// from historyShare or the two would diverge under custom config.
+		pressureThreshold := max(l.compactionInputCap()-overheadEstimate, 0)
+		// Defensive floor: a pathological config (maxTokens >= cw*MaxRequestShare) could
+		// drive compactionInputCap() toward 0, making pressureThreshold≈0 and forcing a
+		// summarize on every mid-loop turn. Never drop below half the baseline threshold.
+		if minFloor := threshold / 2; pressureThreshold < minFloor {
+			pressureThreshold = minFloor
+		}
+		effectiveThreshold = pressureThreshold
+	}
+	if tokenEstimate <= effectiveThreshold {
+		l.logCompactionDecision(sessionKey, "skip", "under_threshold", tokenEstimate, effectiveThreshold, historyShare, lastPT, lastMC, adjustedLastPT, overheadEstimate, calibrationInvalid)
+		return
+	}
+
+	// Per-session lock: prevent concurrent summarize+flush goroutines for the same session.
+	// TryLock is non-blocking — if another run is already summarizing this session, skip.
+	// The next run will trigger summarization again if still needed.
+	muI, _ := l.summarizeMu.LoadOrStore(sessionKey, &sync.Mutex{})
+	sessionMu := muI.(*sync.Mutex)
+	if !sessionMu.TryLock() {
+		l.logCompactionDecision(sessionKey, "skip", "already_in_progress", tokenEstimate, effectiveThreshold, historyShare, lastPT, lastMC, adjustedLastPT, overheadEstimate, calibrationInvalid)
+		slog.Debug("summarization already in progress, skipping", "session", sessionKey)
+		return
+	}
+
+	l.logCompactionDecision(sessionKey, "trigger", "", tokenEstimate, effectiveThreshold, historyShare, lastPT, lastMC, adjustedLastPT, overheadEstimate, calibrationInvalid)
+
+	// Memory flush runs synchronously INSIDE the guard
+	// (so concurrent runs don't both trigger flush for the same compaction cycle).
+	flushSettings := ResolveMemoryFlushSettings(l.compactionCfg)
+	if l.shouldRunMemoryFlush(ctx, sessionKey, tokenEstimate, flushSettings) {
+		l.runMemoryFlush(ctx, sessionKey, flushSettings)
+	}
+
+	// Resolve keepLast before spawning goroutine (reads config under caller's scope).
+	keepLast := 4
+	if l.compactionCfg != nil && l.compactionCfg.KeepLastMessages > 0 {
+		keepLast = l.compactionCfg.KeepLastMessages
+	}
+
+	// Summarize in background (holds the per-session lock until done)
+	go func() {
+		defer sessionMu.Unlock()
+		defer safego.Recover(nil, "session", sessionKey)
+
+		// Re-check: history may have been truncated by a concurrent summarize
+		// that finished between our threshold check and acquiring the lock.
+		timeout := l.compactionTimeout()
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer cancel()
+
+		history := l.sessions.GetHistory(sctx, sessionKey)
+		if len(history) <= keepLast {
+			return
+		}
+
+		summary := l.sessions.GetSummary(sctx, sessionKey)
+		toSummarize := history[:len(history)-keepLast]
+
+		// Resolve the same per-agent request budget the mid-loop compaction path
+		// uses so no single summarization request can exceed the window. The old
+		// path concatenated the entire history into one prompt, which could blow
+		// the hard ceiling on large sessions; chunk + map-reduce keeps every
+		// request within cap.
+		inputCap := l.compactionInputCap()
+		if inputCap <= 0 {
+			slog.Warn("summarization failed", "session", sessionKey, "error", "context_window_unresolved")
+			return
+		}
+
+		var mediaKinds []string
+		for _, m := range toSummarize {
+			for _, ref := range m.MediaRefs {
+				mediaKinds = append(mediaKinds, ref.Kind)
+			}
+		}
+
+		// Build cap-respecting units, prepending any existing summary and a media
+		// note as their own leading units so the packer can split them if needed.
+		var leading []string
+		if summary != "" {
+			leading = append(leading, "Existing context: "+summary+"\n\n")
+		}
+		if len(mediaKinds) > 0 {
+			counts := make(map[string]int)
+			for _, k := range mediaKinds {
+				counts[k]++
+			}
+			var note strings.Builder
+			note.WriteString("Note: user shared media files (")
+			first := true
+			for k, n := range counts {
+				if !first {
+					note.WriteString(", ")
+				}
+				note.WriteString(fmt.Sprintf("%d %s(s)", n, k))
+				first = false
+			}
+			note.WriteString(") which are no longer in context. Mention briefly if relevant.\n\n")
+			leading = append(leading, note.String())
+		}
+		units := append(leading, buildCompactionUnits(toSummarize)...)
+
+		inTokens := l.estimateSummaryInputTokens(toSummarize)
+		slog.Info("compact_budget",
+			"path", "post-turn",
+			"agent", l.id,
+			"session", sessionKey,
+			"in_tokens", inTokens,
+			"out_tokens", dynamicSummaryMax(inTokens),
+			"context_window", l.contextWindow,
+			"input_cap_tokens", inputCap,
+			"threshold", threshold,
+			"token_estimate", tokenEstimate,
+			"max_history_share", historyShare,
+			"reserve_tokens_floor", l.resolveReserveTokens(),
+			"timeout_seconds", int(timeout/time.Second),
+		)
+		summaryContent, _, err := l.summarizeCompactionUnits(sctx, units, inputCap, 1)
+		if err != nil {
+			slog.Warn("summarization failed", "session", sessionKey, "error", err)
+			return
+		}
+		resp := &providers.ChatResponse{Content: summaryContent}
+
+		// Collect MediaRefs from messages about to be truncated (keep up to 30 most recent).
+		const maxPreservedMediaRefs = 30
+		var preservedRefs []providers.MediaRef
+		for i := len(toSummarize) - 1; i >= 0 && len(preservedRefs) < maxPreservedMediaRefs; i-- {
+			for _, ref := range toSummarize[i].MediaRefs {
+				preservedRefs = append(preservedRefs, ref)
+				if len(preservedRefs) >= maxPreservedMediaRefs {
+					break
+				}
+			}
+		}
+
+		l.sessions.SetSummary(sctx, sessionKey, SanitizeAssistantContent(resp.Content))
+		l.sessions.TruncateHistory(sctx, sessionKey, keepLast)
+
+		// Inject preserved MediaRefs into the first kept message so they survive truncation.
+		if len(preservedRefs) > 0 {
+			kept := l.sessions.GetHistory(sctx, sessionKey)
+			if len(kept) > 0 {
+				kept[0].MediaRefs = append(preservedRefs, kept[0].MediaRefs...)
+				// Cap total refs on this message at maxPreservedMediaRefs.
+				if len(kept[0].MediaRefs) > maxPreservedMediaRefs {
+					kept[0].MediaRefs = kept[0].MediaRefs[:maxPreservedMediaRefs]
+				}
+				l.sessions.SetHistory(sctx, sessionKey, kept)
+			}
+		}
+		l.sessions.IncrementCompaction(sctx, sessionKey)
+		// Mirror SessionMetaKeyLastCompactionAt from the v3 prune/compact path
+		// so the legacy v2 post-turn summarizer also surfaces compaction cadence.
+		l.sessions.SetSessionMetadata(sctx, sessionKey, map[string]string{
+			SessionMetaKeyLastCompactionAt: time.Now().UTC().Format(time.RFC3339),
+		})
+		l.sessions.Save(sctx, sessionKey)
+	}()
+}
+
+func (l *Loop) logCompactionDecision(sessionKey, decision, skipReason string, tokenEstimate, threshold int, historyShare float64, lastPromptTokens, lastMessageCount, adjustedLastPromptTokens, overheadEstimate int, calibrationInvalid bool) {
+	args := []any{
+		"path", "post-turn",
+		"agent", l.id,
+		"session", sessionKey,
+		"decision", decision,
+		"context_window", l.contextWindow,
+		"threshold", threshold,
+		"token_estimate", tokenEstimate,
+		"max_history_share", historyShare,
+		"reserve_tokens_floor", l.resolveReserveTokens(),
+		"last_prompt_tokens", lastPromptTokens,
+		"last_message_count", lastMessageCount,
+		"adjusted_last_prompt_tokens", adjustedLastPromptTokens,
+		"overhead_estimate", overheadEstimate,
+		"calibration_invalid", calibrationInvalid,
+	}
+	if calibrationInvalid {
+		args = append(args, "invalid_last_prompt_tokens", lastPromptTokens)
+	}
+	if skipReason != "" {
+		args = append(args, "skip_reason", skipReason)
+	}
+	slog.Info("compaction_decision", args...)
+}
+
+// estimateOverhead derives the non-history token overhead (system prompt + tool definitions +
+// context files) from calibration data. Used by maybeSummarize to compare history-only tokens
+// against the compaction threshold.
+func (l *Loop) estimateOverhead(history []providers.Message, lastPromptTokens, lastMsgCount int) int {
+	if lastPromptTokens <= 0 || lastMsgCount <= 0 {
+		// No calibration data — use conservative default (20% of context, capped at 40k).
+		fallback := min(int(float64(l.contextWindow)*0.2), 40000)
+		return fallback
+	}
+
+	// Overhead = total prompt tokens - estimated history tokens at calibration time.
+	count := min(lastMsgCount, len(history))
+	historyEstAtCalibration := EstimateHistoryTokens(history[:count])
+	overhead := max(lastPromptTokens-historyEstAtCalibration, 0)
+	// Clamp: overhead shouldn't exceed 40% of context window.
+	maxOverhead := int(float64(l.contextWindow) * 0.4)
+	if overhead > maxOverhead {
+		overhead = maxOverhead
+	}
+	return overhead
+}

@@ -1,0 +1,4 @@
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
+ALTER TABLE user_agent_profiles ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
+ALTER TABLE pairing_requests ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';
+ALTER TABLE paired_devices ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}';

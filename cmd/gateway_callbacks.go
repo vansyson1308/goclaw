@@ -2,8 +2,6 @@ package cmd
 
 import (
 	"context"
-	"log/slog"
-	"strings"
 
 	"github.com/google/uuid"
 
@@ -13,36 +11,27 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
-// buildEnsureUserFiles creates the per-user file seeding callback.
-// Used by both managed and standalone modes — no mode-specific logic.
-// Seeds per-user context files on first chat (new user profile).
-func buildEnsureUserFiles(as store.AgentStore) agent.EnsureUserFilesFunc {
-	return func(ctx context.Context, agentID uuid.UUID, userID, agentType, workspace string) error {
-		isNew, err := as.GetOrCreateUserProfile(ctx, agentID, userID, workspace)
+// buildEnsureUserProfile creates the user profile resolution callback.
+// Creates/resolves user profile and returns effective workspace.
+// Separated from seeding to allow independent lifecycle management.
+func buildEnsureUserProfile(as store.AgentStore) agent.EnsureUserProfileFunc {
+	return func(ctx context.Context, agentID uuid.UUID, userID, workspace, channel string) (string, bool, error) {
+		isNew, effectiveWs, err := as.GetOrCreateUserProfile(ctx, agentID, userID, workspace, channel)
 		if err != nil {
-			return err
-		}
-		if !isNew {
-			return nil // already profiled = already seeded
+			return effectiveWs, false, err
 		}
 
-		// Auto-add first group member as a file writer (bootstrap the allowlist).
-		if strings.HasPrefix(userID, "group:") {
-			senderID := store.SenderIDFromContext(ctx)
-			if senderID != "" {
-				parts := strings.SplitN(senderID, "|", 2)
-				numericID := parts[0]
-				senderUsername := ""
-				if len(parts) > 1 {
-					senderUsername = parts[1]
-				}
-				if addErr := as.AddGroupFileWriter(ctx, agentID, userID, numericID, "", senderUsername); addErr != nil {
-					slog.Warn("failed to auto-add group file writer", "error", addErr, "sender", numericID, "group", userID)
-				}
-			}
-		}
+		return effectiveWs, isNew, nil
+	}
+}
 
-		_, err = bootstrap.SeedUserFiles(ctx, as, agentID, userID, agentType)
+// buildSeedUserFiles creates the context file seeding callback.
+// Seeds BOOTSTRAP.md, USER.md, etc. into user_context_files.
+// isNew=true seeds all files; isNew=false only seeds if user has zero files
+// (avoids re-seeding BOOTSTRAP.md after auto-cleanup on server restart).
+func buildSeedUserFiles(as store.AgentStore) agent.SeedUserFilesFunc {
+	return func(ctx context.Context, agentID uuid.UUID, userID, agentType string, isNew bool, channelMeta *bootstrap.ChannelMeta) error {
+		_, err := bootstrap.SeedUserFiles(ctx, as, agentID, userID, agentType, !isNew, channelMeta)
 		return err
 	}
 }
@@ -56,8 +45,19 @@ func buildBootstrapCleanup(as store.AgentStore) agent.BootstrapCleanupFunc {
 	}
 }
 
+// buildCacheInvalidate creates a callback that invalidates the context file cache
+// for a user after SeedUserFiles writes via raw agentStore. Without this,
+// LoadContextFiles may return stale (empty) cached results on the first turn.
+func buildCacheInvalidate(intc *tools.ContextFileInterceptor) agent.CacheInvalidateFunc {
+	if intc == nil {
+		return nil
+	}
+	return func(agentID uuid.UUID, userID string) {
+		intc.InvalidateUser(agentID, userID)
+	}
+}
+
 // buildContextFileLoader creates the per-request context file loader callback.
-// Used by both managed and standalone modes — no mode-specific logic.
 // Delegates to the ContextFileInterceptor for type-aware routing.
 func buildContextFileLoader(intc *tools.ContextFileInterceptor) agent.ContextFileLoaderFunc {
 	return func(ctx context.Context, agentID uuid.UUID, userID, agentType string) []bootstrap.ContextFile {

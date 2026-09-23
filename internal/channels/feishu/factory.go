@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
@@ -20,27 +21,69 @@ type feishuCreds struct {
 
 // feishuInstanceConfig maps the non-secret config JSONB from the channel_instances table.
 type feishuInstanceConfig struct {
-	Domain           string   `json:"domain,omitempty"`
-	ConnectionMode   string   `json:"connection_mode,omitempty"`
-	WebhookPort      int      `json:"webhook_port,omitempty"`
-	WebhookPath      string   `json:"webhook_path,omitempty"`
-	AllowFrom        []string `json:"allow_from,omitempty"`
-	DMPolicy         string   `json:"dm_policy,omitempty"`
-	GroupPolicy      string   `json:"group_policy,omitempty"`
-	GroupAllowFrom   []string `json:"group_allow_from,omitempty"`
-	RequireMention   *bool    `json:"require_mention,omitempty"`
-	TopicSessionMode string   `json:"topic_session_mode,omitempty"`
-	TextChunkLimit   int      `json:"text_chunk_limit,omitempty"`
-	MediaMaxMB       int      `json:"media_max_mb,omitempty"`
-	RenderMode       string   `json:"render_mode,omitempty"`
-	Streaming        *bool    `json:"streaming,omitempty"`
-	HistoryLimit     int      `json:"history_limit,omitempty"`
+	Domain            string                     `json:"domain,omitempty"`
+	ConnectionMode    string                     `json:"connection_mode,omitempty"`
+	WebhookPort       int                        `json:"webhook_port,omitempty"`
+	WebhookPath       string                     `json:"webhook_path,omitempty"`
+	AllowFrom         []string                   `json:"allow_from,omitempty"`
+	DMPolicy          string                     `json:"dm_policy,omitempty"`
+	GroupPolicy       string                     `json:"group_policy,omitempty"`
+	GroupAllowFrom    []string                   `json:"group_allow_from,omitempty"`
+	RequireMention    *bool                      `json:"require_mention,omitempty"`
+	TopicSessionMode  string                     `json:"topic_session_mode,omitempty"`
+	TextChunkLimit    int                        `json:"text_chunk_limit,omitempty"`
+	MediaMaxMB        int                        `json:"media_max_mb,omitempty"`
+	RenderMode        string                     `json:"render_mode,omitempty"`
+	Streaming         *bool                      `json:"streaming,omitempty"`
+	ReactionLevel     string                     `json:"reaction_level,omitempty"`
+	HistoryLimit      int                        `json:"history_limit,omitempty"`
+	BlockReply        *bool                      `json:"block_reply,omitempty"`
+	ChatBehavior      *config.ChatBehaviorConfig `json:"chat_behavior,omitempty"`
+	STTProxyURL       string                     `json:"stt_proxy_url,omitempty"`
+	STTAPIKey         string                     `json:"stt_api_key,omitempty"`
+	STTTenantID       string                     `json:"stt_tenant_id,omitempty"`
+	STTTimeoutSeconds int                        `json:"stt_timeout_seconds,omitempty"`
+	VoiceAgentID      string                     `json:"voice_agent_id,omitempty"`
 }
 
 // Factory creates a Feishu/Lark channel from DB instance data.
 func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+	return buildChannel(name, creds, cfg, msgBus, pairingSvc, nil, nil, nil, nil)
+}
 
+// FactoryWithPendingStore returns a ChannelFactory with persistent history support.
+func FactoryWithPendingStore(pendingStore store.PendingMessageStore) channels.ChannelFactory {
+	return FactoryWithPendingStoreAndAudio(pendingStore, nil)
+}
+
+// FactoryWithPendingStoreAndAudio returns a ChannelFactory with persistent history and STT support.
+func FactoryWithPendingStoreAndAudio(pendingStore store.PendingMessageStore, audioMgr *audio.Manager) channels.ChannelFactory {
+	return FactoryWithStoresAndAudio(nil, nil, pendingStore, audioMgr)
+}
+
+// FactoryWithStores returns a ChannelFactory with the stores required by
+// writer management and persistent group history.
+func FactoryWithStores(agentStore store.AgentStore, configPermStore store.ConfigPermissionStore,
+	pendingStore store.PendingMessageStore) channels.ChannelFactory {
+	return FactoryWithStoresAndAudio(agentStore, configPermStore, pendingStore, nil)
+}
+
+// FactoryWithStoresAndAudio returns a ChannelFactory with writer management,
+// persistent group history, and STT support.
+func FactoryWithStoresAndAudio(agentStore store.AgentStore, configPermStore store.ConfigPermissionStore,
+	pendingStore store.PendingMessageStore, audioMgr *audio.Manager) channels.ChannelFactory {
+	return func(name string, creds json.RawMessage, cfg json.RawMessage,
+		msgBus *bus.MessageBus, pairingSvc store.PairingStore) (channels.Channel, error) {
+		return buildChannel(name, creds, cfg, msgBus, pairingSvc,
+			agentStore, configPermStore, pendingStore, audioMgr)
+	}
+}
+
+func buildChannel(name string, creds json.RawMessage, cfg json.RawMessage,
+	msgBus *bus.MessageBus, pairingSvc store.PairingStore,
+	agentStore store.AgentStore, configPermStore store.ConfigPermissionStore,
+	pendingStore store.PendingMessageStore, audioMgr *audio.Manager) (channels.Channel, error) {
 	var c feishuCreds
 	if len(creds) > 0 {
 		if err := json.Unmarshal(creds, &c); err != nil {
@@ -78,7 +121,15 @@ func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 		MediaMaxMB:        ic.MediaMaxMB,
 		RenderMode:        ic.RenderMode,
 		Streaming:         ic.Streaming,
+		ReactionLevel:     ic.ReactionLevel,
 		HistoryLimit:      ic.HistoryLimit,
+		BlockReply:        ic.BlockReply,
+		ChatBehavior:      ic.ChatBehavior,
+		STTProxyURL:       ic.STTProxyURL,
+		STTAPIKey:         ic.STTAPIKey,
+		STTTenantID:       ic.STTTenantID,
+		STTTimeoutSeconds: ic.STTTimeoutSeconds,
+		VoiceAgentID:      ic.VoiceAgentID,
 	}
 
 	// DB instances default to "pairing" for groups (secure by default).
@@ -86,7 +137,10 @@ func Factory(name string, creds json.RawMessage, cfg json.RawMessage,
 		fsCfg.GroupPolicy = "pairing"
 	}
 
-	ch, err := New(fsCfg, msgBus, pairingSvc)
+	ch, err := New(fsCfg, msgBus, pairingSvc, pendingStore, audioMgr,
+		WithAgentStore(agentStore),
+		WithConfigPermStore(configPermStore),
+	)
 	if err != nil {
 		return nil, err
 	}

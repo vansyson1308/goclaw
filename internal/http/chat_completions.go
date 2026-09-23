@@ -10,25 +10,32 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/sessions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // ChatCompletionsHandler handles POST /v1/chat/completions (OpenAI-compatible).
 type ChatCompletionsHandler struct {
 	agents      *agent.Router
 	sessions    store.SessionStore
-	token       string              // expected bearer token (empty = no auth)
 	isManaged   bool
-	rateLimiter func(string) bool   // rate limit check: key → allowed (nil = no limit)
+	rateLimiter func(string) bool // rate limit check: key → allowed (nil = no limit)
+	postTurn    tools.PostTurnProcessor
+}
+
+// SetPostTurnProcessor sets the post-turn processor for team task dispatch.
+func (h *ChatCompletionsHandler) SetPostTurnProcessor(pt tools.PostTurnProcessor) {
+	h.postTurn = pt
 }
 
 // NewChatCompletionsHandler creates a handler for the chat completions endpoint.
-func NewChatCompletionsHandler(agents *agent.Router, sess store.SessionStore, token string, isManaged bool) *ChatCompletionsHandler {
+func NewChatCompletionsHandler(agents *agent.Router, sess store.SessionStore, isManaged bool) *ChatCompletionsHandler {
 	return &ChatCompletionsHandler{
 		agents:    agents,
 		sessions:  sess,
-		token:     token,
 		isManaged: isManaged,
 	}
 }
@@ -39,10 +46,10 @@ func (h *ChatCompletionsHandler) SetRateLimiter(fn func(string) bool) {
 }
 
 type chatCompletionsRequest struct {
-	Model    string           `json:"model"`
-	Messages []chatMessage    `json:"messages"`
-	Stream   bool             `json:"stream"`
-	User     string           `json:"user,omitempty"`
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
+	User     string        `json:"user,omitempty"`
 }
 
 type chatMessage struct {
@@ -52,12 +59,12 @@ type chatMessage struct {
 }
 
 type chatCompletionsResponse struct {
-	ID      string            `json:"id"`
-	Object  string            `json:"object"`
-	Created int64             `json:"created"`
-	Model   string            `json:"model"`
-	Choices []chatChoice      `json:"choices"`
-	Usage   *chatUsage        `json:"usage,omitempty"`
+	ID      string       `json:"id"`
+	Object  string       `json:"object"`
+	Created int64        `json:"created"`
+	Model   string       `json:"model"`
+	Choices []chatChoice `json:"choices"`
+	Usage   *chatUsage   `json:"usage,omitempty"`
 }
 
 type chatChoice struct {
@@ -74,16 +81,26 @@ type chatUsage struct {
 }
 
 func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	locale := extractLocale(r)
+
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, i18n.T(locale, i18n.MsgMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Auth check (timing-safe comparison)
-	if !tokenMatch(extractBearerToken(r), h.token) {
-		http.Error(w, `{"error":{"message":"Invalid authentication","type":"invalid_request_error"}}`, http.StatusUnauthorized)
+	// Auth + RBAC check (gateway token or API key, operator required for POST)
+	auth := resolveAuth(r)
+	if !auth.Authenticated {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s","type":"invalid_request_error"}}`, i18n.T(locale, i18n.MsgInvalidAuth)), http.StatusUnauthorized)
 		return
 	}
+	if !permissions.HasMinRole(auth.Role, permissions.RoleOperator) {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s","type":"invalid_request_error"}}`, i18n.T(locale, i18n.MsgPermissionDenied, "/v1/chat/completions")), http.StatusForbidden)
+		return
+	}
+
+	// Inject tenant, role, user, and locale into context for downstream stores/tools.
+	r = r.WithContext(enrichContext(r.Context(), r, auth))
 
 	// Rate limit check (per IP or bearer token)
 	if h.rateLimiter != nil {
@@ -93,7 +110,7 @@ func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 		if !h.rateLimiter(key) {
 			w.Header().Set("Retry-After", "60")
-			http.Error(w, `{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}`, http.StatusTooManyRequests)
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"%s","type":"rate_limit_error"}}`, i18n.T(locale, i18n.MsgRateLimitExceeded)), http.StatusTooManyRequests)
 			return
 		}
 	}
@@ -103,26 +120,25 @@ func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 
 	var req chatCompletionsRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"Invalid JSON: %s"}}`, err), http.StatusBadRequest)
+	if !bindJSON(w, r, locale, &req) {
 		return
 	}
 
 	if len(req.Messages) == 0 {
-		http.Error(w, `{"error":{"message":"messages is required"}}`, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s"}}`, i18n.T(locale, i18n.MsgMsgsRequired)), http.StatusBadRequest)
 		return
 	}
 
 	agentID := extractAgentID(r, req.Model)
-	userID := extractUserID(r)
+	userID := store.UserIDFromContext(r.Context()) // resolved by enrichContext (respects API key owner binding)
 	if h.isManaged && userID == "" {
-		http.Error(w, `{"error":{"message":"X-GoClaw-User-Id header is required in managed mode"}}`, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s"}}`, i18n.T(locale, i18n.MsgUserIDHeader)), http.StatusBadRequest)
 		return
 	}
 
-	loop, err := h.agents.Get(agentID)
+	loop, err := h.agents.Get(r.Context(), agentID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"Agent not found: %s"}}`, agentID), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s"}}`, i18n.T(locale, i18n.MsgNotFound, "agent", agentID)), http.StatusNotFound)
 		return
 	}
 
@@ -135,14 +151,8 @@ func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if lastMessage == "" {
-		http.Error(w, `{"error":{"message":"No user message found"}}`, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s"}}`, i18n.T(locale, i18n.MsgNoUserMessage)), http.StatusBadRequest)
 		return
-	}
-
-	// Inject user_id into context for downstream stores/tools
-	ctx := r.Context()
-	if userID != "" {
-		ctx = store.WithUserID(ctx, userID)
 	}
 
 	runID := uuid.NewString()
@@ -156,14 +166,17 @@ func (h *ChatCompletionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	slog.Info("chat completions request", "agent", agentID, "stream", req.Stream, "user", userID)
 
 	if req.Stream {
-		h.handleStream(w, r.WithContext(ctx), loop, runID, sessionKey, lastMessage, req.Model, userID)
+		h.handleStream(w, r, loop, runID, sessionKey, lastMessage, req.Model, userID)
 	} else {
-		h.handleNonStream(w, r.WithContext(ctx), loop, runID, sessionKey, lastMessage, req.Model, userID)
+		h.handleNonStream(w, r, loop, runID, sessionKey, lastMessage, req.Model, userID)
 	}
 }
 
 func (h *ChatCompletionsHandler) handleNonStream(w http.ResponseWriter, r *http.Request, loop agent.Agent, runID, sessionKey, message, model, userID string) {
-	result, err := loop.Run(r.Context(), agent.RunRequest{
+	ctx, drainTeamDispatch := tools.InjectTeamDispatch(r.Context(), h.postTurn)
+	defer drainTeamDispatch()
+
+	result, err := loop.Run(ctx, agent.RunRequest{
 		SessionKey: sessionKey,
 		Message:    message,
 		Channel:    "http",
@@ -174,7 +187,8 @@ func (h *ChatCompletionsHandler) handleNonStream(w http.ResponseWriter, r *http.
 	})
 
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"Agent error: %s"}}`, err), http.StatusInternalServerError)
+		locale := store.LocaleFromContext(r.Context())
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s"}}`, i18n.T(locale, i18n.MsgInternalError, err.Error())), http.StatusInternalServerError)
 		return
 	}
 
@@ -185,7 +199,7 @@ func (h *ChatCompletionsHandler) handleNonStream(w http.ResponseWriter, r *http.
 		Model:   model,
 		Choices: []chatChoice{{
 			Index:        0,
-			Message:      &chatMessage{Role: "assistant", Content: result.Content},
+			Message:      &chatMessage{Role: "assistant", Content: SignFileURLs(result.Content, FileSigningKey())},
 			FinishReason: "stop",
 		}},
 	}
@@ -205,7 +219,8 @@ func (h *ChatCompletionsHandler) handleNonStream(w http.ResponseWriter, r *http.
 func (h *ChatCompletionsHandler) handleStream(w http.ResponseWriter, r *http.Request, loop agent.Agent, runID, sessionKey, message, model, userID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		locale := store.LocaleFromContext(r.Context())
+		http.Error(w, i18n.T(locale, i18n.MsgStreamingNotSupported), http.StatusInternalServerError)
 		return
 	}
 
@@ -219,7 +234,10 @@ func (h *ChatCompletionsHandler) handleStream(w http.ResponseWriter, r *http.Req
 	// Send initial role chunk
 	writeSSEChunk(w, flusher, completionID, model, &chatMessage{Role: "assistant"}, "")
 
-	result, err := loop.Run(r.Context(), agent.RunRequest{
+	ctx, drainTeamDispatch := tools.InjectTeamDispatch(r.Context(), h.postTurn)
+	defer drainTeamDispatch()
+
+	result, err := loop.Run(ctx, agent.RunRequest{
 		SessionKey: sessionKey,
 		Message:    message,
 		Channel:    "http",
@@ -233,7 +251,7 @@ func (h *ChatCompletionsHandler) handleStream(w http.ResponseWriter, r *http.Req
 		writeSSEChunk(w, flusher, completionID, model, &chatMessage{Content: "Error: " + err.Error()}, "stop")
 	} else {
 		// Send content chunk
-		writeSSEChunk(w, flusher, completionID, model, &chatMessage{Content: result.Content}, "stop")
+		writeSSEChunk(w, flusher, completionID, model, &chatMessage{Content: SignFileURLs(result.Content, FileSigningKey())}, "stop")
 	}
 
 	// Send [DONE]
@@ -242,12 +260,12 @@ func (h *ChatCompletionsHandler) handleStream(w http.ResponseWriter, r *http.Req
 }
 
 func writeSSEChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, delta *chatMessage, finishReason string) {
-	chunk := map[string]interface{}{
+	chunk := map[string]any{
 		"id":      id,
 		"object":  "chat.completion.chunk",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []map[string]interface{}{{
+		"choices": []map[string]any{{
 			"index":         0,
 			"delta":         delta,
 			"finish_reason": nilIfEmpty(finishReason),
@@ -259,7 +277,7 @@ func writeSSEChunk(w http.ResponseWriter, flusher http.Flusher, id, model string
 	flusher.Flush()
 }
 
-func nilIfEmpty(s string) interface{} {
+func nilIfEmpty(s string) any {
 	if s == "" {
 		return nil
 	}

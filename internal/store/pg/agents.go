@@ -3,8 +3,11 @@ package pg
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,10 +19,11 @@ import (
 type PGAgentStore struct {
 	db          *sql.DB
 	embProvider store.EmbeddingProvider // optional: for agent frontmatter embeddings
+	embJobs     chan struct{}
 }
 
 func NewPGAgentStore(db *sql.DB) *PGAgentStore {
-	return &PGAgentStore{db: db}
+	return &PGAgentStore{db: db, embJobs: make(chan struct{}, 4)}
 }
 
 // SetEmbeddingProvider sets the embedding provider for agent frontmatter vectors.
@@ -42,68 +46,116 @@ func (s *PGAgentStore) generateAgentEmbedding(ctx context.Context, agentID uuid.
 		return
 	}
 	vecStr := vectorToString(embeddings[0])
-	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET embedding = $1::vector WHERE id = $2`, vecStr, agentID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE agents SET embedding = $1::vector
+		WHERE id = $2 AND deleted_at IS NULL AND status = 'active'
+		  AND COALESCE(display_name, '') = $3
+		  AND COALESCE(frontmatter, '') = $4`,
+		vecStr, agentID, displayName, frontmatter); err != nil {
 		slog.Warn("agent embedding update failed", "agent", agentID, "error", err)
+	}
+}
+
+// queueAgentEmbedding bounds background provider calls. Updates clear the old
+// vector before enqueueing, so overload leaves a retryable NULL instead of a
+// stale semantic index.
+func (s *PGAgentStore) queueAgentEmbedding(agentID uuid.UUID) {
+	if s.embProvider == nil {
+		return
+	}
+	select {
+	case s.embJobs <- struct{}{}:
+		go func() {
+			defer func() { <-s.embJobs }()
+			ctx, cancel := context.WithTimeout(store.WithCrossTenant(context.Background()), 75*time.Second)
+			defer cancel()
+			agent, err := s.GetByID(ctx, agentID)
+			if err != nil {
+				slog.Warn("agent embedding source load failed", "agent", agentID, "error", err)
+				return
+			}
+			s.generateAgentEmbedding(ctx, agent.ID, agent.DisplayName, agent.Frontmatter)
+		}()
+	default:
+		slog.Warn("agent embedding queue full; vector remains pending", "agent", agentID)
 	}
 }
 
 // BackfillAgentEmbeddings generates embeddings for all active agents that have frontmatter but no embedding.
 func (s *PGAgentStore) BackfillAgentEmbeddings(ctx context.Context) (int, error) {
 	if s.embProvider == nil {
-		return 0, nil
-	}
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, COALESCE(display_name, ''), COALESCE(frontmatter, '')
-		 FROM agents WHERE deleted_at IS NULL AND frontmatter IS NOT NULL AND frontmatter != '' AND embedding IS NULL`)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
-	type agentRow struct {
-		id          uuid.UUID
-		displayName string
-		frontmatter string
-	}
-	var pending []agentRow
-	for rows.Next() {
-		var r agentRow
-		if err := rows.Scan(&r.id, &r.displayName, &r.frontmatter); err != nil {
-			continue
-		}
-		pending = append(pending, r)
-	}
-	if len(pending) == 0 {
-		return 0, nil
+		return 0, fmt.Errorf("no embedding provider configured")
 	}
 
-	slog.Info("backfilling agent embeddings", "count", len(pending))
-	updated := 0
-	for _, ag := range pending {
-		text := ag.displayName
-		if ag.frontmatter != "" {
-			text += ": " + ag.frontmatter
+	const batchSize = 50
+	total := 0
+	var backfillErrs []error
+	cursor := uuid.Nil
+	for {
+		var pending []agentBackfillRow
+		if err := pkgSqlxDB.SelectContext(ctx, &pending,
+			`SELECT id, COALESCE(display_name, '') AS display_name, COALESCE(frontmatter, '') AS frontmatter
+			 FROM agents
+			 WHERE deleted_at IS NULL AND status = 'active'
+			   AND frontmatter IS NOT NULL AND frontmatter != '' AND embedding IS NULL AND id > $1
+			 ORDER BY id ASC
+			 LIMIT $2`, cursor, batchSize,
+		); err != nil {
+			return total, fmt.Errorf("query agents without embeddings: %w", err)
 		}
-		embeddings, err := s.embProvider.Embed(ctx, []string{text})
-		if err != nil || len(embeddings) == 0 || len(embeddings[0]) == 0 {
-			continue
+		if len(pending) == 0 {
+			return total, errors.Join(backfillErrs...)
 		}
-		vecStr := vectorToString(embeddings[0])
-		if _, err := s.db.ExecContext(ctx, `UPDATE agents SET embedding = $1::vector WHERE id = $2`, vecStr, ag.id); err != nil {
-			continue
+
+		items := make([]embeddingBackfillItem[agentBackfillRow], len(pending))
+		for i, agent := range pending {
+			items[i] = embeddingBackfillItem[agentBackfillRow]{
+				row:  agent,
+				id:   agent.ID,
+				text: agent.DisplayName + ": " + agent.Frontmatter,
+			}
 		}
-		updated++
+		updated, err := processEmbeddingBackfillBatch(ctx, s.embProvider, "agent", items,
+			func(ctx context.Context, agent agentBackfillRow, embedding []float32) (int64, error) {
+				result, err := s.db.ExecContext(ctx,
+					`UPDATE agents SET embedding = $1::vector
+				 WHERE id = $2 AND embedding IS NULL AND deleted_at IS NULL AND status = 'active'
+				   AND COALESCE(display_name, '') = $3 AND COALESCE(frontmatter, '') = $4`,
+					vectorToString(embedding), agent.ID, agent.DisplayName, agent.Frontmatter)
+				if err != nil {
+					return 0, err
+				}
+				return result.RowsAffected()
+			})
+		total += updated
+		if err != nil {
+			backfillErrs = append(backfillErrs, err)
+			if ctx.Err() != nil {
+				return total, errors.Join(backfillErrs...)
+			}
+		}
+		cursor = pending[len(pending)-1].ID
 	}
-	slog.Info("agent embeddings backfill complete", "updated", updated)
-	return updated, nil
 }
 
 // agentSelectCols is the column list for all agent SELECT queries.
-const agentSelectCols = `id, agent_key, display_name, frontmatter, owner_id, provider, model,
+// display_name and status are nullable in the schema (legacy rows) but scan
+// into plain strings, so they are coalesced to the column defaults.
+const agentSelectCols = `id, agent_key, COALESCE(display_name, '') AS display_name, frontmatter, owner_id, provider, model,
 		 context_window, max_tool_iterations, workspace, restrict_to_workspace,
 		 tools_config, sandbox_config, subagents_config, memory_config,
 		 compaction_config, context_pruning, other_config,
-		 agent_type, is_default, status, created_at, updated_at`
+		 emoji, agent_description, thinking_level, max_tokens,
+		 self_evolve, skill_evolve, skill_nudge_interval,
+		 reasoning_config, workspace_sharing, chatgpt_oauth_routing,
+		 model_fallback, shell_deny_groups, kg_dedup_config,
+		 agent_type, is_default, COALESCE(status, 'active') AS status, budget_monthly_cents, created_at, updated_at, tenant_id`
+
+// sqlExecer is satisfied by both *sql.DB and *sql.Tx, allowing helper
+// functions to be called within or outside a transaction.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
 
 func (s *PGAgentStore) Create(ctx context.Context, agent *store.AgentData) error {
 	if agent.ID == uuid.Nil {
@@ -112,34 +164,73 @@ func (s *PGAgentStore) Create(ctx context.Context, agent *store.AgentData) error
 	now := time.Now()
 	agent.CreatedAt = now
 	agent.UpdatedAt = now
-	_, err := s.db.ExecContext(ctx,
+	tenantID := agent.TenantID
+	if tenantID == uuid.Nil {
+		tenantID = store.MasterTenantID
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO agents (id, agent_key, display_name, frontmatter, owner_id, provider, model,
 		 context_window, max_tool_iterations, workspace, restrict_to_workspace,
 		 tools_config, sandbox_config, subagents_config, memory_config,
 		 compaction_config, context_pruning, other_config,
-		 agent_type, is_default, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)`,
+		 emoji, agent_description, thinking_level, max_tokens,
+		 self_evolve, skill_evolve, skill_nudge_interval,
+		 reasoning_config, workspace_sharing, chatgpt_oauth_routing,
+		 model_fallback, shell_deny_groups, kg_dedup_config,
+		 agent_type, is_default, status, budget_monthly_cents, created_at, updated_at, tenant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+		         $19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38)`,
 		agent.ID, agent.AgentKey, agent.DisplayName, sql.NullString{String: agent.Frontmatter, Valid: agent.Frontmatter != ""}, agent.OwnerID, agent.Provider, agent.Model,
 		agent.ContextWindow, agent.MaxToolIterations, agent.Workspace, agent.RestrictToWorkspace,
 		jsonOrEmpty(agent.ToolsConfig), jsonOrNull(agent.SandboxConfig), jsonOrNull(agent.SubagentsConfig), jsonOrNull(agent.MemoryConfig),
 		jsonOrNull(agent.CompactionConfig), jsonOrNull(agent.ContextPruning), jsonOrEmpty(agent.OtherConfig),
-		agent.AgentType, agent.IsDefault, agent.Status, now, now,
+		agent.Emoji, agent.AgentDescription, agent.ThinkingLevel, agent.MaxTokens,
+		agent.SelfEvolve, agent.SkillEvolve, agent.SkillNudgeInterval,
+		jsonOrEmpty(agent.ReasoningConfig), jsonOrEmpty(agent.WorkspaceSharing), jsonOrEmpty(agent.ChatGPTOAuthRouting),
+		jsonOrEmpty(agent.ModelFallback), jsonOrEmpty(agent.ShellDenyGroups), jsonOrEmpty(agent.KGDedupConfig),
+		agent.AgentType, agent.IsDefault, agent.Status, agent.BudgetMonthlyCents, now, now, tenantID,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("insert agent: %w", err)
+	}
+	if agent.BudgetMonthlyCents != nil {
+		if err := syncAgentBudgetUsageCap(ctx, tx, tenantID, agent.ID, agent.BudgetMonthlyCents); err != nil {
+			return fmt.Errorf("sync budget usage cap: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit agent create: %w", err)
 	}
 
-	// Generate embedding for new agent with frontmatter
-	if agent.Frontmatter != "" && s.embProvider != nil {
-		go s.generateAgentEmbedding(context.Background(), agent.ID, agent.DisplayName, agent.Frontmatter)
+	// Generate embedding for new agent with frontmatter (best-effort, outside tx).
+	if agent.Frontmatter != "" {
+		s.queueAgentEmbedding(agent.ID)
 	}
 	return nil
 }
 
 func (s *PGAgentStore) GetByKey(ctx context.Context, agentKey string) (*store.AgentData, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+agentSelectCols+`
-		 FROM agents WHERE agent_key = $1 AND deleted_at IS NULL`, agentKey)
+	var row *sql.Row
+	if store.IsCrossTenant(ctx) {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT `+agentSelectCols+`
+			 FROM agents WHERE agent_key = $1 AND deleted_at IS NULL`, agentKey)
+	} else {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return nil, fmt.Errorf("agent not found: %s", agentKey)
+		}
+		row = s.db.QueryRowContext(ctx,
+			`SELECT `+agentSelectCols+`
+			 FROM agents WHERE agent_key = $1 AND deleted_at IS NULL AND tenant_id = $2`, agentKey, tid)
+	}
 	d, err := scanAgentRow(row)
 	if err != nil {
 		return nil, fmt.Errorf("agent not found: %s", agentKey)
@@ -148,9 +239,20 @@ func (s *PGAgentStore) GetByKey(ctx context.Context, agentKey string) (*store.Ag
 }
 
 func (s *PGAgentStore) GetByID(ctx context.Context, id uuid.UUID) (*store.AgentData, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+agentSelectCols+`
-		 FROM agents WHERE id = $1 AND deleted_at IS NULL`, id)
+	var row *sql.Row
+	if store.IsCrossTenant(ctx) {
+		row = s.db.QueryRowContext(ctx,
+			`SELECT `+agentSelectCols+`
+			 FROM agents WHERE id = $1 AND deleted_at IS NULL`, id)
+	} else {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return nil, fmt.Errorf("agent not found: %s", id)
+		}
+		row = s.db.QueryRowContext(ctx,
+			`SELECT `+agentSelectCols+`
+			 FROM agents WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2`, id, tid)
+	}
 	d, err := scanAgentRow(row)
 	if err != nil {
 		return nil, fmt.Errorf("agent not found: %s", id)
@@ -159,51 +261,281 @@ func (s *PGAgentStore) GetByID(ctx context.Context, id uuid.UUID) (*store.AgentD
 }
 
 func (s *PGAgentStore) Update(ctx context.Context, id uuid.UUID, updates map[string]any) error {
-	// Add soft-delete guard to WHERE clause
 	if len(updates) == 0 {
 		return nil
 	}
-	updates["updated_at"] = time.Now()
-	err := execMapUpdateWhere(ctx, s.db, "agents", updates, "id = $IDX AND deleted_at IS NULL", id)
-	if err != nil {
-		return err
+	var err error
+	var budgetCents *int
+	rawBudget, syncBudget := updates["budget_monthly_cents"]
+	if syncBudget {
+		budgetCents, err = budgetCentsFromUpdate(rawBudget)
+		if err != nil {
+			return err
+		}
+	}
+	var budgetTenantID uuid.UUID
+	if syncBudget {
+		budgetTenantID, err = s.agentTenantID(ctx, id)
+		if err != nil {
+			return err
+		}
 	}
 
-	// Regenerate embedding when frontmatter changes
-	if _, hasFrontmatter := updates["frontmatter"]; hasFrontmatter && s.embProvider != nil {
-		go func() {
-			ag, agErr := s.GetByID(context.Background(), id)
-			if agErr == nil {
-				s.generateAgentEmbedding(context.Background(), id, ag.DisplayName, ag.Frontmatter)
+	// Coerce NOT NULL columns: null → default to prevent constraint violations.
+	// Promoted TEXT columns (migration 000037): null → empty string.
+	for _, col := range []string{"emoji", "agent_description", "thinking_level"} {
+		if v, ok := updates[col]; ok && v == nil {
+			updates[col] = ""
+		}
+	}
+	// Promoted INT/BOOL columns: null → 0/false.
+	for _, col := range []string{"skill_nudge_interval", "max_tokens", "self_evolve", "skill_evolve", "is_default"} {
+		if v, ok := updates[col]; ok && v == nil {
+			if col == "self_evolve" || col == "skill_evolve" || col == "is_default" {
+				updates[col] = false
+			} else {
+				updates[col] = 0
 			}
-		}()
+		}
+	}
+	// NOT NULL JSONB columns: null → empty object.
+	for _, col := range []string{"other_config", "tools_config", "chatgpt_oauth_routing", "model_fallback", "reasoning_config", "workspace_sharing", "shell_deny_groups", "kg_dedup_config"} {
+		if v, ok := updates[col]; ok && isEmptyOrNullJSONUpdate(v) {
+			updates[col] = []byte("{}")
+		}
+	}
+
+	// If setting this agent as default, unset any existing default first (scoped to same tenant).
+	if v, ok := updates["is_default"]; ok {
+		if isDefault, _ := v.(bool); isDefault {
+			if store.IsCrossTenant(ctx) {
+				if _, err := s.db.ExecContext(ctx,
+					"UPDATE agents SET is_default = false WHERE is_default = true AND id != $1 AND deleted_at IS NULL", id); err != nil {
+					slog.Warn("agents.unset_default", "error", err)
+				}
+			} else {
+				tid := store.TenantIDFromContext(ctx)
+				if tid != uuid.Nil {
+					if _, err := s.db.ExecContext(ctx,
+						"UPDATE agents SET is_default = false WHERE is_default = true AND id != $1 AND deleted_at IS NULL AND tenant_id = $2", id, tid); err != nil {
+						slog.Warn("agents.unset_default", "error", err)
+					}
+				}
+			}
+		}
+	}
+
+	_, frontmatterChanged := updates["frontmatter"]
+	_, displayNameChanged := updates["display_name"]
+	if frontmatterChanged || displayNameChanged {
+		// Never keep a vector built from stale routing metadata. A bounded async
+		// job or the next startup backfill will fill this NULL.
+		updates["embedding"] = nil
+	}
+	updates["updated_at"] = time.Now()
+	if store.IsCrossTenant(ctx) {
+		if err := execMapUpdateWhere(ctx, s.db, "agents", updates, "id = $IDX AND deleted_at IS NULL", id); err != nil {
+			return err
+		}
+	} else {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return fmt.Errorf("agent not found: %s", id)
+		}
+		if err := execMapUpdateWhereTenant(ctx, s.db, "agents", updates, id, tid); err != nil {
+			return err
+		}
+	}
+	if syncBudget {
+		if err := syncAgentBudgetUsageCap(ctx, s.db, budgetTenantID, id, budgetCents); err != nil {
+			return err
+		}
+	}
+
+	if frontmatterChanged || displayNameChanged {
+		s.queueAgentEmbedding(id)
+	}
+	return nil
+}
+
+func (s *PGAgentStore) agentTenantID(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid != uuid.Nil {
+			return tid, nil
+		}
+	}
+	var tenantID uuid.UUID
+	if err := s.db.QueryRowContext(ctx, "SELECT tenant_id FROM agents WHERE id = $1 AND deleted_at IS NULL", id).Scan(&tenantID); err != nil {
+		return uuid.Nil, fmt.Errorf("agent not found: %s", id)
+	}
+	return tenantID, nil
+}
+
+func budgetCentsFromUpdate(v any) (*int, error) {
+	if v == nil {
+		return nil, nil
+	}
+	var cents int
+	switch n := v.(type) {
+	case int:
+		cents = n
+	case int32:
+		cents = int(n)
+	case int64:
+		cents = int(n)
+	case float64:
+		if n != float64(int(n)) {
+			return nil, fmt.Errorf("budget_monthly_cents must be an integer")
+		}
+		cents = int(n)
+	default:
+		return nil, fmt.Errorf("budget_monthly_cents must be an integer")
+	}
+	if cents < 0 {
+		return nil, fmt.Errorf("budget_monthly_cents must be non-negative")
+	}
+	return &cents, nil
+}
+
+// syncAgentBudgetUsageCap upserts or deletes the agent's monthly budget cap
+// in usage_cap_policies. It accepts a sqlExecer so it can be called inside a
+// transaction (during Create) or directly against the pool (during Update).
+func syncAgentBudgetUsageCap(ctx context.Context, db sqlExecer, tenantID, agentID uuid.UUID, budgetCents *int) error {
+	if budgetCents == nil || *budgetCents <= 0 {
+		_, err := db.ExecContext(ctx,
+			`DELETE FROM usage_cap_policies
+			 WHERE tenant_id=$1 AND agent_id=$2 AND source=$3`,
+			tenantID, agentID, store.UsageCapSourceAgentBudget)
+		return err
+	}
+	costMicros := int64(*budgetCents) * 10000
+	_, err := db.ExecContext(ctx, `
+INSERT INTO usage_cap_policies (
+	tenant_id, agent_id, window_key, max_cost_micros, enabled, priority, source
+) VALUES ($1,$2,'month',$3,true,90,$4)
+ON CONFLICT (tenant_id, agent_id) WHERE source = 'agent_budget_monthly_cents'
+DO UPDATE SET
+	window_key='month',
+	provider_id=NULL,
+	provider_type=NULL,
+	model_id=NULL,
+	max_tokens=NULL,
+	max_cost_micros=EXCLUDED.max_cost_micros,
+	enabled=true,
+	priority=EXCLUDED.priority,
+	updated_at=now()`,
+		tenantID, agentID, costMicros, store.UsageCapSourceAgentBudget)
+	return err
+}
+
+func isEmptyOrNullJSONUpdate(v any) bool {
+	if v == nil {
+		return true
+	}
+	switch data := v.(type) {
+	case json.RawMessage:
+		return len(data) == 0 || strings.TrimSpace(string(data)) == "null"
+	case []byte:
+		return len(data) == 0 || strings.TrimSpace(string(data)) == "null"
+	case string:
+		return strings.TrimSpace(data) == "" || strings.TrimSpace(data) == "null"
+	default:
+		return false
+	}
+}
+
+func (s *PGAgentStore) aggregateAndDeleteAgentUsage(ctx context.Context, agentID uuid.UUID) error {
+	// Upsert this agent's usage_snapshots into NULL-agent aggregate rows, then delete the agent rows.
+	// This is necessary because the unique index uses COALESCE(agent_id, '00000000...') so ON DELETE SET NULL
+	// would cause a unique-constraint violation when multiple agent rows share the same bucket/provider/model/channel/tenant.
+	const upsertQuery = `
+		INSERT INTO usage_snapshots
+			(bucket_hour, agent_id, provider, model, channel, tenant_id, input_tokens, output_tokens, created_at)
+		SELECT bucket_hour, NULL, provider, model, channel, tenant_id,
+		       SUM(input_tokens), SUM(output_tokens), NOW()
+		FROM usage_snapshots
+		WHERE agent_id = $1
+		GROUP BY bucket_hour, provider, model, channel, tenant_id
+		ON CONFLICT (bucket_hour, COALESCE(agent_id, '00000000-0000-0000-0000-000000000000'::uuid),
+		             provider, model, channel, tenant_id)
+		DO UPDATE SET
+			input_tokens  = EXCLUDED.input_tokens  + usage_snapshots.input_tokens,
+			output_tokens = EXCLUDED.output_tokens + usage_snapshots.output_tokens
+	`
+	if _, err := s.db.ExecContext(ctx, upsertQuery, agentID); err != nil {
+		return fmt.Errorf("aggregate agent usage: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, "DELETE FROM usage_snapshots WHERE agent_id = $1", agentID); err != nil {
+		return fmt.Errorf("delete agent usage snapshots: %w", err)
 	}
 	return nil
 }
 
 func (s *PGAgentStore) Delete(ctx context.Context, id uuid.UUID) error {
-	// Soft delete
-	_, err := s.db.ExecContext(ctx, "UPDATE agents SET deleted_at = NOW() WHERE id = $1", id)
+	if err := s.aggregateAndDeleteAgentUsage(ctx, id); err != nil {
+		return err
+	}
+	if store.IsCrossTenant(ctx) {
+		_, err := s.db.ExecContext(ctx, "DELETE FROM agents WHERE id = $1", id)
+		return err
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("agent not found: %s", id)
+	}
+	_, err := s.db.ExecContext(ctx, "DELETE FROM agents WHERE id = $1 AND tenant_id = $2", id, tid)
 	return err
 }
 
 func (s *PGAgentStore) List(ctx context.Context, ownerID string) ([]store.AgentData, error) {
-	var rows *sql.Rows
-	var err error
+	q := `SELECT ` + agentSelectCols + ` FROM agents WHERE deleted_at IS NULL`
+	var args []any
+	argIdx := 1
+
 	if ownerID != "" {
-		rows, err = s.db.QueryContext(ctx,
-			`SELECT `+agentSelectCols+`
-			 FROM agents WHERE deleted_at IS NULL AND owner_id = $1 ORDER BY created_at DESC`, ownerID)
-	} else {
-		rows, err = s.db.QueryContext(ctx,
-			`SELECT `+agentSelectCols+`
-			 FROM agents WHERE deleted_at IS NULL ORDER BY created_at DESC`)
+		q += fmt.Sprintf(" AND owner_id = $%d", argIdx)
+		args = append(args, ownerID)
+		argIdx++
 	}
+
+	clause, targs, _, err := scopeClause(ctx, argIdx)
+	if err != nil {
+		slog.Warn("agents.List: tenant context missing, returning empty (fail-closed)", "error", err)
+		return nil, nil
+	}
+	if clause != "" {
+		q += clause
+		args = append(args, targs...)
+		argIdx++
+	}
+
+	q += " ORDER BY created_at DESC"
+	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanAgentRows(rows)
+}
+
+func (s *PGAgentStore) GetDefault(ctx context.Context) (*store.AgentData, error) {
+	if store.IsCrossTenant(ctx) {
+		row := s.db.QueryRowContext(ctx,
+			`SELECT `+agentSelectCols+`
+			 FROM agents WHERE deleted_at IS NULL
+			 ORDER BY is_default DESC, created_at ASC LIMIT 1`)
+		return scanAgentRow(row)
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return nil, fmt.Errorf("agent not found: default")
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+agentSelectCols+`
+		 FROM agents WHERE deleted_at IS NULL AND tenant_id = $1
+		 ORDER BY is_default DESC, created_at ASC LIMIT 1`, tid)
+	return scanAgentRow(row)
 }
 
 // --- Access Control ---
@@ -215,36 +547,49 @@ func (s *PGAgentStore) ShareAgent(ctx context.Context, agentID uuid.UUID, userID
 	if err := store.ValidateUserID(grantedBy); err != nil {
 		return err
 	}
+	tid := tenantIDForInsert(ctx)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO agent_shares (id, agent_id, user_id, role, granted_by, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO agent_shares (id, agent_id, user_id, role, granted_by, tenant_id, created_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
 		 ON CONFLICT (agent_id, user_id) DO UPDATE SET role = EXCLUDED.role, granted_by = EXCLUDED.granted_by`,
-		store.GenNewID(), agentID, userID, role, grantedBy, time.Now(),
+		store.GenNewID(), agentID, userID, role, grantedBy, tid, time.Now(),
 	)
 	return err
 }
 
 func (s *PGAgentStore) RevokeShare(ctx context.Context, agentID uuid.UUID, userID string) error {
+	if store.IsCrossTenant(ctx) {
+		_, err := s.db.ExecContext(ctx,
+			"DELETE FROM agent_shares WHERE agent_id = $1 AND user_id = $2", agentID, userID)
+		return err
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("tenant_id required")
+	}
 	_, err := s.db.ExecContext(ctx,
-		"DELETE FROM agent_shares WHERE agent_id = $1 AND user_id = $2", agentID, userID)
+		"DELETE FROM agent_shares WHERE agent_id = $1 AND user_id = $2 AND tenant_id = $3", agentID, userID, tid)
 	return err
 }
 
 func (s *PGAgentStore) ListShares(ctx context.Context, agentID uuid.UUID) ([]store.AgentShareData, error) {
-	rows, err := s.db.QueryContext(ctx,
-		"SELECT id, agent_id, user_id, role, granted_by, created_at FROM agent_shares WHERE agent_id = $1", agentID)
-	if err != nil {
+	q := "SELECT id, agent_id, user_id, role, granted_by, created_at FROM agent_shares WHERE agent_id = $1"
+	args := []any{agentID}
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return nil, fmt.Errorf("tenant_id required")
+		}
+		q += " AND tenant_id = $2"
+		args = append(args, tid)
+	}
+	var rows []agentShareRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var result []store.AgentShareData
-	for rows.Next() {
-		var d store.AgentShareData
-		if err := rows.Scan(&d.ID, &d.AgentID, &d.UserID, &d.Role, &d.GrantedBy, &d.CreatedAt); err != nil {
-			continue
-		}
-		result = append(result, d)
+	result := make([]store.AgentShareData, len(rows))
+	for i, r := range rows {
+		result[i] = r.toAgentShareData()
 	}
 	return result, nil
 }
@@ -253,9 +598,20 @@ func (s *PGAgentStore) CanAccess(ctx context.Context, agentID uuid.UUID, userID 
 	// Check ownership + default flag
 	var ownerID string
 	var isDefault bool
-	err := s.db.QueryRowContext(ctx,
-		"SELECT owner_id, is_default FROM agents WHERE id = $1 AND deleted_at IS NULL", agentID,
-	).Scan(&ownerID, &isDefault)
+	var err error
+	if store.IsCrossTenant(ctx) {
+		err = s.db.QueryRowContext(ctx,
+			"SELECT owner_id, is_default FROM agents WHERE id = $1 AND deleted_at IS NULL", agentID,
+		).Scan(&ownerID, &isDefault)
+	} else {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return false, "", fmt.Errorf("agent not found")
+		}
+		err = s.db.QueryRowContext(ctx,
+			"SELECT owner_id, is_default FROM agents WHERE id = $1 AND deleted_at IS NULL AND tenant_id = $2", agentID, tid,
+		).Scan(&ownerID, &isDefault)
+	}
 	if err != nil {
 		return false, "", fmt.Errorf("agent not found")
 	}
@@ -270,9 +626,19 @@ func (s *PGAgentStore) CanAccess(ctx context.Context, agentID uuid.UUID, userID 
 	}
 	// Check shares
 	var role string
-	err = s.db.QueryRowContext(ctx,
-		"SELECT role FROM agent_shares WHERE agent_id = $1 AND user_id = $2", agentID, userID,
-	).Scan(&role)
+	if store.IsCrossTenant(ctx) {
+		err = s.db.QueryRowContext(ctx,
+			"SELECT role FROM agent_shares WHERE agent_id = $1 AND user_id = $2", agentID, userID,
+		).Scan(&role)
+	} else {
+		tid := store.TenantIDFromContext(ctx)
+		if tid == uuid.Nil {
+			return false, "", nil
+		}
+		err = s.db.QueryRowContext(ctx,
+			"SELECT role FROM agent_shares WHERE agent_id = $1 AND user_id = $2 AND tenant_id = $3", agentID, userID, tid,
+		).Scan(&role)
+	}
 	if err != nil {
 		return false, "", nil
 	}
@@ -280,11 +646,57 @@ func (s *PGAgentStore) CanAccess(ctx context.Context, agentID uuid.UUID, userID 
 }
 
 func (s *PGAgentStore) ListAccessible(ctx context.Context, userID string) ([]store.AgentData, error) {
+	if store.IsCrossTenant(ctx) {
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT `+agentSelectCols+`
+			 FROM agents
+			 WHERE deleted_at IS NULL AND (
+			     owner_id = $1
+			     OR is_default = true
+			     OR id IN (SELECT agent_id FROM agent_shares WHERE user_id = $1)
+			     OR (
+			         agent_type = 'predefined'
+			         AND id IN (
+			             SELECT agent_id FROM channel_instances ci
+			             WHERE ci.enabled = true
+			             AND EXISTS (
+			                 SELECT 1 FROM jsonb_array_elements_text(ci.config->'allow_from') af
+			                 WHERE af = $1
+			             )
+			         )
+			     )
+			 )
+			 ORDER BY created_at DESC`, userID)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanAgentRows(rows)
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return nil, fmt.Errorf("tenant_id required")
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+agentSelectCols+`
 		 FROM agents
-		 WHERE deleted_at IS NULL AND (owner_id = $1 OR is_default = true OR id IN (SELECT agent_id FROM agent_shares WHERE user_id = $1))
-		 ORDER BY created_at DESC`, userID)
+		 WHERE deleted_at IS NULL AND tenant_id = $2 AND (
+		     owner_id = $1
+		     OR is_default = true
+		     OR id IN (SELECT agent_id FROM agent_shares WHERE user_id = $1 AND tenant_id = $2)
+		     OR (
+		         agent_type = 'predefined'
+		         AND id IN (
+		             SELECT agent_id FROM channel_instances ci
+		             WHERE ci.enabled = true AND ci.tenant_id = $2
+		             AND EXISTS (
+		                 SELECT 1 FROM jsonb_array_elements_text(ci.config->'allow_from') af
+		                 WHERE af = $1
+		             )
+		         )
+		     )
+		 )
+		 ORDER BY created_at DESC`, userID, tid)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +707,7 @@ func (s *PGAgentStore) ListAccessible(ctx context.Context, userID string) ([]sto
 // --- Scan helpers ---
 
 type agentRowScanner interface {
-	Scan(dest ...interface{}) error
+	Scan(dest ...any) error
 }
 
 func scanAgentRow(row agentRowScanner) (*store.AgentData, error) {
@@ -303,10 +715,14 @@ func scanAgentRow(row agentRowScanner) (*store.AgentData, error) {
 	var frontmatter sql.NullString
 	// pgx: scan nullable JSONB into *[]byte (NOT *json.RawMessage — pgx can't scan NULL into defined types)
 	var toolsCfg, sandboxCfg, subagentsCfg, memoryCfg, compactionCfg, pruningCfg, otherCfg *[]byte
+	var reasoningCfg, wsCfg, oauthCfg, fallbackCfg, shellCfg, kgCfg *[]byte
 	err := row.Scan(&d.ID, &d.AgentKey, &d.DisplayName, &frontmatter, &d.OwnerID, &d.Provider, &d.Model,
 		&d.ContextWindow, &d.MaxToolIterations, &d.Workspace, &d.RestrictToWorkspace,
 		&toolsCfg, &sandboxCfg, &subagentsCfg, &memoryCfg, &compactionCfg, &pruningCfg, &otherCfg,
-		&d.AgentType, &d.IsDefault, &d.Status, &d.CreatedAt, &d.UpdatedAt)
+		&d.Emoji, &d.AgentDescription, &d.ThinkingLevel, &d.MaxTokens,
+		&d.SelfEvolve, &d.SkillEvolve, &d.SkillNudgeInterval,
+		&reasoningCfg, &wsCfg, &oauthCfg, &fallbackCfg, &shellCfg, &kgCfg,
+		&d.AgentType, &d.IsDefault, &d.Status, &d.BudgetMonthlyCents, &d.CreatedAt, &d.UpdatedAt, &d.TenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -335,6 +751,24 @@ func scanAgentRow(row agentRowScanner) (*store.AgentData, error) {
 	if otherCfg != nil {
 		d.OtherConfig = *otherCfg
 	}
+	if reasoningCfg != nil {
+		d.ReasoningConfig = *reasoningCfg
+	}
+	if wsCfg != nil {
+		d.WorkspaceSharing = *wsCfg
+	}
+	if oauthCfg != nil {
+		d.ChatGPTOAuthRouting = *oauthCfg
+	}
+	if fallbackCfg != nil {
+		d.ModelFallback = *fallbackCfg
+	}
+	if shellCfg != nil {
+		d.ShellDenyGroups = *shellCfg
+	}
+	if kgCfg != nil {
+		d.KGDedupConfig = *kgCfg
+	}
 	return &d, nil
 }
 
@@ -343,6 +777,10 @@ func scanAgentRows(rows *sql.Rows) ([]store.AgentData, error) {
 	for rows.Next() {
 		d, err := scanAgentRow(rows)
 		if err != nil {
+			// Skipping keeps one bad row from hiding the rest, but it must
+			// not be silent: an agent vanishing from lists is otherwise
+			// undiagnosable.
+			slog.Warn("agents.scan_row_skipped", "error", err)
 			continue
 		}
 		result = append(result, *d)
@@ -352,14 +790,19 @@ func scanAgentRows(rows *sql.Rows) ([]store.AgentData, error) {
 
 // execMapUpdateWhere is like execMapUpdate but with a custom WHERE clause.
 // The whereClause should use $IDX as placeholder for the ID (will be replaced with the next arg index).
+// Column names are validated against a strict identifier regex to prevent SQL injection.
 func execMapUpdateWhere(ctx context.Context, db *sql.DB, table string, updates map[string]any, whereClause string, id uuid.UUID) error {
 	if len(updates) == 0 {
 		return nil
 	}
 	var setClauses []string
-	var args []interface{}
+	var args []any
 	i := 1
 	for col, val := range updates {
+		if !validColumnName.MatchString(col) {
+			slog.Warn("security.invalid_column_name", "table", table, "column", col)
+			return fmt.Errorf("invalid column name: %q", col)
+		}
 		setClauses = append(setClauses, fmt.Sprintf("%s = $%d", col, i))
 		args = append(args, val)
 		i++
@@ -382,25 +825,37 @@ func execMapUpdateWhere(ctx context.Context, db *sql.DB, table string, updates m
 }
 
 func joinStrings(s []string, sep string) string {
-	result := ""
+	var result strings.Builder
 	for i, v := range s {
 		if i > 0 {
-			result += sep
+			result.WriteString(sep)
 		}
-		result += v
+		result.WriteString(v)
 	}
-	return result
+	return result.String()
+}
+
+// ResetStuckSummoning flips rows with status='summoning' to 'summon_failed'.
+// Called at startup to recover from crashes where summon goroutines died mid-flight.
+func (s *PGAgentStore) ResetStuckSummoning(ctx context.Context) (int64, error) {
+	const q = `UPDATE agents SET status = $1 WHERE status = $2`
+	res, err := s.db.ExecContext(ctx, q, store.AgentStatusSummonFailed, store.AgentStatusSummoning)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 func replaceIDX(s, replacement string) string {
-	result := ""
+	var result strings.Builder
 	for i := 0; i < len(s); i++ {
 		if i+4 <= len(s) && s[i:i+4] == "$IDX" {
-			result += replacement
+			result.WriteString(replacement)
 			i += 3
 		} else {
-			result += string(s[i])
+			result.WriteString(string(s[i]))
 		}
 	}
-	return result
+	return result.String()
 }

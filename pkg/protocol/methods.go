@@ -11,10 +11,11 @@ const (
 	MethodAgentIdentityGet = "agent.identity.get"
 
 	// Chat
-	MethodChatSend    = "chat.send"
-	MethodChatHistory = "chat.history"
-	MethodChatAbort   = "chat.abort"
-	MethodChatInject  = "chat.inject"
+	MethodChatSend          = "chat.send"
+	MethodChatHistory       = "chat.history"
+	MethodChatAbort         = "chat.abort"
+	MethodChatInject        = "chat.inject"
+	MethodChatSessionStatus = "chat.session.status"
 
 	// Agents management
 	MethodAgentsList     = "agents.list"
@@ -26,10 +27,12 @@ const (
 	MethodAgentsFileSet  = "agents.files.set"
 
 	// Config
-	MethodConfigGet    = "config.get"
-	MethodConfigApply  = "config.apply"
-	MethodConfigPatch  = "config.patch"
-	MethodConfigSchema = "config.schema"
+	MethodConfigGet           = "config.get"
+	MethodConfigApply         = "config.apply"
+	MethodConfigPatch         = "config.patch"
+	MethodConfigSchema        = "config.schema"
+	MethodConfigDefaults      = "config.defaults"
+	MethodChatBehaviorPreview = "chat_behavior.preview"
 
 	// Sessions
 	MethodSessionsList    = "sessions.list"
@@ -37,6 +40,8 @@ const (
 	MethodSessionsPatch   = "sessions.patch"
 	MethodSessionsDelete  = "sessions.delete"
 	MethodSessionsReset   = "sessions.reset"
+	MethodSessionsCompact = "sessions.compact"
+	MethodRunTimelineGet  = "run.timeline.get"
 
 	// System
 	MethodConnect = "connect"
@@ -46,8 +51,8 @@ const (
 
 // Phase 2 - NEEDED methods
 const (
-	MethodSkillsList  = "skills.list"
-	MethodSkillsGet   = "skills.get"
+	MethodSkillsList   = "skills.list"
+	MethodSkillsGet    = "skills.get"
 	MethodSkillsUpdate = "skills.update"
 
 	MethodCronList   = "cron.list"
@@ -65,6 +70,7 @@ const (
 
 	MethodPairingRequest = "device.pair.request"
 	MethodPairingApprove = "device.pair.approve"
+	MethodPairingDeny    = "device.pair.deny"
 	MethodPairingList    = "device.pair.list"
 	MethodPairingRevoke  = "device.pair.revoke"
 
@@ -77,10 +83,34 @@ const (
 	MethodUsageGet     = "usage.get"
 	MethodUsageSummary = "usage.summary"
 
+	MethodQuotaUsage = "quota.usage"
+
+	MethodLLMComplete = "llm.complete"
+
 	MethodSend = "send"
 )
 
-// Channel instances management (managed mode)
+// Agent heartbeat
+const (
+	MethodHeartbeatGet          = "heartbeat.get"
+	MethodHeartbeatSet          = "heartbeat.set"
+	MethodHeartbeatToggle       = "heartbeat.toggle"
+	MethodHeartbeatTest         = "heartbeat.test"
+	MethodHeartbeatLogs         = "heartbeat.logs"
+	MethodHeartbeatChecklistGet = "heartbeat.checklist.get"
+	MethodHeartbeatChecklistSet = "heartbeat.checklist.set"
+	MethodHeartbeatTargets      = "heartbeat.targets"
+)
+
+// Config permissions
+const (
+	MethodConfigPermissionsList   = "config.permissions.list"
+	MethodConfigPermissionsCheck  = "config.permissions.check"
+	MethodConfigPermissionsGrant  = "config.permissions.grant"
+	MethodConfigPermissionsRevoke = "config.permissions.revoke"
+)
+
+// Channel instances management
 const (
 	MethodChannelInstancesList   = "channels.instances.list"
 	MethodChannelInstancesGet    = "channels.instances.get"
@@ -89,7 +119,7 @@ const (
 	MethodChannelInstancesDelete = "channels.instances.delete"
 )
 
-// Agent links (inter-agent delegation, managed mode)
+// Agent links (inter-agent delegation)
 const (
 	MethodAgentsLinksList   = "agents.links.list"
 	MethodAgentsLinksCreate = "agents.links.create"
@@ -97,19 +127,69 @@ const (
 	MethodAgentsLinksDelete = "agents.links.delete"
 )
 
-// Agent teams (managed mode)
+// Agent teams
 const (
-	MethodTeamsList     = "teams.list"
-	MethodTeamsCreate   = "teams.create"
-	MethodTeamsGet      = "teams.get"
-	MethodTeamsDelete   = "teams.delete"
-	MethodTeamsTaskList = "teams.tasks.list"
+	MethodTeamsList                = "teams.list"
+	MethodTeamsCreate              = "teams.create"
+	MethodTeamsGet                 = "teams.get"
+	MethodTeamsDelete              = "teams.delete"
+	MethodTeamsTaskList            = "teams.tasks.list"
+	MethodTeamsTaskGet             = "teams.tasks.get"
+	MethodTeamsTaskGetLight        = "teams.tasks.get-light"
+	MethodTeamsTaskApprove         = "teams.tasks.approve"
+	MethodTeamsTaskReject          = "teams.tasks.reject"
+	MethodTeamsTaskComment         = "teams.tasks.comment"
+	MethodTeamsTaskComments        = "teams.tasks.comments"
+	MethodTeamsTaskEvents          = "teams.tasks.events"
+	MethodTeamsTaskCreate          = "teams.tasks.create"
+	MethodTeamsTaskDelete          = "teams.tasks.delete"
+	MethodTeamsTaskDeleteBulk      = "teams.tasks.delete-bulk"
+	MethodTeamsTaskAssign          = "teams.tasks.assign"
+	MethodTeamsTaskCancel          = "teams.tasks.cancel"
+	MethodTeamsTaskRetry           = "teams.tasks.retry"
+	MethodTeamsTaskActiveBySession = "teams.tasks.active-by-session"
+	MethodTeamsMembersAdd          = "teams.members.add"
+	MethodTeamsMembersRemove       = "teams.members.remove"
+	MethodTeamsUpdate              = "teams.update"
+	MethodTeamsKnownUsers          = "teams.known_users"
+	MethodTeamsScopes              = "teams.scopes"
 )
 
-// Delegation history (managed mode)
+// Team workspace
 const (
-	MethodDelegationsList = "delegations.list"
-	MethodDelegationsGet  = "delegations.get"
+	MethodTeamsWorkspaceList   = "teams.workspace.list"
+	MethodTeamsWorkspaceRead   = "teams.workspace.read"
+	MethodTeamsWorkspaceDelete = "teams.workspace.delete"
+)
+
+// Team events
+const (
+	MethodTeamsEventsList = "teams.events.list"
+)
+
+// Tenants (multi-tenant management)
+const (
+	MethodTenantsList        = "tenants.list"
+	MethodTenantsGet         = "tenants.get"
+	MethodTenantsCreate      = "tenants.create"
+	MethodTenantsUpdate      = "tenants.update"
+	MethodTenantsUsersList   = "tenants.users.list"
+	MethodTenantsUsersAdd    = "tenants.users.add"
+	MethodTenantsUsersRemove = "tenants.users.remove"
+	MethodTenantsMine        = "tenants.mine"
+)
+
+// API key management
+const (
+	MethodAPIKeysList   = "api_keys.list"
+	MethodAPIKeysCreate = "api_keys.create"
+	MethodAPIKeysRevoke = "api_keys.revoke"
+)
+
+// Voices (ElevenLabs voice picker)
+const (
+	MethodVoicesList    = "voices.list"
+	MethodVoicesRefresh = "voices.refresh"
 )
 
 // Phase 3+ - NICE TO HAVE methods
@@ -127,5 +207,51 @@ const (
 	MethodBrowserSnapshot   = "browser.snapshot"
 	MethodBrowserScreenshot = "browser.screenshot"
 
-	MethodHeartbeat = "heartbeat"
+	// Zalo Personal
+	MethodZaloPersonalQRStart  = "zalo.personal.qr.start"
+	MethodZaloPersonalContacts = "zalo.personal.contacts"
+
+	// WhatsApp
+	MethodWhatsAppQRStart = "whatsapp.qr.start"
+)
+
+// Workstations (Standard edition only — gated at router)
+const (
+	MethodWorkstationsList        = "workstations.list"
+	MethodWorkstationsGet         = "workstations.get"
+	MethodWorkstationsCreate      = "workstations.create"
+	MethodWorkstationsUpdate      = "workstations.update"
+	MethodWorkstationsDelete      = "workstations.delete"
+	MethodWorkstationsTest        = "workstations.testConnection"
+	MethodWorkstationsLinkAgent   = "workstations.linkAgent"
+	MethodWorkstationsUnlinkAgent = "workstations.unlinkAgent"
+
+	// Workstation permission allowlist CRUD (Phase 6)
+	MethodWorkstationsPermList   = "workstations.permissions.list"
+	MethodWorkstationsPermAdd    = "workstations.permissions.add"
+	MethodWorkstationsPermRemove = "workstations.permissions.remove"
+	MethodWorkstationsPermToggle = "workstations.permissions.toggle"
+
+	// Workstation activity audit log (Phase 7)
+	MethodWorkstationsListActivity = "workstations.activity.list"
+)
+
+// Agent hooks (Phase 3)
+const (
+	MethodHooksList    = "hooks.list"
+	MethodHooksCreate  = "hooks.create"
+	MethodHooksUpdate  = "hooks.update"
+	MethodHooksDelete  = "hooks.delete"
+	MethodHooksToggle  = "hooks.toggle"
+	MethodHooksTest    = "hooks.test"
+	MethodHooksHistory = "hooks.history"
+)
+
+// Bitrix24 portal management (self-service onboarding for the bitrix24 channel).
+// See plans/260513-1648-bitrix24-portal-self-service-ux/phase-02-backend-rpc-portals.md.
+const (
+	MethodBitrixPortalsList          = "bitrix.portals.list"
+	MethodBitrixPortalsCreate        = "bitrix.portals.create"
+	MethodBitrixPortalsGetInstallURL = "bitrix.portals.get_install_url"
+	MethodBitrixPortalsDelete        = "bitrix.portals.delete"
 )

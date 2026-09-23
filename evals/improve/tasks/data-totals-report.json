@@ -1,0 +1,30 @@
+{
+  "id": "data-totals-report",
+  "split": "heldout",
+  "contract": {
+    "version": 1,
+    "title": "Category totals for the monthly report",
+    "objective": "Write transform.sh as described in README.md.",
+    "agent": "candidate",
+    "workspace": {
+      "source_dir": "csvtool"
+    },
+    "acceptance": [
+      {
+        "id": "transform",
+        "kind": "command",
+        "command": [
+          "sh",
+          "check.sh"
+        ],
+        "overlay_dir": "csvtool-acceptance",
+        "must_change": true,
+        "timeout_seconds": 60
+      }
+    ],
+    "limits": {
+      "max_iterations": 10,
+      "timeout_seconds": 60
+    }
+  }
+}

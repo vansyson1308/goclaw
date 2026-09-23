@@ -1,11 +1,14 @@
-export function formatDate(date: string | Date): string {
+export function formatDate(date: string | Date, tz?: string): string {
   const d = typeof date === "string" ? new Date(date) : date;
-  return d.toLocaleDateString("en-US", {
+  const opts: Intl.DateTimeFormatOptions = {
     month: "short",
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-  });
+    second: "2-digit",
+  };
+  if (tz) opts.timeZone = resolveTimezone(tz);
+  return d.toLocaleDateString("en-US", opts);
 }
 
 export function formatRelativeTime(date: string | Date): string {
@@ -24,10 +27,25 @@ export function formatRelativeTime(date: string | Date): string {
   return formatDate(d);
 }
 
-export function formatTokens(count: number): string {
+export function formatTokens(count: number | null | undefined): string {
+  if (count == null) return "0";
   if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
   if (count >= 1_000) return `${(count / 1_000).toFixed(1)}K`;
   return count.toString();
+}
+
+export function formatCost(cost: number | null | undefined): string {
+  if (cost == null || cost === 0) return "$0.00";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  return `$${cost.toFixed(2)}`;
+}
+
+export function formatApiCost(cost: number | null | undefined): string {
+  if (cost == null || cost === 0) return "$0.00";
+  return `$${cost.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
 }
 
 export function formatDuration(ms: number | undefined | null): string {
@@ -38,6 +56,50 @@ export function formatDuration(ms: number | undefined | null): string {
   const min = Math.floor(sec / 60);
   const remainSec = Math.floor(sec % 60);
   return `${min}m ${remainSec}s`;
+}
+
+/**
+ * Resolve the effective IANA timezone string.
+ * "auto" → browser's local timezone.
+ */
+export function resolveTimezone(tz: string): string {
+  if (tz === "auto") return Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return tz;
+}
+
+/**
+ * Format a UTC timestamp for chart labels, respecting the user's chosen timezone.
+ * Uses Intl.DateTimeFormat for native timezone support (no extra deps).
+ */
+export function formatBucketTz(
+  bucket: string,
+  tz: string,
+  granularity: "hour" | "day",
+): string {
+  try {
+    const d = new Date(bucket);
+    const resolved = resolveTimezone(tz);
+    const opts: Intl.DateTimeFormatOptions = {
+      timeZone: resolved,
+      month: "short",
+      day: "numeric",
+      ...(granularity === "hour" ? { hour: "2-digit", minute: "2-digit", hour12: false } : {}),
+    };
+    return new Intl.DateTimeFormat("en-US", opts).format(d);
+  } catch {
+    return bucket;
+  }
+}
+
+/**
+ * Format a file size in bytes to a human-readable string.
+ */
+export function formatFileSize(bytes: number): string {
+  if (bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 /**

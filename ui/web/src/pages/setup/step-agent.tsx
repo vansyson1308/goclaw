@@ -1,0 +1,392 @@
+import { useState, useMemo, useEffect, useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
+import { Switch } from "@/components/ui/switch";
+import { Card, CardContent } from "@/components/ui/card";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { InfoTip } from "@/pages/setup/info-tip";
+import { useAgents } from "@/pages/agents/hooks/use-agents";
+import { SummoningModal } from "@/pages/agents/summoning-modal";
+import { useAgentPresets } from "@/pages/agents/agent-presets";
+import { useWsEvent } from "@/hooks/use-ws-event";
+import { slugify, isValidSlug } from "@/lib/slug";
+import { toast } from "@/stores/use-toast-store";
+import type { ProviderData } from "@/types/provider";
+import type { AgentData } from "@/types/agent";
+
+interface StepAgentProps {
+  provider: ProviderData | null;
+  model: string | null;
+  onComplete: (agent: AgentData) => void;
+  onBack?: () => void;
+  existingAgent?: AgentData | null;
+}
+
+export function StepAgent({ provider, model, onComplete, onBack, existingAgent }: StepAgentProps) {
+  const { t } = useTranslation("setup");
+  const { t: tAgents } = useTranslation("agents");
+  const { createAgent, updateAgent, deleteAgent, resummonAgent, cancelSummonAgent } = useAgents();
+  const agentPresets = useAgentPresets();
+
+  const isEditing = !!existingAgent;
+
+  // Default to first preset (Fox Spirit)
+  const defaultPreset = agentPresets[0];
+  const [description, setDescription] = useState(
+    existingAgent?.agent_description ?? defaultPreset?.prompt ?? "",
+  );
+  const [selectedPresetIdx, setSelectedPresetIdx] = useState<number | null>(
+    existingAgent ? null : 0,
+  );
+  // Identity is editable state, only *prefilled* from the selected preset. It must
+  // survive description edits — deselecting a preset never rewrites the name/key.
+  const [displayName, setDisplayName] = useState(
+    existingAgent?.display_name ?? defaultPreset?.name ?? "",
+  );
+  const [agentKey, setAgentKey] = useState(
+    existingAgent?.agent_key ?? defaultPreset?.agentKey ?? "",
+  );
+  const [displayNameEdited, setDisplayNameEdited] = useState(false);
+  const [agentKeyEdited, setAgentKeyEdited] = useState(false);
+  const [emoji, setEmoji] = useState(
+    existingAgent?.emoji ?? defaultPreset?.emoji ?? "",
+  );
+  const [selfEvolve, setSelfEvolve] = useState(
+    Boolean(existingAgent?.self_evolve),
+  );
+  const [gatewayOperatorAccess, setGatewayOperatorAccess] = useState(false);
+  const [gatewayOperatorNotice, setGatewayOperatorNotice] = useState<{
+    variant: "success" | "warning";
+    message: string;
+  } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  // Summoning modal state
+  const [summoningOpen, setSummoningOpen] = useState(false);
+  const [summoningOutcome, setSummoningOutcome] = useState<"pending" | "success" | "failed">("pending");
+  const [createdAgent, setCreatedAgent] = useState<{ id: string; name: string } | null>(null);
+  const [agentResult, setAgentResult] = useState<AgentData | null>(null);
+
+  const activePreset = selectedPresetIdx !== null ? agentPresets[selectedPresetIdx] : undefined;
+  const presetPrompt = activePreset?.prompt;
+  const presetName = activePreset?.name;
+
+  // Deps are plain strings, so this only fires when the translated preset text
+  // actually changes (locale switch) — not on every render.
+  useEffect(() => {
+    if (presetPrompt === undefined) return;
+    setDescription(presetPrompt);
+  }, [presetPrompt]);
+
+  useEffect(() => {
+    if (presetName === undefined || displayNameEdited || isEditing) return;
+    setDisplayName(presetName);
+  }, [presetName, displayNameEdited, isEditing]);
+
+  const trimmedName = displayName.trim();
+  const keyValid = isValidSlug(agentKey);
+  const canSubmit = !!trimmedName && (isEditing || keyValid) && !!description.trim();
+
+  const providerLabel = useMemo(() => {
+    if (!provider) return "—";
+    return provider.display_name || provider.name;
+  }, [provider]);
+
+  // Track summoning outcome via WS event
+  const handleSummoningEvent = useCallback(
+    (payload: unknown) => {
+      const data = payload as Record<string, string>;
+      if (createdAgent && data.agent_id !== createdAgent.id) return;
+      if (data.type === "completed") setSummoningOutcome("success");
+      if (data.type === "failed") setSummoningOutcome("failed");
+    },
+    [createdAgent],
+  );
+  useWsEvent("agent.summoning", handleSummoningEvent);
+
+  const handleContinue = () => {
+    if (agentResult) onComplete(agentResult);
+  };
+
+  const handleSelectPreset = (idx: number) => {
+    const preset = agentPresets[idx];
+    if (!preset) return;
+    setSelectedPresetIdx(idx);
+    setDescription(preset.prompt);
+    setDisplayName(preset.name);
+    setDisplayNameEdited(false);
+    setEmoji(preset.emoji);
+    if (!isEditing) {
+      setAgentKey(preset.agentKey);
+      setAgentKeyEdited(false);
+    }
+  };
+
+  const handleDescriptionChange = (value: string) => {
+    setDescription(value);
+    // Editing the prompt only clears the preset highlight — identity stays as typed.
+    if (selectedPresetIdx !== null && value !== presetPrompt) setSelectedPresetIdx(null);
+  };
+
+  const handleDisplayNameChange = (value: string) => {
+    setDisplayNameEdited(true);
+    setDisplayName(value);
+    if (!agentKeyEdited && !isEditing) setAgentKey(slugify(value));
+  };
+
+  const handleAgentKeyChange = (value: string) => {
+    setAgentKeyEdited(true);
+    setAgentKey(value);
+  };
+
+  const handleSubmit = async () => {
+    if (!provider) { setError(t("agent.errors.noProvider")); return; }
+    if (!canSubmit) return;
+
+    setLoading(true);
+    setError("");
+    setGatewayOperatorNotice(null);
+
+    try {
+      if (isEditing) {
+        const patch: Partial<AgentData> = {
+          display_name: trimmedName,
+          provider: provider.name,
+          model: model || "",
+          // Promoted fields at top level
+          agent_description: description.trim() || null,
+          self_evolve: selfEvolve,
+          emoji: emoji.trim() || null,
+        };
+        await updateAgent(existingAgent!.id, patch);
+        onComplete({ ...existingAgent!, ...patch } as AgentData);
+      } else {
+        const data: Partial<AgentData> = {
+          agent_key: agentKey,
+          display_name: trimmedName,
+          provider: provider.name,
+          model: model || "",
+          agent_type: "predefined",
+          is_default: true,
+          // Promoted fields at top level
+          agent_description: description.trim() || null,
+          self_evolve: selfEvolve,
+          emoji: emoji.trim() || null,
+          grant_gateway_operator_access: gatewayOperatorAccess || undefined,
+        };
+
+        const result = await createAgent(data) as AgentData;
+        const bootstrap = result.gateway_operator_bootstrap;
+        if (bootstrap?.status === "granted") {
+          const message = t("agent.gatewayOperatorGrantedDesc");
+          setGatewayOperatorNotice({ variant: "success", message });
+          toast.success(t("agent.gatewayOperatorGranted"), message);
+        } else if (bootstrap?.warning) {
+          setGatewayOperatorNotice({ variant: "warning", message: bootstrap.warning });
+          toast.warning(t("agent.gatewayOperatorWarning"), bootstrap.warning);
+        }
+        setAgentResult(result);
+        setSummoningOutcome("pending");
+        setCreatedAgent({ id: result.id, name: trimmedName || agentKey });
+        setSummoningOpen(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("agent.errors.failedCreate"));
+    } finally {
+      setLoading(false);
+    }
+  };
+  const handleSummoningComplete = () => {};
+
+  const handleModalClose = async () => {
+    if (summoningOutcome === "pending") return;
+    if (summoningOutcome === "success") return;
+
+    if (agentResult) {
+      try { await deleteAgent(agentResult.id); } catch { /* best effort */ }
+    }
+    setAgentResult(null);
+    setCreatedAgent(null);
+    setSummoningOpen(false);
+    setSummoningOutcome("pending");
+    setError(t("agent.summoningFailed"));
+  };
+
+  return (
+    <>
+      <Card className="py-0 gap-0">
+        <CardContent className="space-y-4 px-6 py-5">
+          <TooltipProvider>
+            <div className="space-y-1">
+              <h2 className="text-lg font-semibold">{t("agent.title")}</h2>
+              <p className="text-sm text-muted-foreground">
+                {t("agent.description")}
+              </p>
+            </div>
+
+            {/* Provider + model info */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-muted-foreground">{t("agent.provider")}</span>
+                <Badge variant="secondary">{providerLabel}</Badge>
+              </div>
+              {model && (
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-muted-foreground">{t("agent.model")}</span>
+                  <Badge variant="outline">{model}</Badge>
+                </div>
+              )}
+            </div>
+
+            {/* Agent identity — editable name + key, prefilled from the preset */}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="setup-display-name">{tAgents("create.displayName")}</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="setup-emoji"
+                    value={emoji}
+                    onChange={(e) => setEmoji(e.target.value)}
+                    placeholder="🤖"
+                    className="w-14 shrink-0 text-center text-base md:text-lg"
+                    maxLength={2}
+                    title={tAgents("create.emojiHint")}
+                  />
+                  <Input
+                    id="setup-display-name"
+                    value={displayName}
+                    onChange={(e) => handleDisplayNameChange(e.target.value)}
+                    placeholder={tAgents("create.displayNamePlaceholder")}
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="setup-agent-key">{tAgents("create.agentKey")}</Label>
+                <Input
+                  id="setup-agent-key"
+                  value={agentKey}
+                  onChange={(e) => handleAgentKeyChange(e.target.value)}
+                  onBlur={(e) => setAgentKey(slugify(e.target.value))}
+                  placeholder={tAgents("create.agentKeyPlaceholder")}
+                  disabled={isEditing}
+                />
+                <p
+                  className={`text-xs ${
+                    !isEditing && agentKey && !keyValid ? "text-destructive" : "text-muted-foreground"
+                  }`}
+                >
+                  {tAgents("create.agentKeyHint")}
+                </p>
+              </div>
+            </div>
+
+            {/* Prompt / description with preset selection */}
+            <div className="space-y-3">
+              <Label className="inline-flex items-center gap-1.5">
+                {t("agent.personality")}
+                <InfoTip text={t("agent.personalityHint")} />
+              </Label>
+              <div className="flex flex-wrap gap-1.5">
+                {agentPresets.map((preset, idx) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    onClick={() => handleSelectPreset(idx)}
+                    className={`cursor-pointer rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                      selectedPresetIdx === idx
+                        ? "border-primary bg-primary/10 text-primary font-medium"
+                        : "hover:bg-accent"
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+              <Textarea
+                value={description}
+                onChange={(e) => handleDescriptionChange(e.target.value)}
+                placeholder={t("agent.personalityPlaceholder")}
+                className="min-h-[120px]"
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("agent.personalityHintBottom")}
+              </p>
+              <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2.5">
+                <div className="space-y-0.5">
+                  <Label htmlFor="setup-self-evolve" className="text-sm font-normal">{t("agent.selfEvolve")}</Label>
+                  <p className="text-xs text-muted-foreground">{t("agent.selfEvolveDesc")}</p>
+                </div>
+                <Switch id="setup-self-evolve" checked={selfEvolve} onCheckedChange={setSelfEvolve} />
+              </div>
+              {!isEditing && (
+                <div className="flex items-center justify-between gap-4 rounded-md border px-3 py-2.5">
+                  <div className="space-y-0.5">
+                    <Label htmlFor="setup-gateway-operator" className="text-sm font-normal">
+                      {t("agent.gatewayOperatorAccess")}
+                    </Label>
+                    <p className="text-xs text-muted-foreground">{t("agent.gatewayOperatorAccessDesc")}</p>
+                  </div>
+                  <Switch
+                    id="setup-gateway-operator"
+                    checked={gatewayOperatorAccess}
+                    onCheckedChange={setGatewayOperatorAccess}
+                  />
+                </div>
+              )}
+            </div>
+
+            {gatewayOperatorNotice && (
+              <p
+                className={`rounded-md border px-3 py-2 text-xs ${
+                  gatewayOperatorNotice.variant === "success"
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200"
+                    : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200"
+                }`}
+              >
+                {gatewayOperatorNotice.message}
+              </p>
+            )}
+            {error && <p className="text-sm text-destructive">{error}</p>}
+
+            <div className={`flex ${onBack ? "justify-between" : "justify-end"} gap-2`}>
+              {onBack && (
+                <Button variant="secondary" onClick={onBack}>
+                  ← {t("common.back")}
+                </Button>
+              )}
+              <Button
+                onClick={handleSubmit}
+                disabled={loading || !canSubmit}
+              >
+                {loading
+                  ? isEditing ? t("agent.updating", "Updating...") : t("agent.creating")
+                  : isEditing ? t("agent.update", "Update") : t("agent.create")}
+              </Button>
+            </div>
+          </TooltipProvider>
+        </CardContent>
+      </Card>
+
+      {/* Summoning animation modal */}
+      {createdAgent && (
+        <SummoningModal
+          open={summoningOpen}
+          onOpenChange={handleModalClose}
+          agentId={createdAgent.id}
+          agentName={createdAgent.name}
+          onCompleted={handleSummoningComplete}
+          onResummon={resummonAgent}
+          onCancel={cancelSummonAgent}
+          hideClose
+          onContinue={summoningOutcome === "success" ? handleContinue : undefined}
+        />
+      )}
+    </>
+  );
+}

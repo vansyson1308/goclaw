@@ -5,29 +5,82 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
-	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/systemmessages"
 )
+
+// ChannelStream is the per-run streaming handle stored on RunContext.
+// Each channel implementation returns a ChannelStream from CreateStream().
+// RunContext owns the stream so concurrent runs in the same group chat
+// each get their own stream — no sync.Map collision on chatID.
+type ChannelStream interface {
+	// Update sends or edits the streaming message with the latest accumulated text.
+	Update(ctx context.Context, text string)
+	// Stop finalizes the stream (final edit/flush). Called on run.completed.
+	Stop(ctx context.Context) error
+	// MessageID returns the platform message ID of the streaming message (0 if none).
+	// Used to hand the message back to Send() via the channel's placeholder map.
+	MessageID() int
+}
 
 // RunContext tracks an active agent run for streaming/reaction event forwarding.
 type RunContext struct {
-	ChannelName  string
-	ChatID       string
-	MessageID    int
-	mu           sync.Mutex
-	streamBuffer string // accumulated streaming text (chunks are deltas)
-	inToolPhase  bool   // true after tool.call, reset on next chunk (new LLM iteration)
+	ChannelName          string
+	ChatID               string
+	MessageID            string            // platform message ID (string to support Feishu "om_xxx", Telegram "12345", etc.)
+	Metadata             map[string]string // outbound routing metadata (thread_id, local_key, group_id)
+	TenantID             uuid.UUID         // tenant scope for per-tenant TTS
+	Streaming            bool              // whether run uses streaming (to avoid double-delivery of block replies)
+	BlockReplyEnabled    bool              // whether block.reply delivery is enabled for this run (resolved at RegisterRun time)
+	ToolStatusEnabled    bool              // whether tool name shows in streaming preview during tool execution
+	ChatBehavior         ResolvedChatBehavior
+	Delivery             DeliveryRuntime
+	ReasoningDelivery    ResolvedReasoningDelivery
+	mu                   sync.Mutex
+	ackTimer             *time.Timer
+	ackSent              bool
+	ackCancelled         bool
+	blockReplySent       bool
+	blockReplySeen       int
+	interimDelivered     int
+	lastInterimReply     string
+	streamBuffer         string        // accumulated streaming text (chunks are deltas)
+	inToolPhase          bool          // true after tool.call, reset on next chunk (new LLM iteration)
+	stream               ChannelStream // per-run stream handle (replaces per-chat sync.Map in channel impls)
+	thinkingBuffer       string        // accumulated thinking/reasoning text
+	hasThinking          bool          // true if any thinking events received this iteration
+	thinkingDone         bool          // true after first chunk arrives (reasoning→answer transition complete)
+	tagParsePending      string        // raw trailing text withheld because it may be a split <think> tag
+	reasoningBubbles     *reasoningBubbleBuffer
+	reasoningBubbleTimer *time.Timer
+
+	// Activity indicator state (for ActivityIndicatorChannel, e.g. Bitrix24).
+	// Ephemeral "agent is working" indicator driven by agent events + a conditional
+	// heartbeat ticker. All fields guarded by mu.
+	activityStatus  string        // current platform-native status code (e.g. THINKING)
+	lastActivityAt  time.Time     // last time a notify was sent (throttle + heartbeat gate)
+	activityStarted bool          // true once the heartbeat ticker is running (start-once guard)
+	activityTicker  *time.Ticker  // heartbeat ticker; nil when not running
+	activityStop    chan struct{} // closed to stop the heartbeat goroutine
 }
 
 // Manager manages all registered channels, handling their lifecycle
 // and routing outbound messages to the correct channel.
 type Manager struct {
-	channels     map[string]Channel
-	bus          *bus.MessageBus
-	runs         sync.Map // runID string → *RunContext
-	dispatchTask *asyncTask
-	mu           sync.RWMutex
+	channels         map[string]Channel
+	health           map[string]ChannelHealth
+	bus              *bus.MessageBus
+	runs             sync.Map // runID string → *RunContext
+	mediaClaims      sync.Map // temp media path → struct{}, in-flight dispatch claims
+	dispatchTask     *asyncTask
+	mu               sync.RWMutex
+	contactCollector *store.ContactCollector
+	systemMessages   *systemmessages.Resolver
 }
 
 type asyncTask struct {
@@ -39,14 +92,22 @@ type asyncTask struct {
 func NewManager(msgBus *bus.MessageBus) *Manager {
 	return &Manager{
 		channels: make(map[string]Channel),
+		health:   make(map[string]ChannelHealth),
 		bus:      msgBus,
 	}
 }
 
 // StartAll starts all registered channels and the outbound dispatch loop.
+// The dispatcher is always started even when no channels exist yet,
+// because channels may be loaded dynamically later via Reload().
 func (m *Manager) StartAll(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Always start the outbound dispatcher — channels may be added later via Reload().
+	dispatchCtx, cancel := context.WithCancel(ctx)
+	m.dispatchTask = &asyncTask{cancel: cancel}
+	go m.dispatchOutbound(dispatchCtx)
 
 	if len(m.channels) == 0 {
 		slog.Warn("no channels enabled")
@@ -55,16 +116,18 @@ func (m *Manager) StartAll(ctx context.Context) error {
 
 	slog.Info("starting all channels")
 
-	dispatchCtx, cancel := context.WithCancel(ctx)
-	m.dispatchTask = &asyncTask{cancel: cancel}
-
-	go m.dispatchOutbound(dispatchCtx)
-
 	for name, channel := range m.channels {
 		slog.Info("starting channel", "channel", name)
-		if err := channel.Start(ctx); err != nil {
-			slog.Error("failed to start channel", "channel", name, "error", err)
+		if hc, ok := channel.(interface{ MarkStarting(string) }); ok {
+			hc.MarkStarting("Starting")
 		}
+		m.syncChannelHealthLocked(name, channel)
+		if err := channel.Start(ctx); err != nil {
+			m.recordChannelStartFailureLocked(name, channel, "", err)
+			slog.Error("failed to start channel", "channel", name, "error", err)
+			continue
+		}
+		m.syncChannelHealthLocked(name, channel)
 	}
 
 	slog.Info("all channels started")
@@ -86,52 +149,18 @@ func (m *Manager) StopAll(ctx context.Context) error {
 	for name, channel := range m.channels {
 		slog.Info("stopping channel", "channel", name)
 		if err := channel.Stop(ctx); err != nil {
+			m.recordHealthLocked(name, NewFailedChannelHealth("Failed to stop channel", err))
 			slog.Error("error stopping channel", "channel", name, "error", err)
+			continue
 		}
+		if hc, ok := channel.(interface{ MarkStopped(string) }); ok {
+			hc.MarkStopped("Stopped")
+		}
+		m.syncChannelHealthLocked(name, channel)
 	}
 
 	slog.Info("all channels stopped")
 	return nil
-}
-
-// dispatchOutbound consumes outbound messages from the bus and routes them
-// to the appropriate channel. Internal channels are silently skipped.
-func (m *Manager) dispatchOutbound(ctx context.Context) {
-	slog.Info("outbound dispatcher started")
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("outbound dispatcher stopped")
-			return
-		default:
-			msg, ok := m.bus.SubscribeOutbound(ctx)
-			if !ok {
-				continue
-			}
-
-			// Skip internal channels
-			if IsInternalChannel(msg.Channel) {
-				continue
-			}
-
-			m.mu.RLock()
-			channel, exists := m.channels[msg.Channel]
-			m.mu.RUnlock()
-
-			if !exists {
-				slog.Warn("unknown channel for outbound message", "channel", msg.Channel)
-				continue
-			}
-
-			if err := channel.Send(ctx, msg); err != nil {
-				slog.Error("error sending message to channel",
-					"channel", msg.Channel,
-					"error", err,
-				)
-			}
-		}
-	}
 }
 
 // GetChannel returns a channel by name.
@@ -142,17 +171,34 @@ func (m *Manager) GetChannel(name string) (Channel, bool) {
 	return channel, ok
 }
 
+// ClearGroupApproval removes a chat from a channel's in-memory pairing
+// approval cache (BaseChannel.approvedGroups). Used when a group pairing is
+// revoked so the bot re-enters the pairing gate on the next message instead of
+// continuing to reply as if it were still approved. Channels that don't embed
+// BaseChannel are ignored.
+func (m *Manager) ClearGroupApproval(channelName, chatID string) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if c, ok := ch.(interface{ ClearGroupApproval(string) }); ok {
+		c.ClearGroupApproval(chatID)
+	}
+}
+
 // GetStatus returns the running status of all channels.
-func (m *Manager) GetStatus() map[string]interface{} {
+func (m *Manager) GetStatus() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	status := make(map[string]interface{})
+	status := make(map[string]any, len(m.health)+len(m.channels))
+	for name, snapshot := range m.health {
+		status[name] = snapshot
+	}
 	for name, channel := range m.channels {
-		status[name] = map[string]interface{}{
-			"enabled": true,
-			"running": channel.IsRunning(),
-		}
+		status[name] = snapshotChannelHealth(channel)
 	}
 	return status
 }
@@ -173,7 +219,236 @@ func (m *Manager) GetEnabledChannels() []string {
 func (m *Manager) RegisterChannel(name string, channel Channel) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Propagate contact collector to channels that embed BaseChannel.
+	if m.contactCollector != nil {
+		if bc, ok := channel.(interface{ SetContactCollector(*store.ContactCollector) }); ok {
+			bc.SetContactCollector(m.contactCollector)
+		}
+	}
+	if m.systemMessages != nil {
+		if sm, ok := channel.(interface {
+			SetSystemMessages(*systemmessages.Resolver)
+		}); ok {
+			sm.SetSystemMessages(m.systemMessages)
+		}
+	}
 	m.channels[name] = channel
+	if hc, ok := channel.(interface{ MarkRegistered(string) }); ok {
+		hc.MarkRegistered("Configured")
+	}
+	m.syncChannelHealthLocked(name, channel)
+}
+
+// SetSystemMessages sets the resolver propagated to channels registered now and
+// in the future.
+func (m *Manager) SetSystemMessages(r *systemmessages.Resolver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.systemMessages = r
+	for _, channel := range m.channels {
+		if sm, ok := channel.(interface {
+			SetSystemMessages(*systemmessages.Resolver)
+		}); ok {
+			sm.SetSystemMessages(r)
+		}
+	}
+}
+
+// RecordHealth stores runtime health for an instance, including failures before registration.
+func (m *Manager) RecordHealth(name string, snapshot ChannelHealth) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordHealthLocked(name, snapshot)
+}
+
+// RecordFailure stores a classified failure snapshot for an instance.
+func (m *Manager) RecordFailure(name, summary string, err error) {
+	m.RecordHealth(name, NewFailedChannelHealth(summary, err))
+}
+
+// RecordFailureForType stores a classified failure snapshot for an instance before registration exists.
+func (m *Manager) RecordFailureForType(name, channelType, summary string, err error) {
+	m.RecordHealth(name, NewFailedChannelHealthForType(channelType, summary, err))
+}
+
+func (m *Manager) recordChannelStartFailure(name string, channel Channel, summary string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordChannelStartFailureLocked(name, channel, summary, err)
+}
+
+func (m *Manager) recordChannelStartFailureLocked(name string, channel Channel, summary string, err error) {
+	info := ClassifyChannelError(err)
+	if summary == "" {
+		summary = info.Summary
+	}
+
+	current := snapshotChannelHealth(channel)
+	if isFailureState(current.State) {
+		if current.ChannelType == "" {
+			current.ChannelType = channel.Type()
+		}
+		if current.Summary == "" {
+			current.Summary = summary
+		}
+		if current.Detail == "" {
+			current.Detail = info.Detail
+		}
+		if current.FailureKind == "" {
+			current.FailureKind = info.Kind
+		}
+		m.recordHealthLocked(name, current)
+		return
+	}
+
+	if hc, ok := channel.(interface {
+		MarkFailed(string, string, ChannelFailureKind, bool)
+	}); ok {
+		hc.MarkFailed(summary, info.Detail, info.Kind, info.Retryable)
+		m.syncChannelHealthLocked(name, channel)
+		return
+	}
+
+	m.recordHealthLocked(name, NewChannelHealthForType(
+		channel.Type(),
+		ChannelHealthStateFailed,
+		summary,
+		info.Detail,
+		info.Kind,
+		info.Retryable,
+	))
+}
+
+// SetContactCollector sets the contact collector for all current and future channels.
+func (m *Manager) SetContactCollector(cc *store.ContactCollector) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.contactCollector = cc
+	for _, ch := range m.channels {
+		if bc, ok := ch.(interface{ SetContactCollector(*store.ContactCollector) }); ok {
+			bc.SetContactCollector(cc)
+		}
+	}
+}
+
+// ChannelTypeForName returns the platform type for a channel instance name.
+// Reads directly from the Channel.Type() method — no separate map needed.
+func (m *Manager) ChannelTypeForName(name string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if ch, ok := m.channels[name]; ok {
+		return ch.Type()
+	}
+	return ""
+}
+
+// ChannelTenantID returns the tenant UUID for a channel instance.
+// Zero UUID means legacy/config-based channel (no tenant scope).
+// Returns (tenantID, exists).
+func (m *Manager) ChannelTenantID(channelName string) (uuid.UUID, bool) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return uuid.Nil, false
+	}
+	if tc, ok := ch.(interface{ TenantID() uuid.UUID }); ok {
+		return tc.TenantID(), true
+	}
+	return uuid.Nil, true // legacy channel without tenant scope
+}
+
+// ListGroupMembers delegates to the channel's GroupMemberProvider if available.
+func (m *Manager) ListGroupMembers(ctx context.Context, channelName, chatID string) ([]GroupMember, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	gmp, ok := ch.(GroupMemberProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support listing group members", channelName)
+	}
+	return gmp.ListGroupMembers(ctx, chatID)
+}
+
+// ListGroups delegates to the channel's GroupListProvider if available.
+func (m *Manager) ListGroups(ctx context.Context, channelName string) ([]GroupInfo, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	glp, ok := ch.(GroupListProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support listing groups", channelName)
+	}
+	return glp.ListGroups(ctx)
+}
+
+// ResolveGroupTitle delegates to the channel's GroupTitleProvider if available.
+func (m *Manager) ResolveGroupTitle(ctx context.Context, channelName, chatID string) (string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("channel %q not found", channelName)
+	}
+	gtp, ok := ch.(GroupTitleProvider)
+	if !ok {
+		return "", fmt.Errorf("channel %q does not support resolving group titles", channelName)
+	}
+	return gtp.ResolveGroupTitle(ctx, chatID)
+}
+
+// ResolveGroupTitles delegates to the channel's batch GroupTitlesProvider when available.
+func (m *Manager) ResolveGroupTitles(ctx context.Context, channelName string, chatIDs []string) (map[string]string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("channel %q not found", channelName)
+	}
+	gtp, ok := ch.(GroupTitlesProvider)
+	if !ok {
+		return nil, fmt.Errorf("channel %q does not support resolving group titles", channelName)
+	}
+	return gtp.ResolveGroupTitles(ctx, chatIDs)
+}
+
+// ResolveGroupDisplayTitle resolves a presentation-only title for a group.
+// It is deliberately separate from ResolveGroupTitle so callers that need a
+// platform's raw title keep their existing contract.
+func (m *Manager) ResolveGroupDisplayTitle(ctx context.Context, channelName, chatID string) (string, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("channel %q not found", channelName)
+	}
+	provider, ok := ch.(GroupDisplayTitleProvider)
+	if !ok {
+		return "", fmt.Errorf("channel %q does not support resolving group display titles", channelName)
+	}
+	return provider.ResolveGroupDisplayTitle(ctx, chatID)
+}
+
+// ManageTelegram delegates a whitelisted Telegram management action to a
+// Telegram-capable channel instance.
+func (m *Manager) ManageTelegram(ctx context.Context, channelName string, req TelegramManagerRequest) (TelegramManagerResult, error) {
+	m.mu.RLock()
+	ch, ok := m.channels[channelName]
+	m.mu.RUnlock()
+	if !ok {
+		return TelegramManagerResult{}, fmt.Errorf("channel %q not found", channelName)
+	}
+	mp, ok := ch.(TelegramManagerProvider)
+	if !ok {
+		return TelegramManagerResult{}, fmt.Errorf("channel %q does not support Telegram management", channelName)
+	}
+	return mp.ManageTelegram(ctx, req)
 }
 
 // UnregisterChannel removes a channel from the manager.
@@ -181,170 +456,48 @@ func (m *Manager) UnregisterChannel(name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.channels, name)
+	delete(m.health, name)
 }
 
-// SendToChannel delivers a message to a specific channel by name.
-func (m *Manager) SendToChannel(ctx context.Context, channelName, chatID, content string) error {
-	m.mu.RLock()
-	channel, exists := m.channels[channelName]
-	m.mu.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("channel %s not found", channelName)
-	}
-
-	msg := bus.OutboundMessage{
-		Channel: channelName,
-		ChatID:  chatID,
-		Content: content,
-	}
-
-	return channel.Send(ctx, msg)
-}
-
-// --- Run tracking for streaming/reaction event forwarding ---
-
-// RegisterRun associates a run ID with a channel context so agent events
-// (chunks, tool calls, completion) can be forwarded to the originating channel.
-func (m *Manager) RegisterRun(runID, channelName, chatID string, messageID int) {
-	m.runs.Store(runID, &RunContext{
-		ChannelName: channelName,
-		ChatID:      chatID,
-		MessageID:   messageID,
-	})
-}
-
-// UnregisterRun removes a run tracking entry.
-func (m *Manager) UnregisterRun(runID string) {
-	m.runs.Delete(runID)
-}
-
-// IsStreamingChannel checks if a named channel implements StreamingChannel
-// AND has streaming currently enabled in its config (StreamEnabled() == true).
-func (m *Manager) IsStreamingChannel(channelName string) bool {
-	m.mu.RLock()
-	ch, exists := m.channels[channelName]
-	m.mu.RUnlock()
-	if !exists {
-		return false
-	}
-	sc, ok := ch.(StreamingChannel)
-	if !ok {
-		return false
-	}
-	return sc.StreamEnabled()
-}
-
-// HandleAgentEvent routes agent lifecycle events to streaming/reaction channels.
-// Called from the bus event subscriber — must be non-blocking.
-// eventType: "run.started", "chunk", "tool.call", "tool.result", "run.completed", "run.failed"
-func (m *Manager) HandleAgentEvent(eventType, runID string, payload interface{}) {
-	val, ok := m.runs.Load(runID)
-	if !ok {
-		return
-	}
-	rc := val.(*RunContext)
-
-	m.mu.RLock()
-	ch, exists := m.channels[rc.ChannelName]
-	m.mu.RUnlock()
-	if !exists {
-		return
-	}
-
-	ctx := context.Background()
-
-	// Forward to StreamingChannel
-	if sc, ok := ch.(StreamingChannel); ok {
-		switch eventType {
-		case protocol.AgentEventRunStarted:
-			if err := sc.OnStreamStart(ctx, rc.ChatID); err != nil {
-				slog.Debug("stream start failed", "channel", rc.ChannelName, "error", err)
-			}
-		case protocol.AgentEventToolCall:
-			// Agent is executing a tool — mark tool phase so the next chunk
-			// (new LLM iteration) resets the stream buffer.
-			// Also clear the current DraftStream so the next iteration starts
-			// a fresh streaming message (matching TS onAssistantMessageStart pattern).
-			rc.mu.Lock()
-			rc.inToolPhase = true
-			rc.mu.Unlock()
-			if err := sc.OnStreamEnd(ctx, rc.ChatID, ""); err != nil {
-				slog.Debug("stream tool-phase end failed", "channel", rc.ChannelName, "error", err)
-			}
-		case protocol.ChatEventChunk:
-			// Accumulate chunk deltas into full text.
-			// When entering a new LLM iteration (first chunk after tool.call),
-			// reset the buffer so we don't concatenate text from previous iterations.
-			content := extractPayloadString(payload, "content")
-			if content != "" {
-				rc.mu.Lock()
-				if rc.inToolPhase {
-					// New LLM iteration — reset buffer and start fresh stream
-					rc.streamBuffer = ""
-					rc.inToolPhase = false
-					rc.mu.Unlock()
-					// Create new DraftStream for this iteration
-					if err := sc.OnStreamStart(ctx, rc.ChatID); err != nil {
-						slog.Debug("stream restart failed", "channel", rc.ChannelName, "error", err)
-					}
-					rc.mu.Lock()
-				}
-				rc.streamBuffer += content
-				fullText := rc.streamBuffer
-				rc.mu.Unlock()
-				if err := sc.OnChunkEvent(ctx, rc.ChatID, fullText); err != nil {
-					slog.Debug("stream chunk failed", "channel", rc.ChannelName, "error", err)
-				}
-			}
-		case protocol.AgentEventRunCompleted:
-			rc.mu.Lock()
-			finalText := rc.streamBuffer
-			rc.mu.Unlock()
-			if err := sc.OnStreamEnd(ctx, rc.ChatID, finalText); err != nil {
-				slog.Debug("stream end failed", "channel", rc.ChannelName, "error", err)
-			}
-		case protocol.AgentEventRunFailed:
-			// Clean up streaming state
-			_ = sc.OnStreamEnd(ctx, rc.ChatID, "")
+func (m *Manager) recordHealthLocked(name string, snapshot ChannelHealth) {
+	prev := m.health[name]
+	if snapshot.ChannelType == "" {
+		switch {
+		case prev.ChannelType != "":
+			snapshot.ChannelType = prev.ChannelType
+		case m.channels[name] != nil:
+			snapshot.ChannelType = m.channels[name].Type()
+		default:
+			snapshot.ChannelType = name
 		}
 	}
-
-	// Forward to ReactionChannel
-	if reactionCh, ok := ch.(ReactionChannel); ok {
-		status := ""
-		switch eventType {
-		case protocol.AgentEventRunStarted:
-			status = "thinking"
-		case protocol.AgentEventToolCall:
-			status = "tool"
-		case protocol.AgentEventRunCompleted:
-			status = "done"
-		case protocol.AgentEventRunFailed:
-			status = "error"
-		}
-		if status != "" {
-			if err := reactionCh.OnReactionEvent(ctx, rc.ChatID, rc.MessageID, status); err != nil {
-				slog.Debug("reaction event failed", "channel", rc.ChannelName, "status", status, "error", err)
-			}
-		}
-	}
-
-	// Clean up on terminal events
-	if eventType == protocol.AgentEventRunCompleted || eventType == protocol.AgentEventRunFailed {
-		m.runs.Delete(runID)
-	}
+	m.health[name] = mergeChannelHealth(prev, snapshot)
 }
 
-// extractPayloadString extracts a string field from a payload (map[string]string or map[string]interface{}).
-func extractPayloadString(payload interface{}, key string) string {
-	switch p := payload.(type) {
-	case map[string]string:
-		return p[key]
-	case map[string]interface{}:
-		if v, ok := p[key].(string); ok {
-			return v
-		}
+func (m *Manager) syncChannelHealthLocked(name string, channel Channel) {
+	m.recordHealthLocked(name, snapshotChannelHealth(channel))
+}
+
+func snapshotChannelHealth(channel Channel) ChannelHealth {
+	if reporter, ok := channel.(interface{ HealthSnapshot() ChannelHealth }); ok {
+		snapshot := reporter.HealthSnapshot()
+		snapshot.ChannelType = channel.Type()
+		snapshot.Enabled = true
+		snapshot.Running = channel.IsRunning()
+		return snapshot
 	}
-	return ""
+
+	state := ChannelHealthStateStopped
+	summary := "Stopped"
+	if channel.IsRunning() {
+		state = ChannelHealthStateHealthy
+		summary = "Connected"
+	}
+	return ChannelHealth{
+		ChannelType: channel.Type(),
+		Enabled:     true,
+		Running:     channel.IsRunning(),
+		State:       state,
+		Summary:     summary,
+	}
 }

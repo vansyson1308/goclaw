@@ -1,0 +1,74 @@
+# Architecture and process decisions
+
+- **D1 Integration base.** Upstream dev @4f808241 plus the main-only vault fix. v3.14.0 and upstream main are comparison/recovery references. dev passes vet; main does not.
+- **D2 Fork safety.** Publishing workflows run only in upstream, or when repo variables `GOCLAW_RELEASES_ENABLED=true` / `GOCLAW_CLAUDE_REVIEW_ENABLED=true` are set. `ci.yaml` is unchanged.
+- **D3 Control set.** `docs/mission-control/` holds SCOPE, STATUS, DECISIONS, EVIDENCE, PREFLIGHT and RUNBOOK. It lives in `docs/` because upstream gitignores `plans/`.
+- **D4 Known behavior changes inherited from upstream (not reverted):**
+  - context pruning is on by default (`cache-ttl`);
+  - standalone file mode was removed;
+  - `GOCLAW_FEISHU_*` was renamed to `GOCLAW_LARK_*`;
+  - migrations 000023 and 000039 delete data.
+
+  These are documented in RUNBOOK.md.
+- **D5 Threshold suggestions become advisory.**
+  - The only auto-applied change wrote `other_config.retrieval_threshold`, which no runtime code reads.
+  - The triggering metric (`used_in_reply = resultCount > 0`) cannot justify raising a threshold: raising it lowers that rate, and evaluation then rolls it back.
+  - Rather than retarget an incoherent loop, `threshold` is now review-only and the UI/API say so.
+  - Real, measured config improvements come through the eval-gated candidate lifecycle (Phase G).
+- **D6 `tool_order` is agent-scoped.** Approval adds the tool to the originating agent's `tools_config.deny` instead of disabling it tenant-wide. Rollback restores the exact prior presence/absence.
+- **D7 Apply and rollback are one DB transaction.**
+  - The transaction covers the suggestion row lock and status check (CAS), the agent config update, and the baseline/applied/audit records.
+  - The baseline records presence as well as value.
+  - Rollback refuses (conflict) when the current value no longer equals what was applied, so newer unrelated edits are never overwritten.
+- **D8 Audit actor.** The audit actor comes only from authenticated context; client-supplied `reviewed_by` is ignored.
+- **D9 Background evolution jobs iterate tenants explicitly.** A bare-context `Agents.List` fails closed and returned nothing, so the cron never analyzed any agent on PG.
+- **D10 Skill patch apply order.** Version history is recorded before activation. If recording fails, the skill stays on its current version and the staged directory is removed. If activation or marking the suggestion applied fails, a retry resumes from the recorded version: the immutable files are verified against the recorded hash, then activated, then marked applied. No second version is minted. This replaces upstream's "activate first, keep files" behavior, which could leave an active version with no history row.
+- **D11 No automatic metric-driven rollback.** The weekly evaluation job is removed. It never ran on PG because of the D9 bug, and it compared a metric unrelated to the change. Rollback is explicit via the API. Measured, eval-gated observation arrives with the Phase G candidate lifecycle.
+- **D12 Reconciliation is report-only.** `goclaw evolution reconcile` lists legacy or inconsistent rows and never repairs data. Legacy threshold applies can be rolled back through the API; tenant-wide tool disables are left for an operator to decide.
+- **D13 Missions wrap agent runs; they do not replace team tasks.** A v1 mission is one agent working on one contract, judged by verifiers. It runs through the scheduler, like cron. Multi-agent decomposition can later link `team_tasks.metadata.mission_id`.
+- **D14 Evidence rules.**
+  - Verifiers run outside the agent, against an isolated copy.
+  - `must_change` checks must fail on the baseline.
+  - Hidden overlays hold acceptance tests the agent cannot see or edit.
+  - Only change-proving criteria count as progress.
+  - An error or timeout is never a pass.
+  - A failed or over-budget run cannot succeed.
+  - Unpriced usage is recorded as unknown cost, not $0.
+- **D15 Missions are opt-in (`GOCLAW_MISSIONS=1`).** The v1 verifier executor runs on the host with a scrubbed environment. Phase E adds a sandboxed executor. The `scripted` provider is separately opt-in (`GOCLAW_ENABLE_SCRIPTED_PROVIDER=1`) and is for offline fixtures only.
+- **D16 Surface parity.**
+  - API, CLI and web: done.
+  - Desktop (Lite): the SQLite store and schema v62 exist and compile, but there is no desktop UI for missions in v1. The executor and data-root assumptions target the Standard server edition.
+- **D17 Verifiers do not trust exit codes of agent-written code.** Command checks run code the agent wrote. `expect_tests` requires explicit per-test passes, and an integrity scan blocks diffs that can take over a test binary. The residual risk (forged output from code that discovers hidden test names) is documented rather than claimed prevented. Mission creation is restricted to the master scope until the sandboxed executor exists.
+- **D18 Durability is crash-only, with leases and fencing.**
+  - A worker claims an attempt (`attempt+1`, lease `owner` + expiry) and renews it every TTL/3.
+  - Every write it makes, including each tool receipt, is conditional on `(owner, attempt)`.
+  - A worker stops its run when the lease is lost, or when it cannot renew for a full TTL.
+  - Recovery requeues attempts whose lease expired, while `attempt < max_attempts`; otherwise the mission fails.
+  - A graceful shutdown takes the same path as a crash: the attempt is retried after the lease expires. There is no separate shutdown protocol to get wrong.
+  - Retries start from a fresh copy of the pinned source (`attempt-N/`), never from a partial workspace. Interrupted runs are **not resumed mid-conversation**, because the agent's partial state cannot be trusted.
+  - Verification failures are never retried; only lost attempts are.
+- **D19 Missions allow only side-effect-contained tools.**
+  - The default allowlist is workspace read/write, `exec` and `datetime`. Network reads are opt-in via `limits.tools`.
+  - Messaging, scheduling, delegation, memory, skills, MCP and other external or non-idempotent tools can never be enabled, so retrying an attempt cannot duplicate an external effect.
+  - Every call gets a receipt, written before it runs (fail-closed). A receipt that stays `started` means the outcome is unknown.
+  - Providers that run their own tools (Claude CLI, ACP) are refused for missions, because the guard cannot see their calls.
+  - `limits.max_tokens` is enforced before each model call. Compaction and summarization calls are not counted (documented gap).
+- **D20 Phase D review outcomes.**
+  - Lease time comes from the database clock and is checked under the row lock (no cross-gateway clock trust).
+  - Evidence is computed from a frozen copy after sweeping leftover processes.
+  - Receipts are accepted only while `running`.
+  - The cost limit applies to the mission total; the token budget counts cached input.
+  - Fallback chains inherit native-tool refusal.
+  - Residual gaps are listed in MISSIONS.md "Known limits" rather than claimed closed.
+- **D21 Containers are the default boundary for missions (Phase E).**
+  - `GOCLAW_MISSIONS_EXECUTOR=docker` is the default and fails closed: no Docker or no suitable image means missions stay disabled. There is no silent host fallback.
+  - **Verifiers:** each check runs in a fresh `--rm` container.
+  - **Agent tools:** the agent's `exec` and file tools use one container per attempt, destroyed at the end of the run.
+  - Both have no network, a read-only root, and no capabilities. Only the relevant copy is mounted.
+  - The host executor remains as an explicit opt-in and is logged as a security warning.
+  - The image must be Debian-based (the file tools need GNU coreutils); this is checked at startup.
+  - Each check gets its own copy and cache, so checks cannot influence one another.
+- **D22 Evaluation is offline and deterministic; promotion is evidence-gated.**
+  - The suite replays scripted agents through the real guard, verifiers and outcome rules, and judges the *system's verdicts*, not a model.
+  - Promotion requires no violations, no regression, held-out not lower and a strict improvement.
+  - Monitoring rolls back when the champion loses any task its predecessor solved, even if it solves more overall. A known task that used to work and now fails is treated as an incident, not a trade-off. This is conservative on purpose; a later policy could weigh tasks.

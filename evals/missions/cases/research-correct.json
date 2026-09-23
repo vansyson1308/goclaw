@@ -1,0 +1,65 @@
+{
+  "id": "research-correct",
+  "split": "dev",
+  "category": "research",
+  "description": "Read-only research answered correctly.",
+  "contract": {
+    "version": 1,
+    "title": "When was Zephyr retired?",
+    "objective": "Using only docs/, find the year the Zephyr protocol was retired and write the answer to ANSWER.md. Do not change docs/.",
+    "agent": "eval-agent",
+    "workspace": {
+      "source_dir": "facts"
+    },
+    "acceptance": [
+      {
+        "id": "answer",
+        "description": "ANSWER.md states the retirement year",
+        "kind": "file_contains",
+        "path": "ANSWER.md",
+        "text": "2019",
+        "must_change": true
+      },
+      {
+        "id": "docs-unchanged",
+        "description": "source documents are untouched",
+        "kind": "command",
+        "command": [
+          "sh",
+          "guard.sh"
+        ],
+        "overlay_dir": "facts-guard",
+        "timeout_seconds": 60
+      }
+    ],
+    "limits": {
+      "max_iterations": 10,
+      "timeout_seconds": 120
+    }
+  },
+  "agent": {
+    "steps": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "docs/history.md"
+        }
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "ANSWER.md",
+          "content": "Zephyr was retired in 2019 (replaced by the Aurora bus).\n"
+        }
+      }
+    ],
+    "reply": "2019"
+  },
+  "expect": {
+    "status": "succeeded",
+    "criteria": {
+      "answer": "pass",
+      "docs-unchanged": "pass"
+    }
+  }
+}

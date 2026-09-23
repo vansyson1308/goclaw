@@ -1,20 +1,35 @@
 package tools
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 )
+
+var ErrAnnounceQueueDrainTimeout = errors.New("announce_queue_drain_timeout")
 
 // AnnounceQueueItem represents a single subagent result waiting to be announced.
 type AnnounceQueueItem struct {
-	SubagentID string
-	Label      string
-	Status     string // "completed", "failed", "cancelled"
-	Result     string
-	Runtime    time.Duration
-	Iterations int
+	SubagentID       string
+	CompletionID     uuid.UUID
+	DurablyPersisted bool
+	ParentTaskID     string
+	Depth            int
+	Label            string
+	Status           string // "completed", "failed", "cancelled"
+	Result           string
+	Media            []bus.MediaFile // media files from tool results
+	Runtime          time.Duration
+	Iterations       int
+	InputTokens      int64
+	OutputTokens     int64
 }
 
 // AnnounceMetadata carries origin info for routing the batched announce.
@@ -22,7 +37,13 @@ type AnnounceMetadata struct {
 	OriginChannel    string
 	OriginChatID     string
 	OriginPeerKind   string
+	OriginLocalKey   string // composite key with topic/thread suffix for routing
 	OriginUserID     string
+	OriginSenderID   string    // real acting sender; preserves permission attribution through re-ingress (#915)
+	OriginRole       string    // caller's RBAC role; bypasses per-user grants for admin/operator/owner (#915)
+	OriginSessionKey string    // exact parent session key (WS uses non-standard format)
+	OriginTenantID   uuid.UUID // parent tenant for announce routing
+	RootAgentID      uuid.UUID
 	ParentAgent      string
 	OriginTraceID    string // parent trace UUID for announce linking
 	OriginRootSpanID string // parent agent's root span UUID
@@ -36,10 +57,8 @@ type AnnounceQueue struct {
 	debounce time.Duration            // default 1000ms
 	cap      int                      // max items per session before immediate drain (default 20)
 	onDrain  func(sessionKey string, items []AnnounceQueueItem, meta AnnounceMetadata)
-
-	// countActiveFunc returns the number of still-running subagents for a parent.
-	// Used at drain time for accurate remaining-active count.
-	countActiveFunc func(parentID string) int
+	closed   bool
+	drainWG  sync.WaitGroup
 }
 
 type sessionQueue struct {
@@ -53,7 +72,6 @@ func NewAnnounceQueue(
 	debounceMs int,
 	cap int,
 	onDrain func(sessionKey string, items []AnnounceQueueItem, meta AnnounceMetadata),
-	countActive func(parentID string) int,
 ) *AnnounceQueue {
 	if debounceMs <= 0 {
 		debounceMs = 1000 // TS default
@@ -62,11 +80,10 @@ func NewAnnounceQueue(
 		cap = 20 // TS default
 	}
 	return &AnnounceQueue{
-		queues:          make(map[string]*sessionQueue),
-		debounce:        time.Duration(debounceMs) * time.Millisecond,
-		cap:             cap,
-		onDrain:         onDrain,
-		countActiveFunc: countActive,
+		queues:   make(map[string]*sessionQueue),
+		debounce: time.Duration(debounceMs) * time.Millisecond,
+		cap:      cap,
+		onDrain:  onDrain,
 	}
 }
 
@@ -75,6 +92,9 @@ func NewAnnounceQueue(
 func (aq *AnnounceQueue) Enqueue(sessionKey string, item AnnounceQueueItem, meta AnnounceMetadata) {
 	aq.mu.Lock()
 	defer aq.mu.Unlock()
+	if aq.closed {
+		return
+	}
 
 	sq, ok := aq.queues[sessionKey]
 	if !ok {
@@ -92,7 +112,7 @@ func (aq *AnnounceQueue) Enqueue(sessionKey string, item AnnounceQueueItem, meta
 		items := sq.items
 		sqMeta := sq.meta
 		delete(aq.queues, sessionKey)
-		go aq.drain(sessionKey, items, sqMeta)
+		aq.startDrainLocked(sessionKey, items, sqMeta)
 		return
 	}
 
@@ -110,10 +130,60 @@ func (aq *AnnounceQueue) Enqueue(sessionKey string, item AnnounceQueueItem, meta
 		items := sq.items
 		sqMeta := sq.meta
 		delete(aq.queues, sessionKey)
+		aq.startDrainLocked(sessionKey, items, sqMeta)
 		aq.mu.Unlock()
-
-		aq.drain(sessionKey, items, sqMeta)
 	})
+}
+
+func (aq *AnnounceQueue) startDrainLocked(
+	sessionKey string,
+	items []AnnounceQueueItem,
+	meta AnnounceMetadata,
+) {
+	if aq.closed {
+		return
+	}
+	aq.drainWG.Add(1)
+	go func() {
+		defer aq.drainWG.Done()
+		aq.drain(sessionKey, items, meta)
+	}()
+}
+
+// CloseContext closes intake, drops pending debounce batches, and waits for any
+// drain callback that already started. Dropping pending parent-resume messages
+// during process shutdown avoids starting new agent runs against dependencies
+// that are being torn down; task terminal state remains durable.
+func (aq *AnnounceQueue) CloseContext(ctx context.Context) error {
+	if aq == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	aq.mu.Lock()
+	if !aq.closed {
+		aq.closed = true
+		for _, queue := range aq.queues {
+			if queue.timer != nil {
+				queue.timer.Stop()
+			}
+		}
+		clear(aq.queues)
+	}
+	aq.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		aq.drainWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", ErrAnnounceQueueDrainTimeout, ctx.Err())
+	}
 }
 
 // drain merges items into a single announce message and calls onDrain.
@@ -126,8 +196,8 @@ func (aq *AnnounceQueue) drain(sessionKey string, items []AnnounceQueueItem, met
 }
 
 // FormatBatchedAnnounce builds the announce content for a batch of items.
-// remainingActive is the count of still-running subagents at drain time.
-func FormatBatchedAnnounce(items []AnnounceQueueItem, remainingActive int) string {
+// roster provides deterministic task labels+statuses to prevent LLM hallucination.
+func FormatBatchedAnnounce(items []AnnounceQueueItem, roster SubagentRoster) string {
 	if len(items) == 1 {
 		// Single item: use the same format as before (no batching overhead)
 		item := items[0]
@@ -138,15 +208,16 @@ func FormatBatchedAnnounce(items []AnnounceQueueItem, remainingActive int) strin
 			statusLabel = "was cancelled"
 		}
 
-		replyInstruction := buildReplyInstruction(remainingActive)
+		replyInstruction := BuildReplyInstruction(roster)
 
 		return fmt.Sprintf(
-			"[System Message] A subagent task %q just %s.\n\n"+
+			"[System Message] A subagent task %q just %s (task=%s, parent=%s, depth=%d).\n\n"+
 				"Result:\n%s\n\n"+
-				"Stats: runtime %s, iterations %d\n\n"+
+				"Stats: runtime %s, iterations %d, tokens %d in / %d out\n\n"+
 				"%s",
-			item.Label, statusLabel, item.Result,
+			item.Label, statusLabel, item.SubagentID, item.ParentTaskID, item.Depth, item.Result,
 			item.Runtime.Round(time.Millisecond), item.Iterations,
+			item.InputTokens, item.OutputTokens,
 			replyInstruction,
 		)
 	}
@@ -164,38 +235,61 @@ func FormatBatchedAnnounce(items []AnnounceQueueItem, remainingActive int) strin
 		}
 
 		sb.WriteString(fmt.Sprintf(
-			"\n---\nTask #%d: %q %s (runtime %s, iterations %d)\nResult: %s\n",
-			i+1, item.Label, statusLabel,
+			"\n---\nTask #%d: %q %s (task=%s, parent=%s, depth=%d, runtime %s, iterations %d, tokens %d/%d)\nResult: %s\n",
+			i+1, item.Label, statusLabel, item.SubagentID, item.ParentTaskID, item.Depth,
 			item.Runtime.Round(time.Millisecond), item.Iterations,
+			item.InputTokens, item.OutputTokens,
 			item.Result,
 		))
 	}
 
 	sb.WriteString("---\n\n")
-	sb.WriteString(buildReplyInstruction(remainingActive))
+	sb.WriteString(BuildReplyInstruction(roster))
 
 	return sb.String()
 }
 
-func buildReplyInstruction(remainingActive int) string {
-	if remainingActive > 0 {
-		runsLabel := "runs"
-		if remainingActive == 1 {
-			runsLabel = "run"
+// buildReplyInstruction generates the instruction block for the parent LLM,
+// including a deterministic roster of all subagent tasks with their statuses.
+func BuildReplyInstruction(roster SubagentRoster) string {
+	running := roster.Active
+	if running == 0 {
+		for _, entry := range roster.Entries {
+			if entry.Status == TaskStatusRunning {
+				running++
+			}
 		}
+	}
+
+	// Build roster block
+	var rosterBlock string
+	if len(roster.Entries) > 0 {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf(
+			"Subagent roster (%d active / %d max; %d retained total):\n",
+			running, roster.MaxPerAgent, roster.Total,
+		))
+		for _, e := range roster.Entries {
+			sb.WriteString(fmt.Sprintf("  [%-9s]  %s\n", e.Status, e.Label))
+		}
+		rosterBlock = sb.String()
+	}
+
+	if running > 0 {
 		return fmt.Sprintf(
-			"There are still %d active subagent %s for this session. "+
+			"%s\n"+
+				"%d subagent(s) still running. "+
 				"If they are part of the same workflow, wait for the remaining results "+
 				"before sending a user update. If they are unrelated, respond normally "+
 				"using only the result above. "+
 				"Do NOT copy or echo the [System Message] block verbatim — rewrite in your own voice. "+
 				"Reply ONLY: NO_REPLY if this result was already delivered to the user.",
-			remainingActive, runsLabel,
+			rosterBlock, running,
 		)
 	}
 
-	return "A completed subagent task is ready for user delivery. " +
-		"Convert the result above into your normal assistant voice and " +
+	return rosterBlock +
+		"\nAll subagent tasks completed. Convert the result above into your normal assistant voice and " +
 		"send that user-facing update now. Keep this internal context private " +
 		"(don't mention system/log/stats/session details or announce type), " +
 		"and do NOT copy the [System Message] block verbatim. " +

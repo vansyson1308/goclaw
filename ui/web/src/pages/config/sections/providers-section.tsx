@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react";
 import { Save, ChevronDown, ChevronRight } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { isSecret } from "@/lib/secret";
 
 type ProviderEntry = {
   api_key?: string;
@@ -15,6 +17,7 @@ type ProvidersData = Record<string, ProviderEntry>;
 const KNOWN_PROVIDERS = [
   { key: "anthropic", label: "Anthropic", envKey: "GOCLAW_ANTHROPIC_API_KEY" },
   { key: "openai", label: "OpenAI", envKey: "GOCLAW_OPENAI_API_KEY" },
+  { key: "api_route", label: "API Route", envKey: "GOCLAW_API_ROUTE_API_KEY" },
   { key: "openrouter", label: "OpenRouter", envKey: "GOCLAW_OPENROUTER_API_KEY" },
   { key: "groq", label: "Groq", envKey: "GOCLAW_GROQ_API_KEY" },
   { key: "gemini", label: "Gemini", envKey: "GOCLAW_GEMINI_API_KEY" },
@@ -24,11 +27,8 @@ const KNOWN_PROVIDERS = [
   { key: "minimax", label: "MiniMax", envKey: "GOCLAW_MINIMAX_API_KEY" },
   { key: "cohere", label: "Cohere", envKey: "GOCLAW_COHERE_API_KEY" },
   { key: "perplexity", label: "Perplexity", envKey: "GOCLAW_PERPLEXITY_API_KEY" },
+  { key: "ollama_cloud", label: "Ollama Cloud", envKey: "GOCLAW_OLLAMA_CLOUD_API_KEY" },
 ];
-
-function isSecret(val: unknown): boolean {
-  return typeof val === "string" && val.includes("***");
-}
 
 interface Props {
   data: ProvidersData | undefined;
@@ -37,6 +37,7 @@ interface Props {
 }
 
 export function ProvidersSection({ data, onSave, saving }: Props) {
+  const { t } = useTranslation("config");
   const [draft, setDraft] = useState<ProvidersData>(data ?? {});
   const [dirty, setDirty] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -74,7 +75,7 @@ export function ProvidersSection({ data, onSave, saving }: Props) {
       }
       toSave[key] = clean;
     }
-    onSave(toSave);
+    onSave(toSave).catch(() => {});
   };
 
   if (!data) return null;
@@ -85,12 +86,12 @@ export function ProvidersSection({ data, onSave, saving }: Props) {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-base">LLM Providers</CardTitle>
-        <CardDescription>API keys are managed via environment variables</CardDescription>
+        <CardTitle className="text-base">{t("providers.title")}</CardTitle>
+        <CardDescription>{t("providers.description")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-2">
         {activeProviders.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No providers configured.</p>
+          <p className="text-sm text-muted-foreground">{t("providers.noProviders")}</p>
         ) : (
           activeProviders.map((p) => {
             const entry = draft[p.key] ?? {};
@@ -111,7 +112,7 @@ export function ProvidersSection({ data, onSave, saving }: Props) {
                 {isOpen && (
                   <div className="space-y-3 border-t px-3 py-3">
                     <div className="grid gap-1.5">
-                      <Label>API Key</Label>
+                      <Label>{t("providers.apiKey")}</Label>
                       <Input
                         type="password"
                         value={entry.api_key ?? ""}
@@ -120,15 +121,15 @@ export function ProvidersSection({ data, onSave, saving }: Props) {
                         onChange={(e) => updateProvider(p.key, { api_key: e.target.value })}
                       />
                       {isSecret(entry.api_key) && (
-                        <p className="text-xs text-muted-foreground">Managed via {p.envKey}</p>
+                        <p className="text-xs text-muted-foreground">{t("providers.managedVia", { envKey: p.envKey })}</p>
                       )}
                     </div>
                     <div className="grid gap-1.5">
-                      <Label>API Base URL</Label>
+                      <Label>{t("providers.apiBaseUrl")}</Label>
                       <Input
                         value={entry.api_base ?? ""}
                         onChange={(e) => updateProvider(p.key, { api_base: e.target.value })}
-                        placeholder="Default endpoint"
+                        placeholder={t("providers.apiBaseUrlPlaceholder")}
                       />
                     </div>
                   </div>
@@ -141,7 +142,7 @@ export function ProvidersSection({ data, onSave, saving }: Props) {
         {dirty && (
           <div className="flex justify-end pt-2">
             <Button size="sm" onClick={handleSave} disabled={saving} className="gap-1.5">
-              <Save className="h-3.5 w-3.5" /> {saving ? "Saving..." : "Save"}
+              <Save className="h-3.5 w-3.5" /> {saving ? t("saving") : t("save")}
             </Button>
           </div>
         )}

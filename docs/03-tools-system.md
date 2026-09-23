@@ -1,10 +1,22 @@
 # 03 - Tools System
 
-The tools system is the bridge between the agent loop and the external environment. When the LLM emits a tool call, the agent loop delegates execution to the tool registry, which handles rate limiting, credential scrubbing, policy enforcement, and virtual filesystem routing before returning results for the next LLM iteration.
+The tools system bridges the agent loop and the external environment. When the LLM emits a tool call, the registry handles rate limiting, credential scrubbing, policy enforcement, and virtual filesystem routing before returning results for the next LLM iteration.
 
 ---
 
-## 1. Tool Execution Flow
+## 1. Overview
+
+Tools are the agent's hands. The registry owns all tool instances and mediates every invocation — injecting request context, enforcing rate limits, running deny-pattern checks, and scrubbing credentials from output. Agents never call tools directly; everything routes through `Registry.ExecuteWithContext`.
+
+Key concerns the tool system manages:
+- **Discovery** — which tools exist and which a given agent may use (policy engine)
+- **Invocation** — per-call context injection, rate limiting, execution, result scrubbing
+- **Isolation** — workspace path containment, path traversal prevention, Docker sandbox routing
+- **Customization** — per-tenant config overlay, custom shell-based tools at runtime
+
+---
+
+## 2. Registry & Lifecycle
 
 ```mermaid
 sequenceDiagram
@@ -15,7 +27,7 @@ sequenceDiagram
     participant SC as Scrubber
 
     AL->>R: ExecuteWithContext(name, args, channel, chatID, ...)
-    R->>R: Inject context values into ctx
+    R->>R: Inject per-call context values
     R->>RL: Allow(sessionKey)?
     alt Rate limited
         RL-->>R: Error: rate limit exceeded
@@ -30,383 +42,212 @@ sequenceDiagram
     R-->>AL: Result
 ```
 
-ExecuteWithContext performs 8 steps:
+Per-call context values injected before execution: channel identity, chat ID, peer kind, sandbox key. Tool instances are shared safely across goroutines because mutable state lives in context, not structs.
 
-1. Lock registry, find tool by name, unlock
-2. Inject `WithToolChannel(ctx, channel)`
-3. Inject `WithToolChatID(ctx, chatID)`
-4. Inject `WithToolPeerKind(ctx, peerKind)`
-5. Inject `WithToolSandboxKey(ctx, sessionKey)`
-6. Rate limit check via `rateLimiter.Allow(sessionKey)`
-7. Execute `tool.Execute(ctx, args)`
-8. Scrub credentials from both `ForLLM` and `ForUser` output, log duration
-
-Context keys ensure each tool call receives the correct per-call values without mutable fields, allowing tool instances to be shared safely across concurrent goroutines.
+**Custom tools** (shell-based, stored in DB) use a two-phase registry:
+- Global tools (no agent scope) are loaded at startup into a shared registry.
+- Per-agent tools are merged on first access; the registry is cloned, never mutated globally.
+- Cache invalidation via pub/sub causes a reload + router invalidation on next agent turn.
 
 ---
 
-## 2. Complete Tool Inventory
+## 3. Tool Capabilities
 
-### Filesystem (group: `fs`)
+Each tool carries structured metadata describing side-effect class, group membership, and workspace requirements.
+
+| Capability | Meaning | Examples |
+|---|---|---|
+| `read-only` | No side effects; safe to retry | `read_file`, `web_search`, `memory_search` |
+| `mutating` | Modifies state or external systems | `write_file`, `exec`, `cron`, `team_tasks` |
+| `async` | Returns immediately; result delivered later | `spawn` |
+| `mcp-bridged` | Proxied to an external MCP server | MCP tools registered dynamically |
+
+Capabilities are inferred from tool name when no explicit metadata is registered. The policy engine can use capability class to gate entire sets (e.g. restrict an agent to read-only tools).
+
+The agent loop also uses this metadata for parallel tool-call scheduling. Only registered read-only tools are eligible for bounded parallel raw I/O. Mutating, async, MCP-bridged, `exec`/`bash`, `wait`, and unknown tools stay sequential by default. `PreToolUse` hooks run before any parallel I/O so hooks can block or rewrite arguments consistently.
+
+---
+
+## 4. Built-in Tool Inventory
+
+### Filesystem (`group:fs`)
 
 | Tool | Description |
-|------|-------------|
+|---|---|
 | `read_file` | Read file contents with optional line range |
 | `write_file` | Write or create a file |
-| `edit_file` | Apply targeted edits to a file |
+| `edit` | Apply targeted edits to a file (old/new string replace) |
 | `list_files` | List directory contents |
-| `search` | Search file contents with regex |
-| `glob` | Find files matching a glob pattern |
 
-### Runtime (group: `runtime`)
+### Runtime (`group:runtime`)
 
 | Tool | Description |
-|------|-------------|
-| `exec` | Execute a shell command |
-| `process` | Manage running processes |
+|---|---|
+| `exec` | Execute a shell command; supports credentialed CLI mode for secure credential injection |
 
-### Web (group: `web`)
+**Credentialed CLI mode** — when the invoked binary is registered in `secure_cli_binaries`, the exec tool injects encrypted env vars directly into the child process (no shell involved) and verifies the agent has an explicit grant. Shell-wrapper unwrapping (up to depth 3) prevents bypass via `sh -c`. Fail-closed on DB error.
 
-| Tool | Description |
-|------|-------------|
-| `web_search` | Search the web |
-| `web_fetch` | Fetch and parse a URL |
-
-### Memory (group: `memory`)
+### Web (`group:web`)
 
 | Tool | Description |
-|------|-------------|
-| `memory_search` | Search memory documents |
-| `memory_get` | Retrieve a specific memory document |
+|---|---|
+| `web_search` | Search the web (Exa, Tavily, Brave, DuckDuckGo provider chain) |
+| `web_fetch` | Fetch and parse a URL (HTML → Markdown); domain allow/block policy |
 
-### Sessions (group: `sessions`)
+### Memory (`group:memory`)
 
 | Tool | Description |
-|------|-------------|
+|---|---|
+| `memory_search` | Search memory documents and episodic memory — supports episodic `created_at` filters via `timeRange`, `createdAfter`, and `createdBefore` |
+| `memory_get` | Retrieve a specific memory document by ID |
+| `memory_expand` | Load full episodic memory content (L2 deep retrieval) |
+
+Memory layers: L1 (`memory_search`) returns ranked abstracts; L2 (`memory_expand`) loads the full summary for a given episodic ID. Use `query: "*"` with an episodic time filter to list recent episodic memories without running document search.
+
+### Sessions (`group:sessions`)
+
+| Tool | Description |
+|---|---|
 | `sessions_list` | List active sessions |
 | `sessions_history` | View session message history |
 | `sessions_send` | Send a message to a session |
-| `sessions_spawn` | Spawn an async subagent task |
-| `subagents` | Manage subagent tasks (list, cancel, steer) |
 | `session_status` | Get current session status |
+| `spawn` | Spawn a subagent or delegate to another session |
 
-### UI (group: `ui`)
-
-| Tool | Description |
-|------|-------------|
-| `browser` | Browser automation via Rod + CDP |
-| `canvas` | Visual canvas operations |
-
-### Automation (group: `automation`)
+### Knowledge & Vault (`group:knowledge` / `group:goclaw`)
 
 | Tool | Description |
-|------|-------------|
-| `cron` | Manage scheduled tasks |
-| `gateway` | Gateway administration commands |
-
-### Messaging (group: `messaging`)
-
-| Tool | Description |
-|------|-------------|
-| `message` | Send a message to a channel |
-
-### Other Tools
-
-| Tool | Description |
-|------|-------------|
+|---|---|
+| `vault_search` | Unified hybrid search across vault docs, memory, and knowledge graph |
+| `vault_read` | Read full content of a vault document by doc_id |
+| `knowledge_graph_search` | Search knowledge graph entities and relationships |
 | `skill_search` | Search available skills (BM25) |
-| `image` | Generate images |
+
+### Automation (`group:automation`)
+
+| Tool | Description |
+|---|---|
+| `cron` | Manage scheduled tasks (create, list, delete) |
+| `datetime` | Get current date/time with timezone support |
+| `heartbeat` | Configure agent periodic proactive check-ins |
+
+### Messaging (`group:messaging`)
+
+| Tool | Description |
+|---|---|
+| `message` | Send a message to a channel |
+| `send_file` | Send an existing workspace file as a chat attachment (with optional caption); marks `DeliveredMedia` to prevent duplicate delivery |
+| `create_forum_topic` | Create a Telegram forum topic |
+| `list_group_members` | List members in a group chat (Feishu/Lark) |
+
+### Delegation
+
+| Tool | Description |
+|---|---|
+| `delegate` | Inter-agent task delegation via `agent_links` (async/sync, optional structured input files, isolated output publication) |
+
+### Teams (`group:team`)
+
+| Tool | Description |
+|---|---|
+| `team_tasks` | Task board: create, list, get, claim, complete, cancel, assign, review, approve, reject, comment, progress, attach, ask_user, search, update |
+
+### Media Generation
+
+| Tool | Description |
+|---|---|
+| `create_image` | Generate images from text (OpenAI, Gemini, MiniMax, DashScope, BytePlus) |
+| `create_audio` | Generate audio/music/sound effects (MiniMax, ElevenLabs) |
+| `create_video` | Generate video from text/image (MiniMax, Gemini, BytePlus) |
 | `tts` | Text-to-speech synthesis (OpenAI, ElevenLabs, Edge, MiniMax) |
-| `spawn` | Spawn subagent (alternative to sessions_spawn) |
-| `nodes` | Node graph operations |
+
+### Media Reading
+
+| Tool | Description |
+|---|---|
+| `read_image` | Analyze/describe images using vision AI (Gemini, Anthropic, OpenRouter, DashScope) |
+| `read_audio` | Transcribe audio to text using Gemini File API, native OpenAI audio input, or OpenAI-compatible transcription models; unsupported provider/model routes fail closed instead of sending audio as image data |
+| `read_document` | Extract and analyze documents (PDF, DOCX, images). Supports local-first extraction via pdftotext/pandoc before falling back to cloud vision (opt-in via config) |
+| `read_video` | Analyze/transcribe video content |
+
+Image attachments keep absolute paths only in internal `MediaRef` storage.
+Model-visible `<media:image>` tags expose an exact media ID plus a logical path
+such as `.uploads/photo.jpg` or delegated `inputs/photo.jpg`. Image tools resolve
+those values against the active workspace; they never infer another agent's
+absolute workspace path. Unknown image IDs fail instead of falling back to an
+unrelated image. Exact `media_id` lookup is an in-process convenience; Claude
+CLI/MCP uses the workspace-confined logical `path` under signed bridge context.
+
+For Agent Link artifact runs, Claude CLI MCP requests carry a signed delegation
+ID and staged-input root. Bridge tools therefore apply the same read-only
+`inputs/` policy as in-process tools, and generated media remains inside
+`outputs/` until the delegation manifest is validated and atomically published.
+
+### Skills & Content
+
+| Tool | Description |
+|---|---|
+| `use_skill` | Activate a skill (marker tool for observability) |
+| `publish_skill` | Register a skill directory in the database |
+| `skill_manage` | Manage skill lifecycle (admin operations) |
 
 ---
 
-## 3. Filesystem Tools and Virtual FS Routing
+## 5. Tool Contracts (JSON Schemas)
 
-In managed mode, filesystem operations are intercepted before hitting the host disk. Two interceptor layers route specific paths to the database instead.
+User-facing parameter schemas for the most commonly configured tools.
 
-```mermaid
-flowchart TD
-    CALL["read_file / write_file"] --> INT1{"ContextFile<br/>Interceptor?"}
-    INT1 -->|Handled| DB1[("DB: agent_context_files<br/>/ user_context_files")]
-    INT1 -->|Not handled| INT2{"Memory<br/>Interceptor?"}
-    INT2 -->|Handled| DB2[("DB: memory_documents")]
-    INT2 -->|Not handled| SBX{"Sandbox enabled?"}
-    SBX -->|Yes| DOCKER["Docker container"]
-    SBX -->|No| HOST["Host filesystem<br/>resolvePath -> os.ReadFile / WriteFile"]
+### `web_search` tenant config shape
+```json
+{
+  "provider_order": ["brave", "exa"],
+  "brave": { "enabled": true, "max_results": 5 },
+  "exa": { "enabled": false },
+  "duckduckgo": { "enabled": false }
+}
+```
+- `provider_order`: provider preference list; unknown names silently ignored.
+- Per-provider: `enabled` (bool) + `max_results` (int). DuckDuckGo `enabled: false` is ignored — it is always the final fallback.
+- API keys go in `config_secrets`, never in settings JSON.
+
+### `web_fetch` tenant config shape
+```json
+{
+  "policy": "allow_all",
+  "allowed_domains": ["github.com", "*.example.com"],
+  "blocked_domains": ["malicious.com"]
+}
 ```
 
-### ContextFileInterceptor -- 7 Routed Files
-
-| File | Description |
-|------|-------------|
-| `SOUL.md` | Agent personality and behavior |
-| `IDENTITY.md` | Agent identity information |
-| `AGENTS.md` | Sub-agent definitions |
-| `TOOLS.md` | Tool usage guidance |
-| `HEARTBEAT.md` | Periodic wake-up instructions |
-| `USER.md` | Per-user preferences and context |
-| `BOOTSTRAP.md` | First-run instructions (write empty = delete row) |
-
-### Routing by Agent Type
-
-```mermaid
-flowchart TD
-    FILE{"Path is one of<br/>7 context files?"} -->|No| PASS["Pass through to disk"]
-    FILE -->|Yes| TYPE{"Agent type?"}
-    TYPE -->|open| USER_CF["user_context_files<br/>fallback: agent_context_files"]
-    TYPE -->|predefined| PRED{"File = USER.md?"}
-    PRED -->|Yes| USER_CF2["user_context_files"]
-    PRED -->|No| AGENT_CF["agent_context_files"]
+### `tts` tenant config shape
+```json
+{
+  "primary": "elevenlabs",
+  "default_voice_id": "pMsXgVXv3BLzUgSXRplE",
+  "default_model": "eleven_flash_v2_5"
+}
 ```
+- `primary`: provider (`elevenlabs`, `openai`, `edge`, `minimax`).
+- Per-agent overrides: `agent.other_config.tts_voice_id`, `agent.other_config.tts_model_id`.
 
-- **Open agents**: All 7 files are per-user. If a user file does not exist, the agent-level template is returned as fallback.
-- **Predefined agents**: Only `USER.md` is per-user. All other files come from the agent-level store.
-
-### MemoryInterceptor
-
-Routes `MEMORY.md`, `memory.md`, and `memory/*` paths. Per-user results take priority with a fallback to global scope. Writing a `.md` file automatically triggers `IndexDocument()` (chunking + embedding).
-
-### Path Security
-
-`resolvePath()` joins relative paths with the workspace root, applies `filepath.Clean()`, and verifies the result with `HasPrefix()`. This prevents path traversal attacks (e.g., `../../../etc/passwd`). The extended `resolvePathWithAllowed()` permits additional prefixes for skills directories.
-
----
-
-## 4. Shell Execution
-
-The `exec` tool allows the LLM to run shell commands, with multiple defense layers.
-
-### Deny Patterns
-
-| Category | Blocked Patterns |
-|----------|------------------|
-| Destructive file ops | `rm -rf`, `del /f`, `rmdir /s` |
-| Disk destruction | `mkfs`, `dd if=`, `> /dev/sd*` |
-| System control | `shutdown`, `reboot`, `poweroff` |
-| Fork bombs | `:(){ ... };:` |
-| Remote code exec | `curl \| sh`, `wget -O - \| sh` |
-| Reverse shells | `/dev/tcp/`, `nc -e` |
-| Eval injection | `eval $()`, `base64 -d \| sh` |
-
-### Approval Workflow
-
-```mermaid
-flowchart TD
-    CMD["Shell Command"] --> DENY{"Matches deny<br/>pattern?"}
-    DENY -->|Yes| BLOCK["Blocked by safety policy"]
-    DENY -->|No| APPROVAL{"Approval manager<br/>configured?"}
-    APPROVAL -->|No| EXEC["Execute on host"]
-    APPROVAL -->|Yes| CHECK{"CheckCommand()"}
-    CHECK -->|deny| BLOCK2["Command denied"]
-    CHECK -->|allow| EXEC
-    CHECK -->|ask| REQUEST["Request approval<br/>(2-minute timeout)"]
-    REQUEST -->|allow-once| EXEC
-    REQUEST -->|allow-always| ADD["Add to dynamic allowlist"] --> EXEC
-    REQUEST -->|deny / timeout| BLOCK3["Command denied"]
+### `document_parser` config shape
+```json
+{
+  "local_first": false,
+  "max_pages": 200,
+  "timeout_sec": 30,
+  "min_text_len": 16
+}
 ```
+Controls local-first document text extraction in the `read_document` tool.
+- `local_first`: Enable local extraction via `pdftotext` (PDF) and `pandoc` (DOCX) before cloud vision fallback (default `false` — opt-in). Requires binaries on PATH; present in `full` Docker variant or builds with `ENABLE_FULL_SKILLS=true`.
+- `max_pages`: Page limit for PDF extraction (default 200). Passed to `pdftotext -l`.
+- `timeout_sec`: Per-extraction timeout in seconds (default 30). Process group killed on timeout.
+- `min_text_len`: Minimum characters (after trim) to consider extraction successful; shorter output triggers cloud fallback (default 16).
 
-### Sandbox Routing
+**Note:** Config values are captured at tool construction (startup) and not picked up by hot-reload. Binary availability is re-checked per call, so runtime binary installations are detected without restart. Any extraction miss (disabled, unsupported mime, missing binary, timeout, empty output) transparently falls back to the cloud vision chain with no caller-visible difference.
 
-When a sandbox manager is configured and a `sandboxKey` exists in context, commands execute inside a Docker container. The host working directory maps to `/workspace` in the container. Host timeout is 60 seconds; sandbox timeout is 300 seconds. If sandbox returns `ErrSandboxDisabled`, execution falls back to the host.
-
----
-
-## 5. Policy Engine
-
-The policy engine determines which tools the LLM can use through a 7-step allow pipeline followed by deny subtraction and additive alsoAllow.
-
-```mermaid
-flowchart TD
-    ALL["All registered tools"] --> S1
-
-    S1["Step 1: Global Profile<br/>full / minimal / coding / messaging"] --> S2
-    S2["Step 2: Provider Profile Override<br/>byProvider.{name}.profile"] --> S3
-    S3["Step 3: Global Allow List<br/>Intersection with allow list"] --> S4
-    S4["Step 4: Provider Allow Override<br/>byProvider.{name}.allow"] --> S5
-    S5["Step 5: Agent Allow<br/>Per-agent allow list"] --> S6
-    S6["Step 6: Agent + Provider Allow<br/>Per-agent per-provider allow"] --> S7
-    S7["Step 7: Group Allow<br/>Group-level allow list"]
-
-    S7 --> DENY["Apply Deny Lists<br/>Global deny, then Agent deny"]
-    DENY --> ALSO["Apply AlsoAllow<br/>Global alsoAllow, Agent alsoAllow<br/>(additive union)"]
-    ALSO --> SUB{"Subagent?"}
-    SUB -->|Yes| SUBDENY["Apply subagent deny list<br/>+ leaf deny list if at max depth"]
-    SUB -->|No| FINAL["Final tool list sent to LLM"]
-    SUBDENY --> FINAL
-```
-
-### Profiles
-
-| Profile | Tools Included |
-|---------|---------------|
-| `full` | All registered tools (no restriction) |
-| `coding` | `group:fs`, `group:runtime`, `group:sessions`, `group:memory`, `image` |
-| `messaging` | `group:messaging`, `sessions_list`, `sessions_history`, `sessions_send`, `session_status` |
-| `minimal` | `session_status` only |
-
-### Tool Groups
-
-| Group | Members |
-|-------|---------|
-| `fs` | `read_file`, `write_file`, `list_files`, `edit_file`, `search`, `glob` |
-| `runtime` | `exec`, `process` |
-| `web` | `web_search`, `web_fetch` |
-| `memory` | `memory_search`, `memory_get` |
-| `sessions` | `sessions_list`, `sessions_history`, `sessions_send`, `sessions_spawn`, `subagents`, `session_status` |
-| `ui` | `browser`, `canvas` |
-| `automation` | `cron`, `gateway` |
-| `messaging` | `message` |
-| `goclaw` | All native tools (composite group) |
-
-Groups can be referenced in allow/deny lists with the `group:` prefix (e.g., `group:fs`). The MCP manager dynamically registers `mcp` and `mcp:{serverName}` groups at runtime.
-
----
-
-## 6. Subagent System
-
-Subagents are child agent instances spawned to handle parallel or complex tasks. They run in background goroutines with restricted tool access.
-
-### Lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Spawning: spawn(task, label)
-    Spawning --> Running: Limits pass<br/>(depth, concurrent, children)
-    Spawning --> Rejected: Limit exceeded
-
-    Running --> Completed: Task finished
-    Running --> Failed: LLM error
-    Running --> Cancelled: cancel / steer / parent abort
-
-    Completed --> Archived: After 60 min
-    Failed --> Archived: After 60 min
-    Cancelled --> Archived: After 60 min
-```
-
-### Limits
-
-| Constraint | Default | Description |
-|------------|---------|-------------|
-| MaxConcurrent | 8 | Total running subagents across all parents |
-| MaxSpawnDepth | 1 | Maximum nesting depth |
-| MaxChildrenPerAgent | 5 | Maximum children per parent agent |
-| ArchiveAfterMinutes | 60 | Auto-archive completed tasks |
-| Max iterations | 20 | LLM loop iterations per subagent |
-
-### Subagent Actions
-
-| Action | Behavior |
-|--------|----------|
-| `spawn` (async) | Launch in goroutine, return immediately with acceptance message |
-| `run` (sync) | Block until subagent completes, return result directly |
-| `list` | List all subagent tasks with status |
-| `cancel` | Cancel by specific ID, `"all"`, or `"last"` |
-| `steer` | Cancel + settle 500ms + respawn with new message |
-
-### Tool Deny Lists
-
-| List | Denied Tools |
-|------|-------------|
-| Always denied (all depths) | `gateway`, `agents_list`, `whatsapp_login`, `session_status`, `cron`, `memory_search`, `memory_get`, `sessions_send` |
-| Leaf denied (max depth) | `sessions_list`, `sessions_history`, `sessions_spawn`, `spawn`, `subagent` |
-
-Results are announced back to the parent agent via the message bus, optionally batched through an AnnounceQueue with debouncing.
-
----
-
-## 7. MCP Bridge Tools
-
-GoClaw integrates with Model Context Protocol (MCP) servers via `internal/mcp/`. The MCP Manager connects to external tool servers and registers their tools in the tool registry with a configurable prefix.
-
-### Transports
-
-| Transport | Description |
-|-----------|-------------|
-| `stdio` | Launch process with command + args, communicate via stdin/stdout |
-| `sse` | Connect to SSE endpoint via URL |
-| `streamable-http` | Connect to HTTP streaming endpoint |
-
-### Behavior
-
-- Health checks run every 30 seconds per server
-- Reconnection uses exponential backoff (2s initial, 60s max, 10 attempts)
-- Tools are registered with a prefix (e.g., `mcp_servername_toolname`)
-- Dynamic tool group registration: `mcp` and `mcp:{serverName}` groups
-
-### Access Control (Managed Mode)
-
-In managed mode, MCP server access is controlled through per-agent and per-user grants stored in PostgreSQL.
-
-```mermaid
-flowchart TD
-    REQ["LoadForAgent(agentID, userID)"] --> QUERY["ListAccessible()<br/>JOIN mcp_servers + agent_grants + user_grants"]
-    QUERY --> SERVERS["Accessible servers list<br/>(with ToolAllow/ToolDeny per grant)"]
-    SERVERS --> CONNECT["Connect each server<br/>(stdio/sse/streamable-http)"]
-    CONNECT --> DISCOVER["ListTools() from server"]
-    DISCOVER --> FILTER["filterTools()<br/>1. Remove tools in deny list<br/>2. Keep only tools in allow list (if set)<br/>3. Deny takes priority over allow"]
-    FILTER --> REGISTER["Register filtered tools<br/>in tool registry"]
-```
-
-**Grant types**:
-
-| Grant | Table | Scope | Fields |
-|-------|-------|-------|--------|
-| Agent grant | `mcp_agent_grants` | Per server + agent | `tool_allow`, `tool_deny` (JSONB arrays), `config_overrides`, `enabled` |
-| User grant | `mcp_user_grants` | Per server + user | `tool_allow`, `tool_deny` (JSONB arrays), `enabled` |
-
-**Access request workflow**: Users can request access to MCP servers. Admins review and approve or reject. On approval, a corresponding grant is created transactionally.
-
-```mermaid
-flowchart LR
-    USER["CreateRequest()<br/>scope: agent/user<br/>status: pending"] --> ADMIN["ReviewRequest()<br/>approve or reject"]
-    ADMIN -->|approved| GRANT["Create agent/user grant<br/>with requested tool_allow"]
-    ADMIN -->|rejected| DONE["Request closed"]
-```
-
----
-
-## 8. Custom Tools (Managed Mode)
-
-Define shell-based tools at runtime via the HTTP API -- no recompile or restart needed. Custom tools are stored in the `custom_tools` PostgreSQL table and loaded dynamically into the agent's tool registry.
-
-### Lifecycle
-
-```mermaid
-flowchart TD
-    subgraph Startup
-        GLOBAL["LoadGlobal()<br/>Fetch all tools with agent_id IS NULL<br/>Register into global registry"]
-    end
-
-    subgraph "Per-Agent Resolution"
-        RESOLVE["LoadForAgent(globalReg, agentID)"] --> CHECK{"Agent has<br/>custom tools?"}
-        CHECK -->|No| USE_GLOBAL["Use global registry as-is"]
-        CHECK -->|Yes| CLONE["Clone global registry<br/>Register per-agent tools<br/>Return cloned registry"]
-    end
-
-    subgraph "Cache Invalidation"
-        EVENT["cache:custom_tools event"] --> RELOAD["ReloadGlobal()<br/>Unregister old, register new"]
-        RELOAD --> INVALIDATE["AgentRouter.InvalidateAll()<br/>Force re-resolve on next request"]
-    end
-```
-
-### Scope
-
-| Scope | `agent_id` | Behavior |
-|-------|-----------|----------|
-| Global | `NULL` | Available to all agents |
-| Per-agent | UUID | Available only to the specified agent |
-
-### Command Execution
-
-1. **Template rendering**: `{{.key}}` placeholders replaced with shell-escaped argument values (single-quote wrapping with embedded quote escaping)
-2. **Deny pattern check**: Same deny patterns as the `exec` tool (blocks `curl|sh`, reverse shells, etc.)
-3. **Execution**: `sh -c <rendered_command>` with configurable timeout (default 60s) and optional working directory
-4. **Environment variables**: Stored encrypted (AES-256-GCM) in the database, decrypted at runtime and injected into the command environment
-
-### JSON Config Example
-
+### Custom tool definition
 ```json
 {
   "name": "dns_lookup",
@@ -425,54 +266,423 @@ flowchart TD
 }
 ```
 
+### Credentialed binary config (`secure_cli_binaries` table)
+```json
+{
+  "binary_name": "gh",
+  "encrypted_env": {"GH_TOKEN": "ghp_..."},
+  "deny_args": ["auth\\s+", "ssh-key"],
+  "timeout_seconds": 30,
+  "tips": "GitHub CLI. Available: gh api, gh repo, gh issue, etc."
+}
+```
+Available presets: `gh`, `gcloud`, `aws`, `kubectl`, `terraform`.
+
+### Credentialed CLI keyword allowlist
+
+`config.tools.commandKeywordAllowlist` lets operators allow specific product or security vocabulary inside selected credentialed CLI content arguments without disabling `deny_args`.
+
+Example:
+
+```json
+{
+  "tools": {
+    "commandKeywordAllowlist": [
+      {
+        "id": "github-content",
+        "command": "gh",
+        "subcommands": ["issue create", "issue edit", "pr create", "pr comment"],
+        "args": ["--body", "--title"],
+        "argPositions": [],
+        "keywords": ["secret", "secrets", "token", "credential"],
+        "reason": "Allow security vocabulary in GitHub issue and PR prose"
+      }
+    ]
+  }
+}
+```
+
+The rule above allows `gh issue create --body "secret rotation notes"` but still blocks command paths like `gh secret set TOKEN`. `argPositions` are 0-based after the matched subcommand. The scanner evaluates command arguments only; it does not read the contents of files passed through arguments such as `--body-file`.
+
+---
+
+## 6. Interception Layer
+
+### Virtual Filesystem Routing
+
+Filesystem calls are intercepted before hitting host disk. Two interceptors route specific paths to the database.
+
+```mermaid
+flowchart TD
+    CALL["read_file / write_file"] --> INT1{"ContextFile<br/>Interceptor?"}
+    INT1 -->|Handled| DB1[("DB: agent_context_files<br/>/ user_context_files")]
+    INT1 -->|Not handled| INT2{"Memory<br/>Interceptor?"}
+    INT2 -->|Handled| DB2[("DB: memory_documents")]
+    INT2 -->|Not handled| SBX{"Sandbox enabled?"}
+    SBX -->|Yes| DOCKER["Docker container"]
+    SBX -->|No| HOST["Host filesystem (workspace-scoped)"]
+```
+
+**ContextFileInterceptor** — routes 6 known bootstrap files (`SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `TOOLS.md`, `USER.md`, `BOOTSTRAP.md`) to the DB instead of disk. Routing depends on agent type:
+- **Open agents**: all files are per-user; agent-level file is the fallback template.
+- **Predefined agents**: only `USER.md` is per-user; all others come from agent-level store.
+
+**MemoryInterceptor** — routes `MEMORY.md`, `memory.md`, and `memory/*` paths to `memory_documents`. Writing a `.md` file automatically triggers chunking + embedding.
+
+### Path Security
+
+`resolvePath()` joins relative paths with the workspace root, applies `filepath.Clean()`, and verifies the result starts with the workspace prefix — preventing path traversal attacks.
+
+### Workspace Context
+
+Filesystem and shell tools read their workspace from context (injected by the agent loop per user and agent). This enables per-user workspace isolation without tool code changes.
+
+### Policy Engine
+
+The policy engine determines which tools reach the LLM through a layered allow pipeline:
+
+```mermaid
+flowchart TD
+    ALL["All registered tools"] --> S1
+    S1["1. Global Profile (full/minimal/coding/messaging)"] --> S2
+    S2["2. Provider Profile Override"] --> S3
+    S3["3. Global Allow List (intersection)"] --> S4
+    S4["4. Provider Allow Override"] --> S5
+    S5["5. Agent Allow"] --> S6
+    S6["6. Agent + Provider Allow"] --> S7
+    S7["7. Group Allow"]
+    S7 --> DENY["Apply Deny Lists (global → agent)"]
+    DENY --> ALSO["Apply AlsoAllow (additive union)"]
+    ALSO --> SUB{"Subagent?"}
+    SUB -->|Yes| SUBDENY["Apply subagent deny list<br/>+ leaf deny at max depth"]
+    SUB -->|No| FINAL["Final tool list → LLM"]
+    SUBDENY --> FINAL
+```
+
+**Profiles:**
+
+| Profile | Tool Set |
+|---|---|
+| `full` | All registered tools |
+| `coding` | `group:fs`, `group:runtime`, `group:sessions`, `group:memory`, `group:web`, `read_image`, `create_image`, `skill_search` |
+| `messaging` | `group:messaging`, `group:web`, sessions read, `read_image`, `skill_search` |
+| `minimal` | `session_status` only |
+
+**Tool Groups** (reference `group:<name>` in allow/deny lists):
+
+| Group | Members |
+|---|---|
+| `fs` | `read_file`, `write_file`, `list_files`, `edit`, `send_file` |
+| `runtime` | `exec` |
+| `web` | `web_search`, `web_fetch` |
+| `memory` | `memory_search`, `memory_get`, `memory_expand`, `knowledge_graph_search` |
+| `sessions` | `sessions_list`, `sessions_history`, `sessions_send`, `spawn`, `session_status` |
+| `automation` | `cron` |
+| `messaging` | `message`, `create_forum_topic`, `list_group_members` |
+| `team` | `team_tasks` |
+| `goclaw` | All native built-in tools (composite) |
+
+MCP groups (`mcp`, `mcp:{serverName}`) are registered dynamically at connection time.
+
+**Per-request allow list** — channels can inject a final intersection step via message metadata (e.g. Telegram forum topics restrict tools per topic).
+
+---
+
+## 7. Custom Tools
+
+Custom tools are shell-based tools defined at runtime via the HTTP API — no recompile or restart needed. Stored in the `custom_tools` table.
+
+**Authoring fields:**
+
+| Field | Required | Purpose |
+|---|---|---|
+| `name` | yes | Tool identifier (lowercase, underscores) |
+| `description` | yes | Shown to the LLM as tool description |
+| `parameters` | yes | JSON Schema object defining tool params |
+| `command` | yes | Shell command with `{{.param}}` Go template placeholders |
+| `timeout_seconds` | no | Execution timeout (default 60s) |
+| `env` | no | Encrypted environment variables injected at runtime |
+| `enabled` | no | Toggle without deleting (default true) |
+
+Credentialed CLI env entries support two API/UI kinds:
+
+- `sensitive` (default): encrypted at rest, masked in normal API responses, replace-only in UI, and flattened only at credential injection time.
+- `value`: encrypted at rest but visible to authorized admins in API/UI for non-secret settings such as public URLs, domains, limits, regions, and feature flags.
+
+Legacy env JSON like `{"TOKEN":"..."}` is still accepted and treated as `sensitive`.
+
+**Execution:** Template placeholders are rendered with shell-escaped argument values, then run via `sh -c`. The same deny-pattern check as the `exec` tool applies — no reverse shells, no `curl | sh`, etc.
+
+**Scope:**
+- `agent_id = NULL` → global; available to all agents.
+- `agent_id = <uuid>` → available only to that agent.
+
 ---
 
 ## 8. Credential Scrubbing
 
-Tool output is automatically scrubbed before being returned to the LLM. Enabled by default in the registry.
+Tool output is automatically scrubbed before being returned to the LLM or the user. The scrubber intercepts both the `ForLLM` and `ForUser` result fields.
 
-### Detected Patterns
+**Static patterns** cover well-known credential shapes including provider API keys, cloud access keys, generic key-value assignments, connection string URIs, and long hex strings. All matches are replaced with `[REDACTED]`.
 
-| Type | Pattern |
-|------|---------|
-| OpenAI | `sk-[a-zA-Z0-9]{20,}` |
-| Anthropic | `sk-ant-[a-zA-Z0-9-]{20,}` |
-| GitHub PAT | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` + 36 alphanumeric characters |
-| AWS | `AKIA[A-Z0-9]{16}` |
-| Generic | `(api_key\|token\|secret\|password\|bearer\|authorization)[:=]value` (case-insensitive) |
+**Dynamic scrubbing** — values can be registered at runtime (e.g. server IPs, deployment-specific tokens). Thread-safe; checked alongside static patterns on every tool result.
 
-All matches are replaced with `[REDACTED]`.
+The exact patterns are intentionally not published here (defense-in-depth). The scrubber is always enabled in the registry by default.
+
+### 8a. Credential adapter framework
+
+For tool binaries that need per-user typed credentials (PAT, SSH key,
+kubeconfig, `.pgpass`, etc.), the `CredentialAdapter` interface in
+`internal/tools/credential_adapter.go` transforms a stored credential into
+the argv/env/ephemeral-file shape the binary expects.
+
+- **`Name() string`** — the value stored in `secure_cli_binaries.adapter_name`.
+- **`ShouldInject(argv []string) bool`** — gate that skips local-only
+  subcommands (e.g. `git status` does not trigger injection).
+- **`Prepare(...) (*Injection, error)`** — returns the four-field
+  `Injection{ArgvPrefix, Env, Cleanup, ScrubValues}` consumed by
+  `credentialed_exec.go`.
+
+Adapters are registered in their own `init()` via `RegisterAdapter`. Lookup
+falls back to the `passthrough` no-op adapter on unknown/empty names, so
+unrelated presets (`gh`, `aws`, `gcloud`, `kubectl`, `terraform`, `gws`)
+keep their legacy env-injection path bit-for-bit.
+
+Per-injection audit: every adapter run emits one
+`slog.Warn("security.system_env_injection", …)` line with the field schema
+documented in [09-security.md § 14](./09-security.md#14-cli-credential-adapters).
+
+To author a new adapter (kubectl, docker, npm, aws, …), follow the worked
+mappings + interface-validation gate in
+[credential-adapter-playbook.md](./credential-adapter-playbook.md). User-facing
+config for the shipped `git` adapter is documented in
+[git-credential-adapter.md](./git-credential-adapter.md).
 
 ---
 
-## 9. Rate Limiter
+## 9. Per-Tenant Config (4-Tier Overlay)
 
-The tool registry supports per-session rate limiting via `ToolRateLimiter`. When configured, each `ExecuteWithContext` call checks `rateLimiter.Allow(sessionKey)` before tool execution. Rate-limited calls receive an error result without executing the tool.
+Tools that support tenant configuration resolve a merged settings map at execution time. Priority order (most specific wins):
+
+```
+Tool Execute(ctx, params)
+  ↓
+Merged settings map:
+  1. Per-agent override   (agents.builtin_tool_settings)
+  2. Tenant override      (builtin_tool_tenant_configs.settings)
+  3. Global default       (builtin_tools.settings)
+  4. Hardcoded fallback   (tool internal defaults)
+```
+
+Merge is per-tool-name: tenant entry for `web_search` wins wholesale over global default — no deep field merge. Tools that do not read the settings map are unaffected.
+
+`exec` reads `settings.timeout_seconds` for host command execution. The REST API validates `exec` settings as a JSON object with optional integer `timeout_seconds` in the `1..3600` range. Missing or invalid runtime values fall back to 60 seconds, while values above the maximum are clamped to 3600 seconds for defense in depth. Docker sandbox tool calls still use `sandbox_config.timeout_sec`; this setting only controls the host `exec` built-in.
+
+**Secret vs non-secret split:**
+- Non-secret config (provider priorities, limits, domain policies) → `builtin_tool_tenant_configs.settings`
+- Secrets (API keys, tokens) → `config_secrets` table (AES-256-GCM encrypted, tenant-scoped)
+
+Never put credentials in the settings JSON blob — backend does not validate the split.
+
+**Cache invalidation:** settings changes propagate via pub/sub (tenant-scoped). Next agent turn re-resolves automatically.
+
+**Tenant admin workflow:** Settings → Builtin Tools → gear icon → typed form when available, otherwise JSON editor → Save. Changes take effect on the next agent turn. "Reset to default" reverts to platform defaults.
+
+**Master-scope guard:** Writes to global `builtin_tools` table require master tenant scope. Tenant admins use the `/tenant-config` endpoint. Same guard applies on the WS config methods.
+
+Current adopters: `exec`, `web_search`, `web_fetch`, `tts`, `create_image`, `read_image`, `create_audio`, `read_audio`, `knowledge_graph_search`.
+
+### Shell Deny-Groups (Runtime Config)
+
+**Global shell deny-groups** are controlled via `config.tools.shellDenyGroups` (map[string]bool). Operators can toggle deny-group classes (e.g. `package_install`, `env_dump`) at runtime from the /config Web UI without restarting the gateway.
+
+**Merge semantics:**
+- Global config serves as base (`config.tools.shellDenyGroups`)
+- Per-agent overrides in `agents.other_config.shell_deny_groups` (if set)
+- Per-key: agent value takes precedence over global value
+- Multi-tenant invariant: each tenant's config is isolated
+
+**Live reload:** Changes to `config.tools.shellDenyGroups` and `config.tools.commandKeywordAllowlist` propagate via `bus.TopicConfigChanged` pub/sub. Next agent turn automatically applies new toggles.
+
+**Deny-group classes** (from `internal/tools/shell_deny_groups.go` — all denied by default):
+
+| Class | Blocks |
+|---|---|
+| `destructive_ops` | rm -rf, dd, mkfs, shutdown, fork bombs |
+| `data_exfiltration` | curl/wget piped to shell, curl POST, DNS tools, /dev/tcp |
+| `reverse_shell` | nc, bash -i, sh -i, reverse-shell payloads |
+| `code_injection` | eval/exec on untrusted input, dynamic code loaders |
+| `privilege_escalation` | sudo, su, setuid abuse |
+| `dangerous_paths` | writes to /etc, /root, system dirs |
+| `env_injection` | export of sensitive env, LD_PRELOAD tricks |
+| `container_escape` | mount, nsenter, capability changes |
+| `crypto_mining` | xmrig and other miners |
+| `filter_bypass` | encoding/quoting tricks to evade pattern matching |
+| `network_recon` | nmap, masscan and similar scanners |
+| `package_install` | apt, yum, brew, pip, npm install (separately routes to approval) |
+| `persistence` | cron edits, systemd unit writes, rc.local |
+| `process_control` | kill -9 of arbitrary PIDs, killall |
+| `env_dump` | env, printenv (full-environment dumps) |
 
 ---
 
-## File Reference
+## 10. MCP Integration
 
-| File | Purpose |
-|------|---------|
-| `internal/tools/registry.go` | Registry: Register, Execute, ExecuteWithContext, ProviderDefs |
-| `internal/tools/types.go` | Tool interface, ContextualTool, InterceptorAware, and other config interfaces |
-| `internal/tools/policy.go` | PolicyEngine: 7-step pipeline, tool groups, profiles, subagent deny lists |
-| `internal/tools/filesystem.go` | read_file, write_file, edit_file with interceptor support |
-| `internal/tools/filesystem_list.go` | list_files tool |
-| `internal/tools/filesystem_write.go` | Additional write operations |
-| `internal/tools/shell.go` | ExecTool: deny patterns, approval workflow, sandbox routing |
-| `internal/tools/scrub.go` | ScrubCredentials: credential pattern matching and redaction |
-| `internal/tools/subagent.go` | SubagentManager: spawn, cancel, steer, run sync, deny lists |
-| `internal/tools/context_file_interceptor.go` | ContextFileInterceptor: 7-file routing by agent type |
-| `internal/tools/memory_interceptor.go` | MemoryInterceptor: MEMORY.md and memory/* routing |
-| `internal/tools/skill_search.go` | Skill search tool (BM25) |
-| `internal/tools/tts.go` | Text-to-speech tool (4 providers) |
-| `internal/mcp/manager.go` | MCP Manager: server connections, health checks, tool registration |
-| `internal/mcp/bridge_tool.go` | MCP bridge tool implementation |
-| `internal/tools/dynamic_loader.go` | DynamicLoader: LoadGlobal, LoadForAgent, ReloadGlobal |
-| `internal/tools/dynamic_tool.go` | DynamicTool: template rendering, shell escaping, execution |
-| `internal/store/custom_tool_store.go` | CustomToolStore interface |
-| `internal/store/pg/custom_tools.go` | PostgreSQL custom tools implementation |
-| `internal/store/mcp_store.go` | MCPServerStore interface (grants, access requests) |
-| `internal/store/pg/mcp_servers.go` | PostgreSQL MCP implementation |
+GoClaw integrates with Model Context Protocol (MCP) servers. The MCP Manager connects to external tool servers and registers their tools in the tool registry with a configurable prefix (e.g. `mcp_servername_toolname`).
+
+**Transports:**
+
+| Transport | Description |
+|---|---|
+| `stdio` | Launch subprocess; communicate via stdin/stdout |
+| `sse` | Connect to SSE endpoint via URL |
+| `streamable-http` | Connect to HTTP streaming endpoint |
+
+**Reliability:** Health checks every 30 seconds. Reconnection via exponential backoff (2s initial, 60s max, 10 attempts).
+
+**Access control:**
+
+```mermaid
+flowchart TD
+    REQ["LoadForAgent(agentID, userID)"] --> QUERY["Join mcp_servers + agent_grants + user_grants"]
+    QUERY --> SERVERS["Accessible servers list"]
+    SERVERS --> CONNECT["Connect (stdio/sse/http)"]
+    CONNECT --> DISCOVER["ListTools() from server"]
+    DISCOVER --> FILTER["filterTools()\n1. Remove deny-listed tools\n2. Intersect with allow list (if set)\n3. Deny takes priority"]
+    FILTER --> REGISTER["Register in tool registry"]
+```
+
+**Grant types:**
+
+| Grant | Table | Scope |
+|---|---|---|
+| Agent grant | `mcp_agent_grants` | Per server + agent; `tool_allow`, `tool_deny` JSONB arrays |
+| User grant | `mcp_user_grants` | Per server + user; `tool_allow`, `tool_deny` JSONB arrays |
+
+**Access request workflow:** Users request server access → admins approve/reject → on approval a grant is created transactionally.
+
+---
+
+## 11. Team Tools
+
+Teams add a shared coordination layer on top of delegation: a task board and peer communication.
+
+### Architecture
+
+When a user messages the team lead:
+1. Lead sees `TEAM.md` in its system prompt (teammate list + roles).
+2. Lead posts tasks to the shared board.
+3. Teammates claim tasks and work in parallel (each has their own session).
+4. Lead synthesizes results and replies to the user.
+
+Only the lead receives `TEAM.md` — teammates discover context through tools, saving tokens on idle agents.
+
+### Task Board (`team_tasks`)
+
+Actions: `create`, `list`, `get`, `claim` (race-safe row lock), `complete`, `cancel`, `assign`, `review`, `approve`, `reject`, `comment` (note/blocker types), `progress`, `attach`, `ask_user`, `search`, `update`.
+
+Completing a task auto-unblocks dependent tasks listed in `blocked_by`.
+
+### Message Routing
+
+Teammate results route through the message bus with a `"teammate:"` prefix, surfacing to the lead and ultimately the user.
+
+---
+
+## 12. Media Tools
+
+Media tools follow a provider-chain pattern: multiple backends are tried in priority order; the first successful response wins.
+
+**Generation chain** (configurable via per-tenant config):
+- Images: OpenAI DALL-E → Gemini → MiniMax → DashScope → BytePlus
+- Audio/music: MiniMax → ElevenLabs
+- Video: MiniMax → Gemini → BytePlus
+- TTS: ElevenLabs → OpenAI → Edge → MiniMax
+
+**Reading chain:**
+- Images: Gemini → Anthropic → OpenRouter → DashScope
+- Audio/documents/video: Resolve service or Gemini File API
+
+Media outputs are written to the agent workspace and referenced by path or URL in the result. File naming is deterministic (content-hashed) to enable deduplication.
+
+---
+
+## 13. Subagent System
+
+Subagents are child agent instances spawned to handle parallel or complex tasks.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Spawning: spawn(task, label)
+    Spawning --> Running: Limits pass
+    Spawning --> Rejected: Limit exceeded
+    Running --> Completed: Task finished
+    Running --> Failed: LLM error
+    Running --> Cancelled: cancel / steer / parent abort
+    Completed --> Archived: After 60 min
+```
+
+**Limits:**
+
+| Constraint | Default |
+|---|---|
+| Max concurrent | 20 executing descendants per root agent |
+| Max spawn depth | 1 |
+| Max children per agent | 5 |
+| Archive after | 60 min |
+| Max iterations | 20 per subagent |
+
+`maxSpawnDepth` applies only to an agent's own subagent tree. Agent Link
+delegation starts a new tree whose spawn depth, concurrency, fanout, retry, and
+model settings are resolved from the target agent.
+
+**Actions:** `spawn(action="spawn", mode="async"|"sync")`, `get`, `list`,
+`cancel` (by ID / `"all"` / `"last"`), `steer` (cancel + respawn with new
+message), and `wait`.
+
+An accepted async spawn returns its short runtime `task_id` plus a durable
+`completion_id`. Terminal status, the full text result, and workspace-safe
+logical media descriptors are written to `subagent_tasks` before the parent
+announcement is attempted. Announcement delivery retries a bounded number of
+times; if the inbound queue is still full or the gateway restarts after
+terminal persistence, the owning root agent can recover the result and logical
+file paths with:
+
+```text
+spawn(action="get", completion_id="<uuid>")
+```
+
+The lookup is scoped by tenant and immutable root-agent UUID. A same-key agent
+created later, another agent in the tenant, and delegation completion rows
+cannot satisfy the lookup.
+
+Terminal persistence uses per-attempt database deadlines and a longer bounded
+retry window than announcement delivery. If the database remains unavailable
+for the entire window, GoClaw does not falsely mark the announcement as
+delivered; a live announcement is still attempted. On the next startup that
+can reach the database, every non-terminal completion row left by the previous
+process is marked `failed` with an interruption reason, so it cannot remain
+`queued` or `running` forever. The single-process gateway retries this
+reconciliation before accepting traffic when the database is temporarily
+unavailable. Graceful gateway shutdown drains this completion lifecycle before
+provider and database teardown.
+
+Self-spawn and Agent Link callbacks also share a process safety cap (Standard:
+32; Lite: 2) and a bounded pending queue of 128. Inside an Agent Link artifact
+run, async `spawn` and async nested `delegate` are rejected; configured
+synchronous descendants complete before the outer artifact is published.
+
+Subagents share the same `SecureCLIStore` as their parent — the credentialed binary gate cannot be bypassed by delegating exec to a child.
+
+---
+
+## 14. File Reference
+
+| Module | Path | Purpose |
+|---|---|---|
+| Registry & policy | `internal/tools/` | Tool registry, policy engine, rate limiter, scrubber, capability metadata |
+| MCP bridge | `internal/mcp/` | MCP server connections, tool bridge, access grants |
+| Custom tools | `internal/tools/` (`dynamic_loader.go`, `dynamic_tool.go`) | Runtime shell-based custom tool loading and execution |
+| Team tools | `internal/tools/` (`team_tasks_tool.go`, `team_tool_*.go`) | Task board backend, team tool dispatch and cache |
+
+Use `grep` or your editor's symbol search for specific files.

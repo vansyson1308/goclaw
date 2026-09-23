@@ -46,95 +46,101 @@ func (s *PGMCPServerStore) CreateServer(ctx context.Context, srv *store.MCPServe
 	now := time.Now()
 	srv.CreatedAt = now
 	srv.UpdatedAt = now
+	encHeaders := s.encryptJSONB(jsonOrEmpty(srv.Headers))
+	encEnv := s.encryptJSONB(jsonOrEmpty(srv.Env))
+
+	tenantID := store.TenantIDFromContext(ctx)
+	if tenantID == uuid.Nil {
+		tenantID = store.MasterTenantID
+	}
+
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO mcp_servers (id, name, display_name, transport, command, args, url, headers, env,
-		 api_key, tool_prefix, timeout_sec, settings, enabled, created_by, created_at, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		 api_key, tool_prefix, timeout_sec, settings, enabled, require_user_credentials, created_by, created_at, updated_at, tenant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		srv.ID, srv.Name, nilStr(srv.DisplayName), srv.Transport, nilStr(srv.Command),
-		jsonOrEmpty(srv.Args), nilStr(srv.URL), jsonOrEmpty(srv.Headers), jsonOrEmpty(srv.Env),
+		jsonOrEmpty(srv.Args), nilStr(srv.URL), encHeaders, encEnv,
 		nilStr(apiKey), nilStr(srv.ToolPrefix), srv.TimeoutSec,
-		jsonOrEmpty(srv.Settings), srv.Enabled, srv.CreatedBy, now, now,
+		jsonOrEmpty(srv.Settings), srv.Enabled, srv.RequireUserCredentials, srv.CreatedBy, now, now, tenantID,
 	)
 	return err
 }
 
+const mcpServerSelectCols = `id, name, COALESCE(display_name, '') AS display_name, transport,
+		 COALESCE(command, '') AS command, args, COALESCE(url, '') AS url, headers, env,
+		 COALESCE(api_key, '') AS api_key, COALESCE(tool_prefix, '') AS tool_prefix,
+		 timeout_sec, settings, enabled, require_user_credentials, created_by, created_at, updated_at`
+
 func (s *PGMCPServerStore) GetServer(ctx context.Context, id uuid.UUID) (*store.MCPServerData, error) {
-	return s.scanServer(s.db.QueryRowContext(ctx,
-		`SELECT id, name, display_name, transport, command, args, url, headers, env,
-		 api_key, tool_prefix, timeout_sec, settings, enabled, created_by, created_at, updated_at
-		 FROM mcp_servers WHERE id = $1`, id))
-}
-
-func (s *PGMCPServerStore) GetServerByName(ctx context.Context, name string) (*store.MCPServerData, error) {
-	return s.scanServer(s.db.QueryRowContext(ctx,
-		`SELECT id, name, display_name, transport, command, args, url, headers, env,
-		 api_key, tool_prefix, timeout_sec, settings, enabled, created_by, created_at, updated_at
-		 FROM mcp_servers WHERE name = $1`, name))
-}
-
-func (s *PGMCPServerStore) scanServer(row *sql.Row) (*store.MCPServerData, error) {
+	q := `SELECT ` + mcpServerSelectCols + ` FROM mcp_servers WHERE id = $1`
+	qArgs := []any{id}
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return nil, sql.ErrNoRows
+		}
+		q += ` AND tenant_id = $2`
+		qArgs = append(qArgs, tenantID)
+	}
 	var srv store.MCPServerData
-	var displayName, command, url, apiKey, toolPrefix *string
-	err := row.Scan(
-		&srv.ID, &srv.Name, &displayName, &srv.Transport, &command,
-		&srv.Args, &url, &srv.Headers, &srv.Env,
-		&apiKey, &toolPrefix, &srv.TimeoutSec,
-		&srv.Settings, &srv.Enabled, &srv.CreatedBy, &srv.CreatedAt, &srv.UpdatedAt,
-	)
-	if err != nil {
+	if err := pkgSqlxDB.GetContext(ctx, &srv, q, qArgs...); err != nil {
 		return nil, err
 	}
-	srv.DisplayName = derefStr(displayName)
-	srv.Command = derefStr(command)
-	srv.URL = derefStr(url)
-	srv.ToolPrefix = derefStr(toolPrefix)
-	if apiKey != nil && *apiKey != "" && s.encKey != "" {
-		decrypted, err := crypto.Decrypt(*apiKey, s.encKey)
-		if err != nil {
-			slog.Warn("mcp: failed to decrypt api key", "server", srv.Name, "error", err)
-		} else {
-			srv.APIKey = decrypted
-		}
-	} else {
-		srv.APIKey = derefStr(apiKey)
-	}
+	s.decryptServerFields(&srv)
 	return &srv, nil
 }
 
-func (s *PGMCPServerStore) ListServers(ctx context.Context) ([]store.MCPServerData, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, display_name, transport, command, args, url, headers, env,
-		 api_key, tool_prefix, timeout_sec, settings, enabled, created_by, created_at, updated_at
-		 FROM mcp_servers ORDER BY name`)
-	if err != nil {
+func (s *PGMCPServerStore) GetServerByName(ctx context.Context, name string) (*store.MCPServerData, error) {
+	q := `SELECT ` + mcpServerSelectCols + ` FROM mcp_servers WHERE name = $1`
+	qArgs := []any{name}
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return nil, sql.ErrNoRows
+		}
+		q += ` AND tenant_id = $2`
+		qArgs = append(qArgs, tenantID)
+	}
+	var srv store.MCPServerData
+	if err := pkgSqlxDB.GetContext(ctx, &srv, q, qArgs...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	s.decryptServerFields(&srv)
+	return &srv, nil
+}
+
+// decryptServerFields decrypts api_key, headers, and env after sqlx scan.
+func (s *PGMCPServerStore) decryptServerFields(srv *store.MCPServerData) {
+	srv.Headers = s.decryptJSONB(srv.Headers)
+	srv.Env = s.decryptJSONB(srv.Env)
+	if srv.APIKey != "" && s.encKey != "" {
+		if decrypted, err := crypto.Decrypt(srv.APIKey, s.encKey); err == nil {
+			srv.APIKey = decrypted
+		} else {
+			slog.Warn("mcp: failed to decrypt api key", "server", srv.Name, "error", err)
+		}
+	}
+}
+
+func (s *PGMCPServerStore) ListServers(ctx context.Context) ([]store.MCPServerData, error) {
+	q := `SELECT ` + mcpServerSelectCols + ` FROM mcp_servers`
+	var qArgs []any
+	if !store.IsCrossTenant(ctx) {
+		tenantID := store.TenantIDFromContext(ctx)
+		if tenantID == uuid.Nil {
+			return []store.MCPServerData{}, nil
+		}
+		q += ` WHERE tenant_id = $1`
+		qArgs = append(qArgs, tenantID)
+	}
+	q += ` ORDER BY name`
 
 	var result []store.MCPServerData
-	for rows.Next() {
-		var srv store.MCPServerData
-		var displayName, command, url, apiKey, toolPrefix *string
-		if err := rows.Scan(
-			&srv.ID, &srv.Name, &displayName, &srv.Transport, &command,
-			&srv.Args, &url, &srv.Headers, &srv.Env,
-			&apiKey, &toolPrefix, &srv.TimeoutSec,
-			&srv.Settings, &srv.Enabled, &srv.CreatedBy, &srv.CreatedAt, &srv.UpdatedAt,
-		); err != nil {
-			continue
-		}
-		srv.DisplayName = derefStr(displayName)
-		srv.Command = derefStr(command)
-		srv.URL = derefStr(url)
-		srv.ToolPrefix = derefStr(toolPrefix)
-		if apiKey != nil && *apiKey != "" && s.encKey != "" {
-			if decrypted, err := crypto.Decrypt(*apiKey, s.encKey); err == nil {
-				srv.APIKey = decrypted
-			}
-		} else {
-			srv.APIKey = derefStr(apiKey)
-		}
-		result = append(result, srv)
+	if err := pkgSqlxDB.SelectContext(ctx, &result, q, qArgs...); err != nil {
+		return nil, err
+	}
+	for i := range result {
+		s.decryptServerFields(&result[i])
 	}
 	return result, nil
 }
@@ -150,273 +156,99 @@ func (s *PGMCPServerStore) UpdateServer(ctx context.Context, id uuid.UUID, updat
 			updates["api_key"] = encrypted
 		}
 	}
+	// Encrypt env/headers JSONB fields.
+	// json.Decoder into map[string]interface{} produces map[string]interface{}
+	// for nested objects, not json.RawMessage — so we must marshal any type.
+	for _, field := range []string{"env", "headers"} {
+		if v, ok := updates[field]; ok {
+			var raw []byte
+			switch val := v.(type) {
+			case json.RawMessage:
+				raw = []byte(val)
+			default:
+				raw, _ = json.Marshal(val)
+			}
+			if len(raw) > 0 {
+				updates[field] = json.RawMessage(s.encryptJSONB(raw))
+			}
+		}
+	}
 	updates["updated_at"] = time.Now()
-	return execMapUpdate(ctx, s.db, "mcp_servers", id, updates)
+	if store.IsCrossTenant(ctx) {
+		return execMapUpdate(ctx, s.db, "mcp_servers", id, updates)
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("tenant_id required for update")
+	}
+	return execMapUpdateWhereTenant(ctx, s.db, "mcp_servers", updates, id, tid)
 }
 
 func (s *PGMCPServerStore) DeleteServer(ctx context.Context, id uuid.UUID) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM mcp_servers WHERE id = $1", id)
+	if store.IsCrossTenant(ctx) {
+		_, err := s.db.ExecContext(ctx, "DELETE FROM mcp_servers WHERE id = $1", id)
+		return err
+	}
+	tid := store.TenantIDFromContext(ctx)
+	if tid == uuid.Nil {
+		return fmt.Errorf("tenant_id required")
+	}
+	_, err := s.db.ExecContext(ctx, "DELETE FROM mcp_servers WHERE id = $1 AND tenant_id = $2", id, tid)
 	return err
 }
 
-// --- Agent Grants ---
-
-func (s *PGMCPServerStore) GrantToAgent(ctx context.Context, g *store.MCPAgentGrant) error {
-	if err := store.ValidateUserID(g.GrantedBy); err != nil {
-		return err
-	}
-	if g.ID == uuid.Nil {
-		g.ID = store.GenNewID()
-	}
-	g.CreatedAt = time.Now()
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO mcp_agent_grants (id, server_id, agent_id, enabled, tool_allow, tool_deny, config_overrides, granted_by, created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-		 ON CONFLICT (server_id, agent_id) DO UPDATE SET
-		   enabled = EXCLUDED.enabled, tool_allow = EXCLUDED.tool_allow,
-		   tool_deny = EXCLUDED.tool_deny, config_overrides = EXCLUDED.config_overrides,
-		   granted_by = EXCLUDED.granted_by`,
-		g.ID, g.ServerID, g.AgentID, g.Enabled,
-		jsonOrNull(g.ToolAllow), jsonOrNull(g.ToolDeny), jsonOrNull(g.ConfigOverrides),
-		g.GrantedBy, g.CreatedAt,
-	)
-	return err
-}
-
-func (s *PGMCPServerStore) RevokeFromAgent(ctx context.Context, serverID, agentID uuid.UUID) error {
-	_, err := s.db.ExecContext(ctx,
-		"DELETE FROM mcp_agent_grants WHERE server_id = $1 AND agent_id = $2", serverID, agentID)
-	return err
-}
-
-func (s *PGMCPServerStore) ListAgentGrants(ctx context.Context, agentID uuid.UUID) ([]store.MCPAgentGrant, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, server_id, agent_id, enabled, tool_allow, tool_deny, config_overrides, granted_by, created_at
-		 FROM mcp_agent_grants WHERE agent_id = $1`, agentID)
+// CacheToolDescriptions stores a map of tool name → cached tool info
+// (description + parameter schema) into the server's settings JSONB under
+// the "tool_cache" key using jsonb_set().
+func (s *PGMCPServerStore) CacheToolDescriptions(ctx context.Context, serverID uuid.UUID, toolInfo map[string]store.CachedToolInfo) error {
+	descJSON, err := json.Marshal(toolInfo)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("marshal tool descriptions: %w", err)
 	}
-	defer rows.Close()
 
-	var result []store.MCPAgentGrant
-	for rows.Next() {
-		var g store.MCPAgentGrant
-		if err := rows.Scan(&g.ID, &g.ServerID, &g.AgentID, &g.Enabled,
-			&g.ToolAllow, &g.ToolDeny, &g.ConfigOverrides, &g.GrantedBy, &g.CreatedAt); err != nil {
-			continue
-		}
-		result = append(result, g)
-	}
-	return result, nil
-}
-
-// --- User Grants ---
-
-func (s *PGMCPServerStore) GrantToUser(ctx context.Context, g *store.MCPUserGrant) error {
-	if err := store.ValidateUserID(g.UserID); err != nil {
-		return err
-	}
-	if err := store.ValidateUserID(g.GrantedBy); err != nil {
-		return err
-	}
-	if g.ID == uuid.Nil {
-		g.ID = store.GenNewID()
-	}
-	g.CreatedAt = time.Now()
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO mcp_user_grants (id, server_id, user_id, enabled, tool_allow, tool_deny, granted_by, created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		 ON CONFLICT (server_id, user_id) DO UPDATE SET
-		   enabled = EXCLUDED.enabled, tool_allow = EXCLUDED.tool_allow,
-		   tool_deny = EXCLUDED.tool_deny, granted_by = EXCLUDED.granted_by`,
-		g.ID, g.ServerID, g.UserID, g.Enabled,
-		jsonOrNull(g.ToolAllow), jsonOrNull(g.ToolDeny),
-		g.GrantedBy, g.CreatedAt,
-	)
-	return err
-}
-
-func (s *PGMCPServerStore) RevokeFromUser(ctx context.Context, serverID uuid.UUID, userID string) error {
-	_, err := s.db.ExecContext(ctx,
-		"DELETE FROM mcp_user_grants WHERE server_id = $1 AND user_id = $2", serverID, userID)
-	return err
-}
-
-// --- Resolution ---
-
-func (s *PGMCPServerStore) ListAccessible(ctx context.Context, agentID uuid.UUID, userID string) ([]store.MCPAccessInfo, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT ms.id, ms.name, ms.display_name, ms.transport, ms.command, ms.args, ms.url, ms.headers, ms.env,
-		 ms.api_key, ms.tool_prefix, ms.timeout_sec, ms.settings, ms.enabled, ms.created_by, ms.created_at, ms.updated_at,
-		 mag.tool_allow, mag.tool_deny
-		 FROM mcp_servers ms
-		 INNER JOIN mcp_agent_grants mag ON ms.id = mag.server_id AND mag.agent_id = $1 AND mag.enabled = true
-		 LEFT JOIN mcp_user_grants mug ON ms.id = mug.server_id AND mug.user_id = $2
-		 WHERE ms.enabled = true
-		   AND (mug.id IS NULL OR mug.enabled = true)`,
-		agentID, userID)
+	query := `
+		UPDATE mcp_servers
+		SET settings = jsonb_set(settings, '{tool_cache}', $1::jsonb, true),
+		    updated_at = NOW()
+		WHERE id = $2
+	`
+	_, err = s.db.ExecContext(ctx, query, string(descJSON), serverID)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("mcp_servers.cache_tool_descriptions: %w", err)
 	}
-	defer rows.Close()
-
-	var result []store.MCPAccessInfo
-	for rows.Next() {
-		var srv store.MCPServerData
-		var displayName, command, url, apiKey, toolPrefix *string
-		var toolAllowJSON, toolDenyJSON []byte
-
-		if err := rows.Scan(
-			&srv.ID, &srv.Name, &displayName, &srv.Transport, &command,
-			&srv.Args, &url, &srv.Headers, &srv.Env,
-			&apiKey, &toolPrefix, &srv.TimeoutSec,
-			&srv.Settings, &srv.Enabled, &srv.CreatedBy, &srv.CreatedAt, &srv.UpdatedAt,
-			&toolAllowJSON, &toolDenyJSON,
-		); err != nil {
-			continue
-		}
-		srv.DisplayName = derefStr(displayName)
-		srv.Command = derefStr(command)
-		srv.URL = derefStr(url)
-		srv.ToolPrefix = derefStr(toolPrefix)
-		if apiKey != nil && *apiKey != "" && s.encKey != "" {
-			if decrypted, err := crypto.Decrypt(*apiKey, s.encKey); err == nil {
-				srv.APIKey = decrypted
-			}
-		} else {
-			srv.APIKey = derefStr(apiKey)
-		}
-
-		info := store.MCPAccessInfo{Server: srv}
-		if toolAllowJSON != nil {
-			json.Unmarshal(toolAllowJSON, &info.ToolAllow)
-		}
-		if toolDenyJSON != nil {
-			json.Unmarshal(toolDenyJSON, &info.ToolDeny)
-		}
-		result = append(result, info)
-	}
-	return result, nil
+	return nil
 }
 
-// --- Access Requests ---
-
-func (s *PGMCPServerStore) CreateRequest(ctx context.Context, req *store.MCPAccessRequest) error {
-	if err := store.ValidateUserID(req.RequestedBy); err != nil {
-		return err
+// encryptJSONB encrypts a JSONB blob (env, headers) by converting it to a JSON string literal.
+// Unencrypted: {"key":"val"} (JSONB object). Encrypted: "aes-gcm:..." (JSONB string).
+func (s *PGMCPServerStore) encryptJSONB(data []byte) []byte {
+	if s.encKey == "" || len(data) == 0 || string(data) == "{}" || string(data) == "null" {
+		return data
 	}
-	if req.ID == uuid.Nil {
-		req.ID = store.GenNewID()
+	enc, err := crypto.Encrypt(string(data), s.encKey)
+	if err != nil {
+		slog.Warn("mcp: failed to encrypt jsonb", "error", err)
+		return data
 	}
-	req.Status = "pending"
-	req.CreatedAt = time.Now()
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO mcp_access_requests (id, server_id, agent_id, user_id, scope, status, reason, tool_allow, requested_by, created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		req.ID, req.ServerID, nilUUID(req.AgentID), nilStr(req.UserID),
-		req.Scope, req.Status, nilStr(req.Reason),
-		jsonOrNull(req.ToolAllow), req.RequestedBy, req.CreatedAt,
-	)
-	return err
+	// Wrap as JSON string so it's valid JSONB
+	wrapped, _ := json.Marshal(enc)
+	return wrapped
 }
 
-func (s *PGMCPServerStore) ListPendingRequests(ctx context.Context) ([]store.MCPAccessRequest, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, server_id, agent_id, user_id, scope, status, reason, tool_allow, requested_by,
-		 reviewed_by, reviewed_at, review_note, created_at
-		 FROM mcp_access_requests WHERE status = 'pending' ORDER BY created_at`)
+// decryptJSONB decrypts a JSONB blob if it's an encrypted JSON string.
+// Returns the original bytes if unencrypted (JSON object) or on error.
+func (s *PGMCPServerStore) decryptJSONB(data []byte) []byte {
+	if s.encKey == "" || len(data) == 0 || data[0] != '"' {
+		return data // not a JSON string → unencrypted JSONB object
+	}
+	var encStr string
+	if json.Unmarshal(data, &encStr) != nil {
+		return data
+	}
+	dec, err := crypto.Decrypt(encStr, s.encKey)
 	if err != nil {
-		return nil, err
+		slog.Warn("mcp: failed to decrypt jsonb", "error", err)
+		return data
 	}
-	defer rows.Close()
-
-	var result []store.MCPAccessRequest
-	for rows.Next() {
-		var r store.MCPAccessRequest
-		var agentID *uuid.UUID
-		var userID, reviewedBy, reviewNote *string
-		if err := rows.Scan(&r.ID, &r.ServerID, &agentID, &userID, &r.Scope, &r.Status,
-			&r.Reason, &r.ToolAllow, &r.RequestedBy,
-			&reviewedBy, &r.ReviewedAt, &reviewNote, &r.CreatedAt); err != nil {
-			continue
-		}
-		r.AgentID = agentID
-		r.UserID = derefStr(userID)
-		r.ReviewedBy = derefStr(reviewedBy)
-		r.ReviewNote = derefStr(reviewNote)
-		result = append(result, r)
-	}
-	return result, nil
-}
-
-func (s *PGMCPServerStore) ReviewRequest(ctx context.Context, requestID uuid.UUID, approved bool, reviewedBy, note string) error {
-	if err := store.ValidateUserID(reviewedBy); err != nil {
-		return err
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	// Load the request
-	var req store.MCPAccessRequest
-	var agentID *uuid.UUID
-	var userID *string
-	err = tx.QueryRowContext(ctx,
-		`SELECT id, server_id, agent_id, user_id, scope, status, tool_allow
-		 FROM mcp_access_requests WHERE id = $1 AND status = 'pending'`, requestID,
-	).Scan(&req.ID, &req.ServerID, &agentID, &userID, &req.Scope, &req.Status, &req.ToolAllow)
-	if err != nil {
-		return fmt.Errorf("request not found or not pending: %w", err)
-	}
-
-	status := "rejected"
-	if approved {
-		status = "approved"
-	}
-	now := time.Now()
-
-	// Update request status
-	_, err = tx.ExecContext(ctx,
-		`UPDATE mcp_access_requests SET status = $1, reviewed_by = $2, reviewed_at = $3, review_note = $4 WHERE id = $5`,
-		status, reviewedBy, now, nilStr(note), requestID,
-	)
-	if err != nil {
-		return err
-	}
-
-	// If approved, insert the grant
-	if approved {
-		switch req.Scope {
-		case "agent":
-			if agentID == nil {
-				return fmt.Errorf("agent_id required for agent scope")
-			}
-			_, err = tx.ExecContext(ctx,
-				`INSERT INTO mcp_agent_grants (id, server_id, agent_id, enabled, tool_allow, granted_by, created_at)
-				 VALUES ($1,$2,$3,true,$4,$5,$6)
-				 ON CONFLICT (server_id, agent_id) DO UPDATE SET enabled = true, tool_allow = EXCLUDED.tool_allow, granted_by = EXCLUDED.granted_by`,
-				store.GenNewID(), req.ServerID, *agentID, jsonOrNull(req.ToolAllow), reviewedBy, now,
-			)
-		case "user":
-			if userID == nil || *userID == "" {
-				return fmt.Errorf("user_id required for user scope")
-			}
-			_, err = tx.ExecContext(ctx,
-				`INSERT INTO mcp_user_grants (id, server_id, user_id, enabled, tool_allow, granted_by, created_at)
-				 VALUES ($1,$2,$3,true,$4,$5,$6)
-				 ON CONFLICT (server_id, user_id) DO UPDATE SET enabled = true, tool_allow = EXCLUDED.tool_allow, granted_by = EXCLUDED.granted_by`,
-				store.GenNewID(), req.ServerID, *userID, jsonOrNull(req.ToolAllow), reviewedBy, now,
-			)
-		default:
-			return fmt.Errorf("unknown scope: %s", req.Scope)
-		}
-		if err != nil {
-			return err
-		}
-	}
-
-	return tx.Commit()
+	return []byte(dec)
 }

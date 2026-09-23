@@ -1,0 +1,102 @@
+{
+  "title": "Workstations",
+  "description": "Quản lý kết nối workstation từ xa (SSH, Docker) cho agent thực thi lệnh.",
+  "addWorkstation": "Thêm Workstation",
+  "emptyTitle": "Chưa có workstation nào",
+  "emptyDescription": "Thêm workstation để cho phép agent chạy lệnh trên máy từ xa.",
+  "backend": {
+    "ssh": "SSH",
+    "docker": "Docker"
+  },
+  "status": {
+    "active": "Hoạt động",
+    "inactive": "Tắt"
+  },
+  "columns": {
+    "name": "Tên",
+    "key": "Khóa",
+    "backend": "Loại",
+    "status": "Trạng thái",
+    "created": "Tạo lúc",
+    "actions": "Thao tác"
+  },
+  "actions": {
+    "edit": "Sửa",
+    "delete": "Xóa",
+    "test": "Kiểm tra kết nối",
+    "activate": "Kích hoạt",
+    "deactivate": "Tắt"
+  },
+  "createDialog": {
+    "title": "Thêm Workstation",
+    "description": "Cấu hình kết nối workstation từ xa mới.",
+    "nameLabel": "Tên hiển thị",
+    "namePlaceholder": "Máy chủ Dev",
+    "keyLabel": "Khóa workstation",
+    "keyPlaceholder": "may-chu-dev",
+    "keyHint": "Chữ thường, số, dấu gạch ngang. Agent dùng khóa này để tham chiếu workstation.",
+    "backendLabel": "Loại backend",
+    "sshOption": "SSH",
+    "dockerOption": "Docker",
+    "hostLabel": "Host",
+    "hostPlaceholder": "192.168.1.100",
+    "portLabel": "Cổng",
+    "userLabel": "SSH User",
+    "userPlaceholder": "ubuntu",
+    "authMethodLabel": "Xác thực",
+    "authPrivateKeyOption": "Khóa riêng tư",
+    "authPasswordOption": "Mật khẩu",
+    "privateKeyLabel": "Khóa riêng tư (PEM)",
+    "privateKeyPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "privateKeyHint": "Nội dung khóa được mã hóa khi lưu và không bao giờ trả về qua API.",
+    "passwordLabel": "Mật khẩu SSH",
+    "passwordPlaceholder": "Mật khẩu của SSH user",
+    "passwordHint": "Nên ưu tiên xác thực bằng khóa khi có thể.",
+    "containerLabel": "Tên / ID container",
+    "containerPlaceholder": "my-container",
+    "imageLabel": "Image",
+    "imagePlaceholder": "ubuntu:24.04",
+    "socketPathLabel": "Đường dẫn Docker socket (tùy chọn)",
+    "socketPathPlaceholder": "unix:///var/run/docker.sock",
+    "cancel": "Hủy",
+    "create": "Tạo",
+    "errors": {
+      "keyRequired": "Vui lòng nhập khóa workstation.",
+      "nameRequired": "Vui lòng nhập tên hiển thị.",
+      "sshHostUserRequired": "Backend SSH yêu cầu Host và SSH user.",
+      "sshPortRange": "Cổng phải nằm trong khoảng 1 đến 65535.",
+      "sshPrivateKeyRequired": "Cần khóa riêng tư khi xác thực bằng khóa.",
+      "sshPasswordRequired": "Cần mật khẩu khi xác thực bằng mật khẩu.",
+      "dockerContainerRequired": "Backend Docker yêu cầu tên container.",
+      "dockerImageRequired": "Backend Docker yêu cầu image.",
+      "createFailed": "Tạo workstation thất bại."
+    }
+  },
+  "deleteDialog": {
+    "title": "Xóa Workstation",
+    "description": "Bạn có chắc muốn xóa \"{{name}}\"? Thao tác này không thể hoàn tác.",
+    "confirmLabel": "Xóa"
+  },
+  "testResult": {
+    "success": "Kết nối thành công",
+    "notImplemented": "Tính năng kiểm tra kết nối chưa khả dụng"
+  },
+  "activity": {
+    "title": "Hoạt động gần đây",
+    "emptyTitle": "Chưa có hoạt động",
+    "emptyDescription": "Các lệnh thực thi sẽ xuất hiện ở đây.",
+    "columns": {
+      "action": "Hành động",
+      "cmdPreview": "Lệnh",
+      "exitCode": "Mã thoát",
+      "duration": "Thời gian",
+      "agent": "Agent",
+      "timestamp": "Thời điểm"
+    },
+    "actions": {
+      "exec": "Thực thi",
+      "deny": "Từ chối"
+    },
+    "loadMore": "Tải thêm"
+  }
+}

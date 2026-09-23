@@ -21,7 +21,7 @@ func TestNewToolRateLimiter_Negative(t *testing.T) {
 
 func TestToolRateLimiter_AllowUnderLimit(t *testing.T) {
 	rl := NewToolRateLimiter(5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := rl.Allow("user1"); err != nil {
 			t.Errorf("action %d should be allowed: %v", i, err)
 		}
@@ -31,7 +31,7 @@ func TestToolRateLimiter_AllowUnderLimit(t *testing.T) {
 func TestToolRateLimiter_BlockOverLimit(t *testing.T) {
 	rl := NewToolRateLimiter(3)
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := rl.Allow("user1"); err != nil {
 			t.Fatalf("action %d should be allowed: %v", i, err)
 		}
@@ -58,6 +58,28 @@ func TestToolRateLimiter_SeparateKeys(t *testing.T) {
 	// user2 is independent
 	if err := rl.Allow("user2"); err != nil {
 		t.Errorf("user2 should be allowed: %v", err)
+	}
+}
+
+func TestToolRateLimiter_AllowWithLimit_Override(t *testing.T) {
+	rl := NewToolRateLimiter(100) // global default 100
+
+	// A per-agent override of 2 caps this key at 2, regardless of the global 100.
+	if err := rl.AllowWithLimit("agentA", 2); err != nil {
+		t.Fatalf("call 1 should be allowed: %v", err)
+	}
+	if err := rl.AllowWithLimit("agentA", 2); err != nil {
+		t.Fatalf("call 2 should be allowed: %v", err)
+	}
+	if err := rl.AllowWithLimit("agentA", 2); err == nil {
+		t.Error("call 3 should be blocked by the override of 2")
+	}
+
+	// maxOverride <= 0 falls back to the configured global (100), on its own key.
+	for i := range 3 {
+		if err := rl.AllowWithLimit("agentB", 0); err != nil {
+			t.Fatalf("agentB call %d should use global 100: %v", i, err)
+		}
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -23,7 +25,8 @@ func (m *SendMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodSend, m.handleSend)
 }
 
-func (m *SendMethods) handleSend(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *SendMethods) handleSend(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		Channel string `json:"channel"`
 		To      string `json:"to"`
@@ -34,15 +37,15 @@ func (m *SendMethods) handleSend(_ context.Context, client *gateway.Client, req 
 	}
 
 	if params.Channel == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "channel is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "channel")))
 		return
 	}
 	if params.To == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "to is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "to")))
 		return
 	}
 	if params.Message == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "message is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgMsgRequired)))
 		return
 	}
 
@@ -52,7 +55,7 @@ func (m *SendMethods) handleSend(_ context.Context, client *gateway.Client, req 
 		Content: params.Message,
 	})
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok":      true,
 		"channel": params.Channel,
 		"to":      params.To,

@@ -2,10 +2,13 @@ package agent
 
 import (
 	"fmt"
+	"log/slog"
 	"unicode/utf8"
 
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/pipeline"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/tokencount"
 )
 
 // Context pruning defaults matching TS DEFAULT_CONTEXT_PRUNING_SETTINGS.
@@ -13,13 +16,80 @@ const (
 	defaultKeepLastAssistants   = 3
 	defaultSoftTrimRatio        = 0.3
 	defaultHardClearRatio       = 0.5
+	defaultPruningMode          = "cache-ttl"
 	defaultMinPrunableToolChars = 50000
-	defaultSoftTrimMaxChars     = 4000
-	defaultSoftTrimHeadChars    = 1500
-	defaultSoftTrimTailChars    = 1500
+	defaultSoftTrimMaxChars     = 6000
+	defaultSoftTrimHeadChars    = 3000
+	defaultSoftTrimTailChars    = 3000
 	defaultHardClearPlaceholder = "[Old tool result content cleared]"
+	defaultCacheTTL             = "5m"
 	charsPerTokenEstimate       = 4
+
+	// Media tool results contain irreplaceable vision/audio descriptions
+	// from dedicated providers (Gemini, Anthropic) — re-generating requires
+	// another LLM call. Give them a higher soft trim budget.
+	mediaSoftTrimHeadChars = 4000
+	mediaSoftTrimTailChars = 4000
 )
+
+// PruningDefaults mirrors the private pruning const block for external
+// consumers (e.g. config.defaults RPC). Values are the SSoT the resolver uses
+// when a user config leaves a field unset.
+type PruningDefaults struct {
+	KeepLastAssistants   int
+	SoftTrimRatio        float64
+	HardClearRatio       float64
+	MinPrunableToolChars int
+	SoftTrimMaxChars     int
+	SoftTrimHeadChars    int
+	SoftTrimTailChars    int
+	HardClearEnabled     bool
+	HardClearPlaceholder string
+	TTL                  string
+}
+
+// DefaultPruningValues returns the private pruning consts packaged for
+// cross-package consumption. The resolver in resolvePruningSettings uses these
+// same values.
+func DefaultPruningValues() PruningDefaults {
+	return PruningDefaults{
+		KeepLastAssistants:   defaultKeepLastAssistants,
+		SoftTrimRatio:        defaultSoftTrimRatio,
+		HardClearRatio:       defaultHardClearRatio,
+		MinPrunableToolChars: defaultMinPrunableToolChars,
+		SoftTrimMaxChars:     defaultSoftTrimMaxChars,
+		SoftTrimHeadChars:    defaultSoftTrimHeadChars,
+		SoftTrimTailChars:    defaultSoftTrimTailChars,
+		HardClearEnabled:     true,
+		HardClearPlaceholder: defaultHardClearPlaceholder,
+		TTL:                  defaultCacheTTL,
+	}
+}
+
+// pruningEstimator wraps either a tiktoken counter or the legacy char-based heuristic.
+// When counter is nil, falls back to rune_count / charsPerTokenEstimate.
+type pruningEstimator struct {
+	counter tokencount.TokenCounter
+	model   string
+}
+
+// estimateTokens returns an integer unit comparable to tokenWindow.
+// When counter is set: returns actual token count (tiktoken).
+// When nil (fallback): returns rune count, to be compared against charWindow = tokens * charsPerTokenEstimate.
+func (e *pruningEstimator) estimateTokens(content string) int {
+	if e.counter != nil {
+		return e.counter.Count(e.model, content)
+	}
+	return utf8.RuneCountInString(content)
+}
+
+// mediaToolNames identifies builtin tools whose results use a higher soft trim budget.
+var mediaToolNames = map[string]bool{
+	"read_image":    true,
+	"read_document": true,
+	"read_audio":    true,
+	"read_video":    true,
+}
 
 // effectivePruningSettings holds resolved pruning settings with defaults applied.
 type effectivePruningSettings struct {
@@ -98,16 +168,46 @@ func resolvePruningSettings(cfg *config.ContextPruningConfig) *effectivePruningS
 //
 // Only tool results older than keepLastAssistants are eligible for pruning.
 // Returns a new slice if any changes were made, otherwise the original.
-func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg *config.ContextPruningConfig) []providers.Message {
-	if cfg == nil || cfg.Mode != "cache-ttl" {
+//
+// When tc is non-nil, token counting uses tiktoken for accuracy (especially
+// for non-ASCII content like Vietnamese/Chinese). When nil, falls back to the
+// legacy rune_count/charsPerTokenEstimate heuristic so existing tests pass.
+func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg *config.ContextPruningConfig, tc tokencount.TokenCounter, model string, stats *pipeline.PruneStats) []providers.Message {
+	// Resolve effective mode: empty defaults to "cache-ttl" (enabled by default).
+	mode := defaultPruningMode
+	if cfg != nil && cfg.Mode != "" {
+		mode = cfg.Mode
+	}
+	if mode == "off" {
+		return msgs
+	}
+	if mode != "cache-ttl" {
+		slog.Warn("context_pruning: unknown mode, disabled", "mode", mode)
 		return msgs
 	}
 	if contextWindowTokens <= 0 || len(msgs) == 0 {
 		return msgs
 	}
 
+	est := &pruningEstimator{counter: tc, model: model}
 	settings := resolvePruningSettings(cfg)
-	charWindow := contextWindowTokens * charsPerTokenEstimate
+
+	// tokenWindow is contextWindowTokens when using tiktoken (est.counter != nil),
+	// or charWindow (tokens * 4) when using the char-based fallback.
+	tokenWindow := contextWindowTokens
+	if tc == nil {
+		tokenWindow = contextWindowTokens * charsPerTokenEstimate
+	}
+
+	// softTrimMaxTokens is the threshold for the estimator's unit.
+	// When tiktoken (tc != nil): convert chars → tokens (3000 chars / 4 ≈ 750 tokens).
+	// When char fallback (tc == nil): keep as rune count (estimateTokens returns rune count).
+	softTrimMaxTokens := settings.softTrimMaxChars
+	mediaSoftTrimMaxTokens := mediaSoftTrimHeadChars + mediaSoftTrimTailChars
+	if tc != nil {
+		softTrimMaxTokens = settings.softTrimMaxChars / charsPerTokenEstimate
+		mediaSoftTrimMaxTokens = mediaSoftTrimMaxTokens / charsPerTokenEstimate
+	}
 
 	// Find cutoff: protect last N assistant messages.
 	cutoffIndex := findAssistantCutoff(msgs, settings.keepLastAssistants)
@@ -124,13 +224,13 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 		}
 	}
 
-	// Estimate total chars.
-	totalChars := 0
+	// Estimate total tokens (or chars in fallback mode).
+	totalTokens := 0
 	for _, m := range msgs {
-		totalChars += estimateMessageChars(m)
+		totalTokens += est.estimateTokens(m.Content)
 	}
 
-	ratio := float64(totalChars) / float64(charWindow)
+	ratio := float64(totalTokens) / float64(tokenWindow)
 	if ratio < settings.softTrimRatio {
 		return msgs // context is small enough
 	}
@@ -147,14 +247,25 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 		return msgs
 	}
 
+	// Build tool call name map for media tool detection in soft trim.
+	toolCallNames := buildToolCallNameMap(msgs)
+
 	// Pass 1: Soft trim long tool results.
 	var result []providers.Message
 	for i := range prunableIndexes {
 		idx := prunableIndexes[i]
 		msg := msgs[idx]
-		msgChars := estimateMessageChars(msg)
+		msgTokens := est.estimateTokens(msg.Content)
 
-		if msgChars <= settings.softTrimMaxChars {
+		// Media tool results (read_image, etc.) get a higher trim budget because
+		// their content is an irreplaceable description from a dedicated vision provider.
+		isMedia := mediaToolNames[toolCallNames[msg.ToolCallID]]
+		trimThreshold := softTrimMaxTokens
+		if isMedia {
+			trimThreshold = mediaSoftTrimMaxTokens
+		}
+
+		if msgTokens <= trimThreshold {
 			continue
 		}
 
@@ -164,17 +275,39 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 			copy(result, msgs)
 		}
 
-		head := takeHead(msg.Content, settings.softTrimHeadChars)
-		tail := takeTail(msg.Content, settings.softTrimTailChars)
+		// Tail-aware split: if tail has important content (errors, summaries),
+		// use dynamic 70/30 split. Otherwise use configured head/tail sizes.
+		// String slicing always uses chars (not tokens).
+		headChars := settings.softTrimHeadChars
+		tailChars := settings.softTrimTailChars
+		if isMedia {
+			headChars = mediaSoftTrimHeadChars
+			tailChars = mediaSoftTrimTailChars
+		}
+		if hasImportantTail(msg.Content) {
+			totalBudget := headChars + tailChars
+			tailChars = totalBudget * 7 / 10
+			headChars = totalBudget - tailChars
+		}
+		head := takeHead(msg.Content, headChars)
+		tail := takeTail(msg.Content, tailChars)
+		msgChars := utf8.RuneCountInString(msg.Content)
 		trimmed := fmt.Sprintf("%s\n...\n%s\n\n[Tool result trimmed: kept first %d chars and last %d chars of %d chars.]",
-			head, tail, settings.softTrimHeadChars, settings.softTrimTailChars, msgChars)
+			head, tail, headChars, tailChars, msgChars)
 
 		result[idx] = providers.Message{
 			Role:       msg.Role,
 			Content:    trimmed,
 			ToolCallID: msg.ToolCallID,
+			// Preserve ToolName: Gemini needs it to build FunctionResponse.name,
+			// and pruned results are exactly the ones whose assistant tool_call
+			// may already be out of the request window.
+			ToolName: msg.ToolName,
 		}
-		totalChars += len(trimmed) - msgChars
+		totalTokens += est.estimateTokens(trimmed) - msgTokens
+		if stats != nil {
+			stats.ResultsTrimmed++
+		}
 	}
 
 	output := msgs
@@ -183,15 +316,15 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 	}
 
 	// Re-check ratio after soft trim.
-	ratio = float64(totalChars) / float64(charWindow)
+	ratio = float64(totalTokens) / float64(tokenWindow)
 	if ratio < settings.hardClearRatio || !settings.hardClearEnabled {
 		return output
 	}
 
-	// Check min prunable chars threshold.
+	// Check min prunable chars threshold (always char-based per config).
 	prunableChars := 0
 	for _, idx := range prunableIndexes {
-		prunableChars += estimateMessageChars(output[idx])
+		prunableChars += utf8.RuneCountInString(output[idx].Content)
 	}
 	if prunableChars < settings.minPrunableToolChars {
 		return output
@@ -209,16 +342,28 @@ func pruneContextMessages(msgs []providers.Message, contextWindowTokens int, cfg
 			break
 		}
 		msg := output[idx]
-		beforeChars := estimateMessageChars(msg)
+
+		// Media tool results (read_image, etc.) are never hard-cleared because
+		// they contain irreplaceable vision/audio descriptions — re-generating
+		// requires another LLM call. Soft trim already caps them at 8K chars.
+		if mediaToolNames[toolCallNames[msg.ToolCallID]] {
+			continue
+		}
+
+		beforeTokens := est.estimateTokens(msg.Content)
 
 		output[idx] = providers.Message{
 			Role:       msg.Role,
 			Content:    settings.hardClearPlaceholder,
 			ToolCallID: msg.ToolCallID,
+			ToolName:   msg.ToolName,
 		}
-		afterChars := len(settings.hardClearPlaceholder)
-		totalChars += afterChars - beforeChars
-		ratio = float64(totalChars) / float64(charWindow)
+		afterTokens := est.estimateTokens(settings.hardClearPlaceholder)
+		totalTokens += afterTokens - beforeTokens
+		ratio = float64(totalTokens) / float64(tokenWindow)
+		if stats != nil {
+			stats.ResultsCleared++
+		}
 	}
 
 	return output
@@ -249,6 +394,14 @@ func estimateMessageChars(m providers.Message) int {
 	return utf8.RuneCountInString(m.Content)
 }
 
+// hasImportantTail checks if the last ~500 chars of content contain error/summary keywords.
+func hasImportantTail(content string) bool {
+	runes := []rune(content)
+	checkLen := min(500, len(runes))
+	tail := string(runes[len(runes)-checkLen:])
+	return importantTailRe.MatchString(tail)
+}
+
 // takeHead returns the first n runes of s.
 func takeHead(s string, n int) string {
 	if n <= 0 {
@@ -271,4 +424,16 @@ func takeTail(s string, n int) string {
 		return s
 	}
 	return string(runes[len(runes)-n:])
+}
+
+// buildToolCallNameMap creates a mapping from tool_call_id → tool name
+// by scanning assistant messages for their ToolCalls.
+func buildToolCallNameMap(msgs []providers.Message) map[string]string {
+	m := make(map[string]string)
+	for _, msg := range msgs {
+		for _, tc := range msg.ToolCalls {
+			m[tc.ID] = tc.Name
+		}
+	}
+	return m
 }

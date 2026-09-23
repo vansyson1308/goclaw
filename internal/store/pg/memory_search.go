@@ -16,7 +16,10 @@ func (s *PGMemoryStore) Search(ctx context.Context, query string, agentID, userI
 		maxResults = s.cfg.MaxResults
 	}
 
-	aid := mustParseUUID(agentID)
+	aid, err := parseUUID(agentID)
+	if err != nil {
+		return nil, fmt.Errorf("memory search: %w", err)
+	}
 
 	// FTS search using tsvector
 	ftsResults, err := s.ftsSearch(ctx, query, aid, userID, maxResults*2)
@@ -36,8 +39,14 @@ func (s *PGMemoryStore) Search(ctx context.Context, query string, agentID, userI
 		}
 	}
 
-	// Merge results — normalize weights when one channel has no results
+	// Merge results — use per-query overrides if set, else store defaults
 	textW, vecW := s.cfg.TextWeight, s.cfg.VectorWeight
+	if opts.TextWeight > 0 {
+		textW = opts.TextWeight
+	}
+	if opts.VectorWeight > 0 {
+		vecW = opts.VectorWeight
+	}
 	if len(ftsResults) == 0 && len(vecResults) > 0 {
 		textW, vecW = 0, 1.0
 	} else if len(vecResults) == 0 && len(ftsResults) > 0 {
@@ -51,7 +60,7 @@ func (s *PGMemoryStore) Search(ctx context.Context, query string, agentID, userI
 		if opts.MinScore > 0 && m.Score < opts.MinScore {
 			continue
 		}
-		if opts.PathPrefix != "" && len(m.Path) < len(opts.PathPrefix) {
+		if opts.PathPrefix != "" && !strings.HasPrefix(m.Path, opts.PathPrefix) {
 			continue
 		}
 		filtered = append(filtered, m)
@@ -72,155 +81,137 @@ type scoredChunk struct {
 	UserID    *string
 }
 
-func (s *PGMemoryStore) ftsSearch(ctx context.Context, query string, agentID interface{}, userID string, limit int) ([]scoredChunk, error) {
+func (s *PGMemoryStore) ftsSearch(ctx context.Context, query string, agentID any, userID string, limit int) ([]scoredChunk, error) {
 	var q string
-	var args []interface{}
+	var args []any
 
-	if userID != "" {
-		q = `SELECT path, start_line, end_line, text, user_id,
-				ts_rank(tsv, plainto_tsquery('simple', $1)) AS score
+	if store.IsSharedMemory(ctx) {
+		// Shared: no user_id filter — search ALL chunks for agent
+		tc, tcArgs, _, err := scopeClause(ctx, 4)
+		if err != nil {
+			return nil, err
+		}
+		limitN := 4 + len(tcArgs)
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
+				ts_rank(tsv, plainto_tsquery('russian', $1)) AS score
 			FROM memory_chunks
-			WHERE agent_id = $2 AND tsv @@ plainto_tsquery('simple', $3)
-			AND (user_id IS NULL OR user_id = $4)
-			ORDER BY score DESC LIMIT $5`
-		args = []interface{}{query, agentID, query, userID, limit}
+			WHERE agent_id = $2 AND tsv @@ plainto_tsquery('russian', $3)%s
+			ORDER BY score DESC LIMIT $%d`, tc, limitN)
+		args = append([]any{query, agentID, query}, tcArgs...)
+		args = append(args, limit)
+	} else if userID != "" {
+		// fixed params: $1=query, $2=agentID, $3=query, $4=userID
+		tc, tcArgs, _, err := scopeClause(ctx, 5)
+		if err != nil {
+			return nil, err
+		}
+		limitN := 5 + len(tcArgs)
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
+				ts_rank(tsv, plainto_tsquery('russian', $1)) AS score
+			FROM memory_chunks
+			WHERE agent_id = $2 AND tsv @@ plainto_tsquery('russian', $3)
+			AND (user_id IS NULL OR user_id = $4)%s
+			ORDER BY score DESC LIMIT $%d`, tc, limitN)
+		args = append([]any{query, agentID, query, userID}, tcArgs...)
+		args = append(args, limit)
 	} else {
-		q = `SELECT path, start_line, end_line, text, user_id,
-				ts_rank(tsv, plainto_tsquery('simple', $1)) AS score
+		// fixed params: $1=query, $2=agentID, $3=query
+		tc, tcArgs, _, err := scopeClause(ctx, 4)
+		if err != nil {
+			return nil, err
+		}
+		limitN := 4 + len(tcArgs)
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
+				ts_rank(tsv, plainto_tsquery('russian', $1)) AS score
 			FROM memory_chunks
-			WHERE agent_id = $2 AND tsv @@ plainto_tsquery('simple', $3)
-			AND user_id IS NULL
-			ORDER BY score DESC LIMIT $4`
-		args = []interface{}{query, agentID, query, limit}
+			WHERE agent_id = $2 AND tsv @@ plainto_tsquery('russian', $3)
+			AND user_id IS NULL%s
+			ORDER BY score DESC LIMIT $%d`, tc, limitN)
+		args = append([]any{query, agentID, query}, tcArgs...)
+		args = append(args, limit)
 	}
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
+	var rows []scoredChunkRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var results []scoredChunk
-	for rows.Next() {
-		var r scoredChunk
-		rows.Scan(&r.Path, &r.StartLine, &r.EndLine, &r.Text, &r.UserID, &r.Score)
-		results = append(results, r)
+	results := make([]scoredChunk, len(rows))
+	for i := range rows {
+		results[i] = rows[i].toScoredChunk()
 	}
 	return results, nil
 }
 
-func (s *PGMemoryStore) vectorSearch(ctx context.Context, embedding []float32, agentID interface{}, userID string, limit int) ([]scoredChunk, error) {
+func (s *PGMemoryStore) vectorSearch(ctx context.Context, embedding []float32, agentID any, userID string, limit int) ([]scoredChunk, error) {
 	vecStr := vectorToString(embedding)
 
 	var q string
-	var args []interface{}
+	var args []any
 
-	if userID != "" {
-		q = `SELECT path, start_line, end_line, text, user_id,
+	if store.IsSharedMemory(ctx) {
+		// Shared: no user_id filter — search ALL chunks for agent
+		tc, tcArgs, _, err := scopeClause(ctx, 3)
+		if err != nil {
+			return nil, err
+		}
+		orderN := 3 + len(tcArgs)
+		limitN := orderN + 1
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
+				1 - (embedding <=> $1::vector) AS score
+			FROM memory_chunks
+			WHERE agent_id = $2 AND embedding IS NOT NULL%s
+			ORDER BY embedding <=> $%d::vector LIMIT $%d`, tc, orderN, limitN)
+		args = append([]any{vecStr, agentID}, tcArgs...)
+		args = append(args, vecStr, limit)
+	} else if userID != "" {
+		// fixed params: $1=vec, $2=agentID, $3=userID
+		tc, tcArgs, _, err := scopeClause(ctx, 4)
+		if err != nil {
+			return nil, err
+		}
+		orderN := 4 + len(tcArgs)
+		limitN := orderN + 1
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
 				1 - (embedding <=> $1::vector) AS score
 			FROM memory_chunks
 			WHERE agent_id = $2 AND embedding IS NOT NULL
-			AND (user_id IS NULL OR user_id = $3)
-			ORDER BY embedding <=> $4::vector LIMIT $5`
-		args = []interface{}{vecStr, agentID, userID, vecStr, limit}
+			AND (user_id IS NULL OR user_id = $3)%s
+			ORDER BY embedding <=> $%d::vector LIMIT $%d`, tc, orderN, limitN)
+		args = append([]any{vecStr, agentID, userID}, tcArgs...)
+		args = append(args, vecStr, limit)
 	} else {
-		q = `SELECT path, start_line, end_line, text, user_id,
+		// fixed params: $1=vec, $2=agentID
+		tc, tcArgs, _, err := scopeClause(ctx, 3)
+		if err != nil {
+			return nil, err
+		}
+		orderN := 3 + len(tcArgs)
+		limitN := orderN + 1
+		q = fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id,
 				1 - (embedding <=> $1::vector) AS score
 			FROM memory_chunks
 			WHERE agent_id = $2 AND embedding IS NOT NULL
-			AND user_id IS NULL
-			ORDER BY embedding <=> $3::vector LIMIT $4`
-		args = []interface{}{vecStr, agentID, vecStr, limit}
+			AND user_id IS NULL%s
+			ORDER BY embedding <=> $%d::vector LIMIT $%d`, tc, orderN, limitN)
+		args = append([]any{vecStr, agentID}, tcArgs...)
+		args = append(args, vecStr, limit)
 	}
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
+	var rows []scoredChunkRow
+	if err := pkgSqlxDB.SelectContext(ctx, &rows, q, args...); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var results []scoredChunk
-	for rows.Next() {
-		var r scoredChunk
-		rows.Scan(&r.Path, &r.StartLine, &r.EndLine, &r.Text, &r.UserID, &r.Score)
-		results = append(results, r)
-	}
-	return results, nil
-}
-
-// likeSearch is a fallback when FTS returns nothing (e.g., cross-language query).
-// Splits query into keywords (max 5, min 3 chars each) and matches via ILIKE.
-// Scoped to agent_id (indexed) so scan is limited. Only runs as last resort.
-func (s *PGMemoryStore) likeSearch(ctx context.Context, query string, agentID interface{}, userID string, limit int) ([]scoredChunk, error) {
-	words := strings.Fields(query)
-	if len(words) == 0 {
-		return nil, nil
-	}
-
-	// Build OR conditions — cap at 5 longest keywords (>= 3 chars) to limit scan cost
-	const maxKeywords = 5
-	const minKeywordLen = 3
-	var filtered []string
-	for _, w := range words {
-		w = strings.TrimSpace(w)
-		if len(w) >= minKeywordLen {
-			filtered = append(filtered, w)
-		}
-	}
-	if len(filtered) == 0 {
-		return nil, nil
-	}
-	// Keep longest keywords first (more selective → fewer matches)
-	for i := 0; i < len(filtered); i++ {
-		for j := i + 1; j < len(filtered); j++ {
-			if len(filtered[j]) > len(filtered[i]) {
-				filtered[i], filtered[j] = filtered[j], filtered[i]
-			}
-		}
-	}
-	if len(filtered) > maxKeywords {
-		filtered = filtered[:maxKeywords]
-	}
-
-	// Build query with positional params
-	// $1 = agentID, $2..$N = keywords, then optional userID, then limit
-	args := []interface{}{agentID}
-	var conditions []string
-	for _, w := range filtered {
-		args = append(args, "%"+w+"%")
-		conditions = append(conditions, fmt.Sprintf("text ILIKE $%d", len(args)))
-	}
-
-	q := fmt.Sprintf(`SELECT path, start_line, end_line, text, user_id, 0.5 AS score
-		FROM memory_chunks
-		WHERE agent_id = $1 AND (%s)`, strings.Join(conditions, " OR "))
-
-	if userID != "" {
-		args = append(args, userID)
-		q += fmt.Sprintf(" AND (user_id IS NULL OR user_id = $%d)", len(args))
-	} else {
-		q += " AND user_id IS NULL"
-	}
-	args = append(args, limit)
-	q += fmt.Sprintf(" LIMIT $%d", len(args))
-
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var results []scoredChunk
-	for rows.Next() {
-		var r scoredChunk
-		rows.Scan(&r.Path, &r.StartLine, &r.EndLine, &r.Text, &r.UserID, &r.Score)
-		results = append(results, r)
+	results := make([]scoredChunk, len(rows))
+	for i := range rows {
+		results[i] = rows[i].toScoredChunk()
 	}
 	return results, nil
 }
 
 // hybridMerge combines FTS and vector results with weighted scoring.
 // Per-user results get a 1.2x boost. Deduplication: user copy wins over global.
+// NOTE: when shared memory is active, the 1.2x personal boost still applies —
+// consider removing it in shared mode if all docs should be treated equally.
 func hybridMerge(fts, vec []scoredChunk, textWeight, vectorWeight float64, currentUserID string) []store.MemorySearchResult {
 	type key struct {
 		Path      string
@@ -282,3 +273,4 @@ func hybridMerge(fts, vec []scoredChunk, textWeight, vectorWeight float64, curre
 
 	return results
 }
+

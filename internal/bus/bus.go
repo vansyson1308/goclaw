@@ -2,6 +2,8 @@ package bus
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sync"
 )
 
@@ -22,16 +24,28 @@ type MessageBus struct {
 
 func New() *MessageBus {
 	return &MessageBus{
-		inbound:     make(chan InboundMessage, 100),
-		outbound:    make(chan OutboundMessage, 100),
+		inbound:     make(chan InboundMessage, 1000),
+		outbound:    make(chan OutboundMessage, 1000),
 		handlers:    make(map[string]MessageHandler),
 		subscribers: make(map[string]EventHandler),
 	}
 }
 
 // PublishInbound queues an inbound message from a channel.
+// Blocks if the inbound buffer is full.
 func (mb *MessageBus) PublishInbound(msg InboundMessage) {
 	mb.inbound <- msg
+}
+
+// TryPublishInbound attempts to queue an inbound message without blocking.
+// Returns false if the inbound buffer is full (message dropped).
+func (mb *MessageBus) TryPublishInbound(msg InboundMessage) bool {
+	select {
+	case mb.inbound <- msg:
+		return true
+	default:
+		return false
+	}
 }
 
 // ConsumeInbound blocks until an inbound message is available or ctx is cancelled.
@@ -45,8 +59,20 @@ func (mb *MessageBus) ConsumeInbound(ctx context.Context) (InboundMessage, bool)
 }
 
 // PublishOutbound queues an outbound message to a channel.
+// Blocks if the outbound buffer is full.
 func (mb *MessageBus) PublishOutbound(msg OutboundMessage) {
 	mb.outbound <- msg
+}
+
+// TryPublishOutbound attempts to queue an outbound message without blocking.
+// Returns false if the outbound buffer is full (message dropped).
+func (mb *MessageBus) TryPublishOutbound(msg OutboundMessage) bool {
+	select {
+	case mb.outbound <- msg:
+		return true
+	default:
+		return false
+	}
 }
 
 // SubscribeOutbound blocks until an outbound message is available or ctx is cancelled.
@@ -89,11 +115,24 @@ func (mb *MessageBus) Unsubscribe(id string) {
 }
 
 // Broadcast sends an event to all subscribers (non-blocking per subscriber).
+// Panicking handlers are caught and logged to prevent one bad subscriber
+// from crashing the entire event bus.
 func (mb *MessageBus) Broadcast(event Event) {
 	mb.subMu.RLock()
 	defer mb.subMu.RUnlock()
-	for _, handler := range mb.subscribers {
-		handler(event) // handlers should be non-blocking
+	for id, handler := range mb.subscribers {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("bus: subscriber panicked",
+						"subscriber", id,
+						"event", event.Name,
+						"panic", fmt.Sprint(r),
+					)
+				}
+			}()
+			handler(event)
+		}()
 	}
 }
 

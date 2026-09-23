@@ -2,38 +2,55 @@ package feishu
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"strings"
+	"path/filepath"
 	"time"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // messageContext holds parsed information from a Feishu message event.
 type messageContext struct {
-	ChatID      string
-	MessageID   string
-	SenderID    string // sender_id.open_id
-	ChatType    string // "p2p" or "group"
-	Content     string
-	ContentType string // "text", "post", "image", etc.
+	ChatID       string
+	MessageID    string
+	SenderID     string // sender_id.open_id
+	ChatType     string // "p2p" or "group"
+	Content      string
+	ContentType  string // "text", "post", "image", etc.
 	MentionedBot bool
-	RootID      string // thread root message ID
-	ParentID    string // parent message ID
-	Mentions    []mentionInfo
+	RootID       string // reply-chain root (populated on ANY reply, incl. plain quote reply)
+	ParentID     string // direct parent in reply chain
+	ThreadID     string // set ONLY when message is inside an actual topic thread
+	Mentions     []mentionInfo
 }
 
 type mentionInfo struct {
-	Key    string // @_user_N placeholder
-	OpenID string
-	Name   string
+	Key       string // @_user_N placeholder
+	OpenID    string
+	UserID    string
+	UnionID   string
+	Name      string
+	TenantKey string
 }
 
 // handleMessageEvent processes an incoming Feishu message event.
 func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
+	c.handleMessageEventFrom(ctx, event, "direct")
+}
+
+func (c *Channel) handleMessageEventFrom(ctx context.Context, event *MessageEvent, source string) {
+	// Inject tenant scope so store queries filter by the correct tenant_id.
+	ctx = store.WithTenantID(ctx, c.TenantID())
+
 	if event == nil {
+		return
+	}
+	if !c.shouldProcessMessageEvent(event, source) {
 		return
 	}
 
@@ -56,31 +73,152 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 	if mc == nil {
 		return
 	}
+	c.logParsedMessage(event, mc, source)
+
+	// 2a. Slash commands in DMs are rejected early with a clear hint so
+	// they never reach the agent pipeline (otherwise users typing
+	// "/addwriter" in a DM would waste an LLM turn). The full writer
+	// command router is gated behind group policy below at step 5a.
+	if mc.ChatType != "group" && c.isWriterSlashCommand(mc) {
+		c.sendCommandReply(ctx, mc, "This command only works in group chats.")
+		return
+	}
+
+	if mc.ChatType == "group" && len(mc.Mentions) > 0 && !mc.MentionedBot {
+		slog.Info("feishu group message skipped; explicit mention is not this bot",
+			"source", source,
+			"decision", "skip_non_target_mention",
+			"channel", c.Name(),
+			"event_id", event.Header.EventID,
+			"message_id", mc.MessageID,
+			"chat_id", mc.ChatID,
+			"sender_id", mc.SenderID,
+			"bot_open_id", c.botOpenID,
+			"mention_count", len(mc.Mentions),
+		)
+		return
+	}
 
 	// 3. Resolve sender name (cached)
 	senderName := c.resolveSenderName(ctx, mc.SenderID)
+	senderLabel := senderName
+	if senderLabel == "" {
+		senderLabel = mc.SenderID
+	}
 
-	// 4. Group policy
-	if mc.ChatType == "group" {
-		if !c.checkGroupPolicy(mc.SenderID) {
-			slog.Debug("feishu group message rejected by policy", "sender_id", mc.SenderID, "chat_id", mc.ChatID)
-			return
+	// 4. Resolve media BEFORE mention gate so non-mentioned messages
+	// also have their files downloaded and stored in pending history.
+	var earlyMedia []media.MediaInfo
+	switch mc.ContentType {
+	case "image", "file", "audio", "video", "sticker":
+		earlyMedia = c.resolveMediaFromMessage(ctx, mc.MessageID, mc.ContentType, msg.Content)
+	case "post":
+		if imageKeys := extractPostImageKeys(msg.Content); len(imageKeys) > 0 {
+			earlyMedia = c.resolvePostImages(ctx, mc.MessageID, imageKeys)
 		}
+	}
+	var earlyMediaPaths []string
+	for _, m := range earlyMedia {
+		if m.FilePath != "" {
+			earlyMediaPaths = append(earlyMediaPaths, m.FilePath)
+		}
+	}
 
-		// 5. RequireMention check
+	// 5. Group policy
+	if mc.ChatType == "group" {
+		isWriterCommand := c.isWriterSlashCommand(mc)
+
+		// 5a. RequireMention check runs before pairing for normal messages so
+		// non-target bots stay silent in multi-agent groups. Do not create a
+		// pairing request for messages that did not mention this bot.
 		requireMention := true
 		if c.cfg.RequireMention != nil {
 			requireMention = *c.cfg.RequireMention
 		}
-		if requireMention && !mc.MentionedBot {
-			slog.Debug("feishu group message skipped: bot not mentioned", "chat_id", mc.ChatID)
+		slog.Debug("feishu group mention gate",
+			"source", source,
+			"decision", "evaluate_group_gate",
+			"channel", c.Name(),
+			"event_id", event.Header.EventID,
+			"message_id", mc.MessageID,
+			"chat_id", mc.ChatID,
+			"sender_id", mc.SenderID,
+			"bot_open_id", c.botOpenID,
+			"mentioned_bot", mc.MentionedBot,
+			"mention_count", len(mc.Mentions),
+			"mentions", formatMentionInfos(mc.Mentions),
+			"require_mention", requireMention,
+			"group_policy", c.cfg.GroupPolicy,
+			"is_writer_command", isWriterCommand,
+		)
+		if !isWriterCommand && requireMention && !mc.MentionedBot {
+			if !c.canRecordUnmentionedGroupMessage(ctx, mc.SenderID, mc.ChatID) {
+				slog.Debug("feishu group message skipped; no bot mention and policy not approved",
+					"source", source,
+					"decision", "skip_no_mention_unapproved",
+					"channel", c.Name(),
+					"event_id", event.Header.EventID,
+					"message_id", mc.MessageID,
+					"chat_id", mc.ChatID,
+					"sender_id", mc.SenderID,
+				)
+				return
+			}
+
+			historyKey := mc.ChatID
+			if mc.RootID != "" && c.cfg.TopicSessionMode == "enabled" {
+				historyKey = fmt.Sprintf("%s:topic:%s", mc.ChatID, mc.RootID)
+			}
+			c.GroupHistory().Record(historyKey, channels.HistoryEntry{
+				Sender:    senderLabel,
+				SenderID:  mc.SenderID,
+				Body:      mc.Content,
+				Media:     earlyMediaPaths,
+				Timestamp: time.Now(),
+				MessageID: messageID,
+			}, c.HistoryLimit())
+
+			// Collect contact even when bot is not mentioned (cache prevents DB spam).
+			if cc := c.ContactCollector(); cc != nil {
+				cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", "group", "user", "", "")
+			}
+
+			slog.Debug("feishu group message recorded without bot mention",
+				"source", source,
+				"decision", "record_no_mention_history",
+				"channel", c.Name(),
+				"event_id", event.Header.EventID,
+				"message_id", mc.MessageID,
+				"chat_id", mc.ChatID,
+				"sender", senderName,
+			)
+			return
+		}
+
+		if !c.checkGroupPolicy(ctx, mc.SenderID, mc.ChatID) {
+			slog.Debug("feishu group message rejected by policy",
+				"source", source,
+				"decision", "reject_group_policy",
+				"channel", c.Name(),
+				"event_id", event.Header.EventID,
+				"message_id", mc.MessageID,
+				"sender_id", mc.SenderID,
+				"chat_id", mc.ChatID,
+			)
+			return
+		}
+
+		// 5b. Writer management slash commands run AFTER the group policy
+		// gate so commands cannot bypass allowlists or pairing. Commands
+		// short-circuit the agent pipeline to avoid consuming LLM tokens.
+		if isWriterCommand && c.maybeHandleWriterCommand(ctx, mc) {
 			return
 		}
 	}
 
 	// 6. DM policy (pairing flow)
 	if mc.ChatType == "p2p" {
-		if !c.checkDMPolicy(mc.SenderID, mc.ChatID) {
+		if !c.checkDMPolicy(ctx, mc.SenderID, mc.ChatID) {
 			return
 		}
 	}
@@ -91,13 +229,39 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 		content = "[empty message]"
 	}
 
+	// 7a. Lark doc auto-fetch: expand any docx URLs in the message body into
+	// inline context blocks so the agent can read linked docs without a tool
+	// call. Cached per channel for the TTL window. Missing permission / dead
+	// links fail soft with a marker string.
+	content = c.resolveLarkDocs(ctx, content)
+
+	// 7b. Fetch reply context + media if this is a reply to another message.
+	// We intentionally do NOT recurse into resolveLarkDocs for the parent
+	// message body — expanding doc URLs in older messages would bloat the
+	// prompt unpredictably (one quote reply could drag in multiple docs the
+	// user never intended to reference). Users must include the doc URL in
+	// their own new message to get auto-fetch behavior.
+	var replyMediaList []media.MediaInfo
+	if mc.ParentID != "" {
+		replyCtx, replyMedia := c.fetchReplyContext(ctx, mc.ParentID)
+		if replyCtx != "" {
+			content += "\n\n" + replyCtx
+		}
+		replyMediaList = replyMedia
+	}
+
 	// 8. Topic session
 	chatID := mc.ChatID
 	if mc.RootID != "" && c.cfg.TopicSessionMode == "enabled" {
 		chatID = fmt.Sprintf("%s:topic:%s", mc.ChatID, mc.RootID)
 	}
 
-	slog.Debug("feishu message received",
+	slog.Debug("feishu message accepted",
+		"source", source,
+		"decision", "publish_inbound",
+		"channel", c.Name(),
+		"event_id", event.Header.EventID,
+		"message_id", mc.MessageID,
 		"sender_id", mc.SenderID,
 		"sender_name", senderName,
 		"chat_id", chatID,
@@ -112,343 +276,228 @@ func (c *Channel) handleMessageEvent(ctx context.Context, event *MessageEvent) {
 		peerKind = "group"
 	}
 
+	// Collect contact for processed messages (DM + group-mentioned).
+	if cc := c.ContactCollector(); cc != nil {
+		cc.EnsureContact(ctx, c.Type(), c.Name(), mc.SenderID, mc.SenderID, senderName, "", peerKind, "user", "", "")
+	}
+
 	metadata := map[string]string{
 		"message_id":    messageID,
 		"chat_type":     mc.ChatType,
 		"sender_name":   senderName,
+		"display_name":  channels.SanitizeDisplayName(senderName),
 		"mentioned_bot": fmt.Sprintf("%t", mc.MentionedBot),
-		"platform":      "feishu",
+		"platform":      channels.TypeFeishu,
+	}
+
+	// Thread routing: stamp the triggering message ID ONLY when the inbound
+	// message is inside an actual topic thread (thread_id present per Lark
+	// docs). We deliberately do NOT fire on mc.RootID — Lark populates root_id
+	// on every reply including plain quote replies outside any thread, and
+	// routing those through the reply endpoint would silently promote them to
+	// new threads. thread_id is the definitive signal.
+	//
+	// Outbound Send() reads this key and, when non-empty, routes to the Lark
+	// reply endpoint with reply_in_thread=true so the bot response lands
+	// inside the same thread. Absent on non-thread messages — preserves
+	// existing new-message endpoint behavior for DMs, plain groups, and quote
+	// replies.
+	if mc.ThreadID != "" {
+		metadata["feishu_reply_target_id"] = messageID
 	}
 
 	if sender != nil {
 		metadata["sender_open_id"] = sender.SenderID.OpenID
 	}
 
-	// Annotate current message with sender name so LLM knows who is talking in groups.
-	if mc.ChatType == "group" && senderName != "" {
-		content = fmt.Sprintf("[From: %s]\n%s", senderName, content)
-	}
-
-	// 10. Publish to bus
-	c.HandleMessage(mc.SenderID, chatID, content, nil, metadata, peerKind)
-}
-
-// --- Parse ---
-
-func (c *Channel) parseMessageEvent(event *MessageEvent) *messageContext {
-	msg := &event.Event.Message
-	sender := &event.Event.Sender
-
-	chatID := msg.ChatID
-	messageID := msg.MessageID
-	chatType := msg.ChatType
-	contentType := msg.MessageType
-	rootID := msg.RootID
-	parentID := msg.ParentID
-
-	senderID := ""
-	if sender != nil {
-		senderID = sender.SenderID.OpenID
-	}
-
-	// Parse content
-	content := parseMessageContent(msg.Content, contentType)
-
-	// Parse mentions
-	var mentions []mentionInfo
-	mentionedBot := false
-	for _, m := range msg.Mentions {
-		mi := mentionInfo{
-			Key:    m.Key,
-			OpenID: m.ID.OpenID,
-			Name:   m.Name,
-		}
-		mentions = append(mentions, mi)
-
-		// Check if bot is mentioned
-		if c.botOpenID != "" && mi.OpenID == c.botOpenID {
-			mentionedBot = true
-		}
-	}
-
-	// Strip bot mention from content
-	if mentionedBot && c.botOpenID != "" {
-		content = stripBotMention(content, mentions, c.botOpenID)
-	}
-
-	return &messageContext{
-		ChatID:       chatID,
-		MessageID:    messageID,
-		SenderID:     senderID,
-		ChatType:     chatType,
-		Content:      content,
-		ContentType:  contentType,
-		MentionedBot: mentionedBot,
-		RootID:       rootID,
-		ParentID:     parentID,
-		Mentions:     mentions,
-	}
-}
-
-// --- Content parsing ---
-
-func parseMessageContent(rawContent, messageType string) string {
-	if rawContent == "" {
-		return ""
-	}
-
-	switch messageType {
-	case "text":
-		var textMsg struct {
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal([]byte(rawContent), &textMsg); err == nil {
-			return textMsg.Text
-		}
-		return rawContent
-
-	case "post":
-		return parsePostContent(rawContent)
-
-	case "image":
-		return "[image]"
-
-	case "file":
-		var fileMsg struct {
-			FileName string `json:"file_name"`
-		}
-		if err := json.Unmarshal([]byte(rawContent), &fileMsg); err == nil {
-			return fmt.Sprintf("[file: %s]", fileMsg.FileName)
-		}
-		return "[file]"
-
-	default:
-		return fmt.Sprintf("[%s message]", messageType)
-	}
-}
-
-func parsePostContent(rawContent string) string {
-	var post map[string]interface{}
-	if err := json.Unmarshal([]byte(rawContent), &post); err != nil {
-		return rawContent
-	}
-
-	var langContent interface{}
-	for _, lang := range []string{"zh_cn", "en_us"} {
-		if lc, ok := post[lang]; ok {
-			langContent = lc
-			break
-		}
-	}
-	if langContent == nil {
-		for _, v := range post {
-			langContent = v
-			break
-		}
-	}
-	if langContent == nil {
-		return rawContent
-	}
-
-	langMap, ok := langContent.(map[string]interface{})
-	if !ok {
-		return rawContent
-	}
-
-	contentArr, ok := langMap["content"].([]interface{})
-	if !ok {
-		return rawContent
-	}
-
-	var textParts []string
-	for _, para := range contentArr {
-		paraArr, ok := para.([]interface{})
-		if !ok {
-			continue
-		}
-		var lineParts []string
-		for _, elem := range paraArr {
-			elemMap, ok := elem.(map[string]interface{})
-			if !ok {
-				continue
+	// Annotate content with sender identity so the agent knows who is messaging.
+	if mc.ChatType == "group" || senderName != "" {
+		if mc.ChatType == "group" {
+			annotated := content
+			if senderLabel != "" {
+				annotated = fmt.Sprintf("[From: %s]\n%s", senderLabel, content)
 			}
-			tag, _ := elemMap["tag"].(string)
-			switch tag {
-			case "text":
-				if t, ok := elemMap["text"].(string); ok {
-					lineParts = append(lineParts, t)
-				}
-			case "md":
-				if t, ok := elemMap["text"].(string); ok {
-					lineParts = append(lineParts, t)
-				}
-			case "at":
-				if name, ok := elemMap["user_name"].(string); ok {
-					lineParts = append(lineParts, "@"+name)
-				}
-			case "a":
-				if href, ok := elemMap["href"].(string); ok {
-					text, _ := elemMap["text"].(string)
-					if text != "" {
-						lineParts = append(lineParts, fmt.Sprintf("[%s](%s)", text, href))
+			if c.HistoryLimit() > 0 {
+				content = c.GroupHistory().BuildContext(chatID, annotated, c.HistoryLimit())
+			} else {
+				content = annotated
+			}
+		} else {
+			// DM: annotate with sender identity so the agent knows who is messaging.
+			content = fmt.Sprintf("[From: %s]\n%s", senderName, content)
+		}
+	}
+
+	// 10. Build media list from early-resolved media (step 4) + reply media.
+	// Media was already downloaded before the mention gate — reuse results.
+	var mediaList []media.MediaInfo
+	// Reply media first (context), current-message media second.
+	if len(replyMediaList) > 0 {
+		mediaList = append(mediaList, replyMediaList...)
+	}
+	mediaList = append(mediaList, earlyMedia...)
+
+	// 10b. Collect media from pending history (files downloaded by earlier non-mentioned messages).
+	var mediaFiles []bus.MediaFile
+	if mc.ChatType == "group" && c.HistoryLimit() > 0 {
+		if histMediaPaths := c.GroupHistory().CollectMedia(chatID); len(histMediaPaths) > 0 {
+			for _, p := range histMediaPaths {
+				// Original filename not retained in pending-history paths; fall back to basename.
+				mediaFiles = append(mediaFiles, bus.MediaFile{Path: p, Filename: filepath.Base(p)}) // cannot use append(slice, other...) — different types
+			}
+		}
+	}
+
+	// 11. Process media: STT transcription, document extraction, build tags
+	if len(mediaList) > 0 {
+		var extraContent string
+		for i := range mediaList {
+			m := &mediaList[i]
+
+			switch m.Type {
+			case media.TypeAudio, media.TypeVoice:
+				var transcript string
+				var sttErr error
+				if c.audioMgr != nil {
+					sttCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					res, err := c.audioMgr.Transcribe(sttCtx, audio.STTInput{FilePath: m.FilePath, MimeType: "audio/ogg"}, audio.STTOptions{})
+					cancel()
+					if err == nil && res != nil {
+						transcript = res.Text
 					} else {
-						lineParts = append(lineParts, href)
+						sttErr = err
 					}
 				}
-			case "img":
-				lineParts = append(lineParts, "[image]")
+				if sttErr != nil {
+					slog.Warn("feishu: STT transcription failed",
+						"type", m.Type, "error", sttErr,
+					)
+				} else {
+					m.Transcript = transcript
+				}
+
+			case media.TypeDocument:
+				if m.FileName != "" && m.FilePath != "" {
+					docContent, err := media.ExtractDocumentContent(m.FilePath, m.FileName)
+					if err != nil {
+						slog.Warn("feishu: document extraction failed", "file", m.FileName, "error", err)
+					} else if docContent != "" {
+						extraContent += "\n\n" + docContent
+					}
+				}
+			}
+
+			if m.FilePath != "" {
+				mediaFiles = append(mediaFiles, bus.MediaFile{
+					Path:     m.FilePath,
+					MimeType: m.ContentType,
+					Filename: m.FileName,
+				})
 			}
 		}
-		if len(lineParts) > 0 {
-			textParts = append(textParts, strings.Join(lineParts, ""))
-		}
-	}
 
-	return strings.Join(textParts, "\n")
-}
-
-func stripBotMention(text string, mentions []mentionInfo, botOpenID string) string {
-	for _, m := range mentions {
-		if m.OpenID == botOpenID && m.Key != "" {
-			text = strings.ReplaceAll(text, m.Key, "")
-		}
-	}
-	return strings.TrimSpace(text)
-}
-
-// --- Sender name resolution ---
-
-func (c *Channel) resolveSenderName(ctx context.Context, openID string) string {
-	if openID == "" {
-		return ""
-	}
-
-	// Check cache
-	if entry, ok := c.senderCache.Load(openID); ok {
-		e := entry.(*senderCacheEntry)
-		if time.Now().Before(e.expiresAt) {
-			return e.name
-		}
-		c.senderCache.Delete(openID)
-	}
-
-	// Fetch from API
-	name := c.fetchSenderName(ctx, openID)
-	if name != "" {
-		c.senderCache.Store(openID, &senderCacheEntry{
-			name:      name,
-			expiresAt: time.Now().Add(senderCacheTTL),
-		})
-	}
-	return name
-}
-
-func (c *Channel) fetchSenderName(ctx context.Context, openID string) string {
-	name, err := c.client.GetUser(ctx, openID, "open_id")
-	if err != nil {
-		slog.Debug("feishu fetch sender name failed", "open_id", openID, "error", err)
-		return ""
-	}
-	return name
-}
-
-// --- Policy checks ---
-
-func (c *Channel) checkGroupPolicy(senderID string) bool {
-	groupPolicy := c.cfg.GroupPolicy
-	if groupPolicy == "" {
-		groupPolicy = "open"
-	}
-
-	switch groupPolicy {
-	case "disabled":
-		return false
-	case "allowlist":
-		if c.IsAllowed(senderID) {
-			return true
-		}
-		for _, allowed := range c.groupAllowList {
-			if senderID == allowed || strings.TrimPrefix(allowed, "@") == senderID {
-				return true
+		// Build media tags AFTER processing so transcript fields are populated.
+		mediaTags := media.BuildMediaTags(mediaList)
+		if mediaTags != "" {
+			if content != "" {
+				content = mediaTags + "\n\n" + content
+			} else {
+				content = mediaTags
 			}
 		}
-		return false
-	default: // "open"
-		return true
+
+		if extraContent != "" {
+			content += extraContent
+		}
+	}
+
+	// 12. Voice agent routing
+	targetAgentID := c.AgentID()
+	if c.cfg.VoiceAgentID != "" {
+		for _, m := range mediaList {
+			if m.Type == media.TypeAudio || m.Type == media.TypeVoice {
+				targetAgentID = c.cfg.VoiceAgentID
+				slog.Debug("feishu: routing voice inbound to speaking agent",
+					"agent_id", targetAgentID, "media_type", m.Type,
+				)
+				break
+			}
+		}
+	}
+
+	// Derive userID from senderID (strip "|username" suffix if present).
+	userID := mc.SenderID
+
+	// 13. Publish to bus directly (to preserve MediaFile MIME types)
+	c.Bus().PublishInbound(bus.InboundMessage{
+		Channel:      c.Name(),
+		SenderID:     mc.SenderID,
+		ChatID:       chatID,
+		Content:      content,
+		Media:        mediaFiles,
+		PeerKind:     peerKind,
+		UserID:       userID,
+		AgentID:      targetAgentID,
+		HistoryLimit: c.HistoryLimit(),
+		TenantID:     c.TenantID(),
+		Metadata:     metadata,
+	})
+
+	// Clear pending history after sending to agent.
+	if mc.ChatType == "group" {
+		c.GroupHistory().Clear(chatID)
 	}
 }
 
-func (c *Channel) checkDMPolicy(senderID, chatID string) bool {
-	dmPolicy := c.cfg.DMPolicy
-	if dmPolicy == "" {
-		dmPolicy = "pairing"
-	}
+const replyContextMaxLen = 2000
 
-	switch dmPolicy {
-	case "disabled":
-		slog.Debug("feishu DM rejected: disabled", "sender_id", senderID)
-		return false
-	case "open":
-		return true
-	case "allowlist":
-		if !c.IsAllowed(senderID) {
-			slog.Debug("feishu DM rejected by allowlist", "sender_id", senderID)
-			return false
-		}
-		return true
-	default: // "pairing"
-		paired := false
-		if c.pairingService != nil {
-			paired = c.pairingService.IsPaired(senderID, c.Name())
-		}
-		inAllowList := c.HasAllowList() && c.IsAllowed(senderID)
-
-		if paired || inAllowList {
-			return true
-		}
-
-		c.sendPairingReply(senderID, chatID)
-		return false
-	}
-}
-
-func (c *Channel) sendPairingReply(senderID, chatID string) {
-	if c.pairingService == nil {
-		return
-	}
-
-	// Debounce
-	if lastSent, ok := c.pairingDebounce.Load(senderID); ok {
-		if time.Since(lastSent.(time.Time)) < pairingDebounceTime {
-			return
-		}
-	}
-
-	code, err := c.pairingService.RequestPairing(senderID, c.Name(), chatID, "default")
+// fetchReplyContext fetches the parent message content and returns a formatted
+// reply context string + any downloaded media from the parent message.
+func (c *Channel) fetchReplyContext(ctx context.Context, parentID string) (string, []media.MediaInfo) {
+	resp, err := c.client.GetMessage(ctx, parentID)
 	if err != nil {
-		slog.Debug("feishu pairing request failed", "sender_id", senderID, "error", err)
-		return
+		slog.Debug("feishu: failed to fetch parent message", "parent_id", parentID, "error", err)
+		return "", nil
+	}
+	if len(resp.Items) == 0 {
+		return "", nil
 	}
 
-	replyText := fmt.Sprintf(
-		"GoClaw: access not configured.\n\nYour Feishu open_id: %s\n\nPairing code: %s\n\nAsk the bot owner to approve with:\n  goclaw pairing approve %s",
-		senderID, code, code,
-	)
+	item := &resp.Items[0]
+	body := parseMessageContent(item.Body.Content, item.MsgType)
 
-	receiveIDType := resolveReceiveIDType(chatID)
-	if err := c.sendText(context.Background(), chatID, receiveIDType, replyText); err != nil {
-		slog.Warn("failed to send feishu pairing reply", "error", err)
-	} else {
-		c.pairingDebounce.Store(senderID, time.Now())
-		slog.Info("feishu pairing reply sent", "sender_id", senderID, "code", code)
+	// Resolve sender name
+	senderName := "unknown"
+	if item.Sender.ID != "" {
+		if name := c.resolveSenderName(ctx, item.Sender.ID); name != "" {
+			senderName = name
+		}
 	}
-}
 
-// --- Helpers ---
-
-func safeStr(s *string) string {
-	if s == nil {
-		return ""
+	// Build reply context text.
+	var replyCtx string
+	if body != "" {
+		body = channels.Truncate(body, replyContextMaxLen)
+		replyCtx = fmt.Sprintf("[Replying to %s]\n%s\n[/Replying]", senderName, body)
 	}
-	return *s
+
+	// Download media from parent message (image, file, audio, video, sticker, post).
+	var replyMedia []media.MediaInfo
+	switch item.MsgType {
+	case "image", "file", "audio", "video", "sticker":
+		replyMedia = c.resolveMediaFromMessage(ctx, parentID, item.MsgType, item.Body.Content)
+	case "post":
+		if imageKeys := extractPostImageKeys(item.Body.Content); len(imageKeys) > 0 {
+			replyMedia = c.resolvePostImages(ctx, parentID, imageKeys)
+		}
+	}
+	for i := range replyMedia {
+		replyMedia[i].FromReply = true
+	}
+	if len(replyMedia) > 0 {
+		slog.Debug("feishu: resolved media from replied message",
+			"parent_id", parentID, "media_count", len(replyMedia))
+	}
+
+	return replyCtx, replyMedia
 }

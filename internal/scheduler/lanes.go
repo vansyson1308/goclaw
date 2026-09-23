@@ -22,7 +22,7 @@ import (
 const (
 	LaneMain     = "main"
 	LaneSubagent = "subagent"
-	LaneDelegate = "delegate"
+	LaneTeam     = "team"
 	LaneCron     = "cron"
 )
 
@@ -152,13 +152,18 @@ func NewLaneManager(configs []LaneConfig) *LaneManager {
 //
 //	GOCLAW_LANE_MAIN=30
 //	GOCLAW_LANE_SUBAGENT=50
-//	GOCLAW_LANE_DELEGATE=100
+//	GOCLAW_LANE_TEAM=100
 //	GOCLAW_LANE_CRON=30
+//
+// LaneMain bounds concurrent agent runs across every channel, so on a bot
+// shared by a whole org it is the ceiling on how many people can be answered
+// at once. A run is overwhelmingly blocked on the LLM, not on CPU, so raising
+// it trades provider load for wait time, not local work.
 func DefaultLanes() []LaneConfig {
 	return []LaneConfig{
 		{Name: LaneMain, Concurrency: laneEnv("GOCLAW_LANE_MAIN", 30)},
 		{Name: LaneSubagent, Concurrency: laneEnv("GOCLAW_LANE_SUBAGENT", 50)},
-		{Name: LaneDelegate, Concurrency: laneEnv("GOCLAW_LANE_DELEGATE", 100)},
+		{Name: LaneTeam, Concurrency: laneEnvFallback("GOCLAW_LANE_TEAM", "GOCLAW_LANE_DELEGATE", 100)},
 		{Name: LaneCron, Concurrency: laneEnv("GOCLAW_LANE_CRON", 30)},
 	}
 }
@@ -171,6 +176,16 @@ func laneEnv(key string, defaultVal int) int {
 		}
 	}
 	return defaultVal
+}
+
+// laneEnvFallback reads an int from primary env var, then fallback env var, then defaultVal.
+func laneEnvFallback(primary, fallback string, defaultVal int) int {
+	if v := os.Getenv(primary); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return laneEnv(fallback, defaultVal)
 }
 
 // Get returns a lane by name. Returns the "main" lane as fallback.

@@ -5,6 +5,8 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
@@ -26,7 +28,7 @@ func (m *ChannelsMethods) Register(router *gateway.MethodRouter) {
 func (m *ChannelsMethods) handleList(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	enabled := m.manager.GetEnabledChannels()
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"channels": enabled,
 	}))
 }
@@ -34,12 +36,13 @@ func (m *ChannelsMethods) handleList(_ context.Context, client *gateway.Client, 
 func (m *ChannelsMethods) handleStatus(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	status := m.manager.GetStatus()
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"channels": status,
 	}))
 }
 
-func (m *ChannelsMethods) handleToggle(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *ChannelsMethods) handleToggle(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	// Channel toggling requires restarting the channel, which is a Phase 3 feature.
-	client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, "channels.toggle not yet implemented"))
+	client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotImplemented, "channels.toggle")))
 }

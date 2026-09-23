@@ -2,63 +2,175 @@ package whatsapp
 
 import (
 	"context"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"go.mau.fi/whatsmeow"
+	wastore "go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
+	"github.com/nextlevelbuilder/goclaw/internal/audio"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
-// Channel connects to a WhatsApp bridge via WebSocket.
-// The bridge (e.g. whatsapp-web.js based) handles the actual WhatsApp
-// protocol; this channel just sends/receives JSON messages over WS.
+const (
+	pairingDebounceTime = 60 * time.Second
+	maxMessageLen       = 4096 // WhatsApp practical message length limit
+)
+
+func init() {
+	// Set device name shown in WhatsApp's "Linked Devices" screen (once at package init).
+	wastore.DeviceProps.Os = new("GoClaw")
+}
+
+// Channel connects directly to WhatsApp via go.mau.fi/whatsmeow.
+// Auth state is stored in PostgreSQL (standard) or SQLite (desktop).
 type Channel struct {
 	*channels.BaseChannel
-	conn      *websocket.Conn
-	config    config.WhatsAppConfig
-	mu        sync.Mutex
-	connected bool
-	ctx       context.Context
-	cancel    context.CancelFunc
+	client           *whatsmeow.Client
+	container        *sqlstore.Container
+	config           config.WhatsAppConfig
+	mu               sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	parentCtx        context.Context        // stored from Start() for Reauth() context chain
+	audioMgr         *audio.Manager         // unified STT via audio.Manager (nil = no STT)
+	builtinToolStore store.BuiltinToolStore // reads stt settings (whatsapp_enabled) per voice message; nil = opt-out
+	deviceJID        types.JID              // scoped whatsmeow device for DB-backed channel instances
+
+	// QR state
+	lastQRMu        sync.RWMutex
+	lastQRB64       string    // base64-encoded PNG, empty when authenticated
+	waAuthenticated bool      // true once WhatsApp account is connected
+	myJID           types.JID // linked account's phone JID for mention detection
+	myLID           types.JID // linked account's LID — WhatsApp's newer identifier
+
+	// typingCancel tracks active typing-refresh loops per chatID.
+	typingCancel sync.Map // chatID string → context.CancelFunc
+
+	// reauthMu serializes Reauth() and StartQRFlow() to prevent race when user clicks reauth rapidly.
+	reauthMu                  sync.Mutex
+	legacyFirstDeviceFallback bool // config-file WhatsApp channel migration path only
+	// pairingService, pairingDebounce, approvedGroups, groupHistory are inherited from channels.BaseChannel.
 }
 
-// New creates a new WhatsApp channel from config.
-func New(cfg config.WhatsAppConfig, msgBus *bus.MessageBus) (*Channel, error) {
-	if cfg.BridgeURL == "" {
-		return nil, fmt.Errorf("whatsapp bridge_url is required")
+// Option configures optional WhatsApp channel runtime behavior.
+type Option func(*Channel)
+
+// WithDeviceJID scopes the whatsmeow device store to one channel instance.
+func WithDeviceJID(jid types.JID) Option {
+	return func(c *Channel) {
+		c.deviceJID = jid
+	}
+}
+
+// WithLegacyFirstDeviceFallback preserves config-file WhatsApp channels created
+// before DB channel instances stored their own device_jid credential.
+func WithLegacyFirstDeviceFallback() Option {
+	return func(c *Channel) {
+		c.legacyFirstDeviceFallback = true
+	}
+}
+
+// GetLastQRB64 returns the most recent QR PNG (base64).
+func (c *Channel) GetLastQRB64() string {
+	c.lastQRMu.RLock()
+	defer c.lastQRMu.RUnlock()
+	return c.lastQRB64
+}
+
+// IsAuthenticated reports whether the WhatsApp account is currently authenticated.
+func (c *Channel) IsAuthenticated() bool {
+	c.lastQRMu.RLock()
+	defer c.lastQRMu.RUnlock()
+	return c.waAuthenticated
+}
+
+// cacheQR stores the latest QR PNG (base64) for late-joining wizard clients.
+func (c *Channel) cacheQR(pngB64 string) {
+	c.lastQRMu.Lock()
+	c.lastQRB64 = pngB64
+	c.lastQRMu.Unlock()
+}
+
+// New creates a new WhatsApp channel backed by whatsmeow.
+// dialect must be "pgx" (PostgreSQL) or "sqlite3" (SQLite/desktop).
+// audioMgr is optional (nil = STT disabled).
+// builtinToolStore is optional (nil = STT permanently opt-out regardless of admin toggle).
+func New(cfg config.WhatsAppConfig, msgBus *bus.MessageBus,
+	pairingSvc store.PairingStore, db *sql.DB,
+	pendingStore store.PendingMessageStore, dialect string, audioMgr *audio.Manager,
+	builtinToolStore store.BuiltinToolStore, opts ...Option) (*Channel, error) {
+
+	base := channels.NewBaseChannel(channels.TypeWhatsApp, msgBus, cfg.AllowFrom)
+	base.ValidatePolicy(cfg.DMPolicy, cfg.GroupPolicy)
+
+	container := sqlstore.NewWithDB(db, dialect, nil)
+	if err := container.Upgrade(context.Background()); err != nil {
+		return nil, fmt.Errorf("whatsapp sqlstore upgrade: %w", err)
 	}
 
-	base := channels.NewBaseChannel("whatsapp", msgBus, cfg.AllowFrom)
-
-	return &Channel{
-		BaseChannel: base,
-		config:      cfg,
-	}, nil
+	ch := &Channel{
+		BaseChannel:      base,
+		config:           cfg,
+		container:        container,
+		audioMgr:         audioMgr,
+		builtinToolStore: builtinToolStore,
+	}
+	for _, opt := range opts {
+		opt(ch)
+	}
+	ch.SetPairingService(pairingSvc)
+	ch.SetGroupHistory(channels.MakeHistory("whatsapp", pendingStore, base.TenantID()))
+	return ch, nil
 }
 
-// Start connects to the WhatsApp bridge WebSocket and begins listening.
+// Start initializes the whatsmeow client and connects to WhatsApp.
 func (c *Channel) Start(ctx context.Context) error {
-	slog.Info("starting whatsapp channel", "bridge_url", c.config.BridgeURL)
+	slog.Info("starting whatsapp channel (whatsmeow)")
+	c.MarkStarting("Initializing WhatsApp connection")
 
+	c.parentCtx = ctx
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
-	if err := c.connect(); err != nil {
-		// Don't fail hard — reconnect loop will keep trying
-		slog.Warn("initial whatsapp bridge connection failed, will retry", "error", err)
+	c.mu.Lock()
+	if err := c.resetClientLocked(ctx); err != nil {
+		c.mu.Unlock()
+		return fmt.Errorf("whatsapp get device: %w", err)
 	}
+	client := c.client
+	c.mu.Unlock()
 
-	go c.listenLoop()
+	if client.Store.ID == nil {
+		// Not paired yet — QR flow will be triggered by qr_methods.go.
+		slog.Info("whatsapp: not paired yet, waiting for QR scan", "channel", c.Name())
+		c.MarkDegraded("Awaiting QR scan", "Scan QR code to authenticate",
+			channels.ChannelFailureKindAuth, false)
+	} else {
+		if err := client.Connect(); err != nil {
+			slog.Warn("whatsapp: initial connect failed", "error", err)
+			c.MarkDegraded("Connection failed", err.Error(),
+				channels.ChannelFailureKindNetwork, true)
+		}
+	}
 
 	c.SetRunning(true)
 	return nil
 }
+
+// BlockReplyEnabled returns the per-channel block_reply override (nil = inherit gateway default).
+func (c *Channel) BlockReplyEnabled() *bool { return c.config.BlockReply }
+
+// ChatBehaviorConfig returns the per-channel chat_behavior override.
+func (c *Channel) ChatBehaviorConfig() *config.ChatBehaviorConfig { return c.config.ChatBehavior }
 
 // Stop gracefully shuts down the WhatsApp channel.
 func (c *Channel) Stop(_ context.Context) error {
@@ -67,188 +179,74 @@ func (c *Channel) Stop(_ context.Context) error {
 	if c.cancel != nil {
 		c.cancel()
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil {
-		_ = c.conn.Close()
-		c.conn = nil
+	if c.client != nil {
+		c.client.Disconnect()
 	}
-	c.connected = false
+
+	// Cancel all active typing goroutines.
+	c.typingCancel.Range(func(key, value any) bool {
+		if fn, ok := value.(context.CancelFunc); ok {
+			fn()
+		}
+		c.typingCancel.Delete(key)
+		return true
+	})
+
 	c.SetRunning(false)
-
+	c.MarkStopped("Stopped")
 	return nil
 }
 
-// Send delivers an outbound message to the WhatsApp bridge.
-func (c *Channel) Send(_ context.Context, msg bus.OutboundMessage) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return fmt.Errorf("whatsapp bridge not connected")
-	}
-
-	payload := map[string]interface{}{
-		"type":    "message",
-		"to":      msg.ChatID,
-		"content": msg.Content,
-	}
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("marshal whatsapp message: %w", err)
-	}
-
-	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		return fmt.Errorf("send whatsapp message: %w", err)
-	}
-
-	return nil
-}
-
-// connect establishes the WebSocket connection to the bridge.
-func (c *Channel) connect() error {
-	dialer := websocket.DefaultDialer
-	dialer.HandshakeTimeout = 10 * time.Second
-
-	conn, _, err := dialer.Dial(c.config.BridgeURL, nil)
-	if err != nil {
-		return fmt.Errorf("dial whatsapp bridge %s: %w", c.config.BridgeURL, err)
-	}
-
-	c.mu.Lock()
-	c.conn = conn
-	c.connected = true
-	c.mu.Unlock()
-
-	slog.Info("whatsapp bridge connected", "url", c.config.BridgeURL)
-	return nil
-}
-
-// listenLoop reads messages from the bridge with automatic reconnection.
-func (c *Channel) listenLoop() {
-	backoff := time.Second
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		c.mu.Lock()
-		conn := c.conn
-		c.mu.Unlock()
-
-		if conn == nil {
-			// Not connected — attempt reconnect with backoff
-			slog.Info("attempting whatsapp bridge reconnect", "backoff", backoff)
-
-			select {
-			case <-c.ctx.Done():
-				return
-			case <-time.After(backoff):
-			}
-
-			if err := c.connect(); err != nil {
-				slog.Warn("whatsapp bridge reconnect failed", "error", err)
-				backoff = min(backoff*2, 30*time.Second)
-				continue
-			}
-
-			backoff = time.Second // reset on success
-			continue
-		}
-
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			slog.Warn("whatsapp read error, will reconnect", "error", err)
-
-			c.mu.Lock()
-			if c.conn != nil {
-				_ = c.conn.Close()
-				c.conn = nil
-			}
-			c.connected = false
-			c.mu.Unlock()
-
-			continue
-		}
-
-		var msg map[string]interface{}
-		if err := json.Unmarshal(message, &msg); err != nil {
-			slog.Warn("invalid whatsapp message JSON", "error", err)
-			continue
-		}
-
-		msgType, _ := msg["type"].(string)
-		if msgType == "message" {
-			c.handleIncomingMessage(msg)
-		}
+// handleEvent dispatches whatsmeow events.
+func (c *Channel) handleEvent(evt any) {
+	switch v := evt.(type) {
+	case *events.Message:
+		c.handleIncomingMessage(v)
+	case *events.Connected:
+		c.handleConnected()
+	case *events.Disconnected:
+		c.handleDisconnected()
+	case *events.LoggedOut:
+		c.handleLoggedOut(v)
+	case *events.PairSuccess:
+		slog.Info("whatsapp: pair success", "channel", c.Name())
 	}
 }
 
-// handleIncomingMessage processes a message received from the bridge.
-// Expected format: {"type":"message","from":"...","chat":"...","content":"...","id":"...","from_name":"...","media":[...]}
-func (c *Channel) handleIncomingMessage(msg map[string]interface{}) {
-	senderID, ok := msg["from"].(string)
-	if !ok || senderID == "" {
-		return
+// handleConnected processes the Connected event.
+func (c *Channel) handleConnected() {
+	c.lastQRMu.Lock()
+	c.waAuthenticated = true
+	c.lastQRB64 = ""
+	if c.client.Store.ID != nil {
+		c.myJID = *c.client.Store.ID
+		c.myLID = c.client.Store.GetLID()
+		slog.Info("whatsapp: connected", "jid", c.myJID.String(),
+			"lid", c.myLID.String(), "channel", c.Name())
 	}
+	c.lastQRMu.Unlock()
 
-	chatID, _ := msg["chat"].(string)
-	if chatID == "" {
-		chatID = senderID
-	}
+	c.MarkHealthy("WhatsApp authenticated and connected")
+}
 
-	// WhatsApp groups have chatID ending in "@g.us"
-	peerKind := "direct"
-	if strings.HasSuffix(chatID, "@g.us") {
-		peerKind = "group"
-	}
+// handleDisconnected processes the Disconnected event.
+func (c *Channel) handleDisconnected() {
+	c.lastQRMu.Lock()
+	c.waAuthenticated = false
+	c.lastQRMu.Unlock()
 
-	// DM/Group policy check
-	if !c.CheckPolicy(peerKind, c.config.DMPolicy, c.config.GroupPolicy, senderID) {
-		slog.Debug("whatsapp message rejected by policy", "sender_id", senderID, "peer_kind", peerKind)
-		return
-	}
+	c.MarkDegraded("WhatsApp disconnected", "Waiting for reconnect",
+		channels.ChannelFailureKindNetwork, true)
+	// whatsmeow auto-reconnects — no manual reconnect loop needed.
+}
 
-	// Allowlist check
-	if !c.IsAllowed(senderID) {
-		slog.Debug("whatsapp message rejected by allowlist", "sender_id", senderID)
-		return
-	}
+// handleLoggedOut processes the LoggedOut event.
+func (c *Channel) handleLoggedOut(evt *events.LoggedOut) {
+	slog.Warn("whatsapp: logged out", "reason", evt.Reason, "channel", c.Name())
+	c.lastQRMu.Lock()
+	c.waAuthenticated = false
+	c.lastQRMu.Unlock()
 
-	content, _ := msg["content"].(string)
-	if content == "" {
-		content = "[empty message]"
-	}
-
-	var media []string
-	if mediaData, ok := msg["media"].([]interface{}); ok {
-		media = make([]string, 0, len(mediaData))
-		for _, m := range mediaData {
-			if path, ok := m.(string); ok {
-				media = append(media, path)
-			}
-		}
-	}
-
-	metadata := make(map[string]string)
-	if messageID, ok := msg["id"].(string); ok {
-		metadata["message_id"] = messageID
-	}
-	if userName, ok := msg["from_name"].(string); ok {
-		metadata["user_name"] = userName
-	}
-
-	slog.Debug("whatsapp message received",
-		"sender_id", senderID,
-		"chat_id", chatID,
-		"preview", channels.Truncate(content, 50),
-	)
-
-	c.HandleMessage(senderID, chatID, content, media, metadata, peerKind)
+	c.MarkDegraded("WhatsApp logged out", "Re-scan QR to reconnect",
+		channels.ChannelFailureKindAuth, false)
 }

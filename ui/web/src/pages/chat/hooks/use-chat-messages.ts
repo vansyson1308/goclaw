@@ -3,180 +3,331 @@ import { useWs } from "@/hooks/use-ws";
 import { useWsEvent } from "@/hooks/use-ws-event";
 import { Methods, Events } from "@/api/protocol";
 import type { Message } from "@/types/session";
-import type { ChatMessage, AgentEventPayload, ToolStreamEntry } from "@/types/chat";
+import type { ChatMessage, AgentEventPayload, ToolStreamEntry, RunActivity, ActiveTeamTask, MediaItem } from "@/types/chat";
+import { toFileUrl, mediaKindFromMime } from "@/lib/file-helpers";
+import { transformHistoryMessages } from "@/adapters/chat-message.adapter";
+import { useChatTeamTasks } from "./use-chat-team-tasks";
+import { useChatMessagesStore } from "@/stores/use-chat-messages-store";
+import { appendFilteredThinkingChunk, createThinkTagStreamFilterState } from "@/lib/think-tag-stream";
+
+// Stable empty array — avoids creating a new reference on every render inside
+// Zustand selectors, which would trigger an infinite re-render loop (React #185).
+const EMPTY_MESSAGES: ChatMessage[] = [];
 
 /**
  * Manages chat message history and real-time streaming for a session.
  * Listens to "agent" events for chunks, tool calls, and run lifecycle.
- *
- * The runId is captured from the first "run.started" event (not from the
- * chat.send RPC response, which only arrives after the run completes).
  */
 export function useChatMessages(sessionKey: string, agentId: string) {
   const ws = useWs();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [streamText, setStreamText] = useState<string | null>(null);
-  const [toolStream, setToolStream] = useState<ToolStreamEntry[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const messages = useChatMessagesStore((s) => sessionKey ? (s.sessions[sessionKey]?.messages ?? EMPTY_MESSAGES) : EMPTY_MESSAGES);
+  const streamText = useChatMessagesStore((s) => sessionKey ? (s.sessions[sessionKey]?.streamText ?? null) : null);
+  const thinkingText = useChatMessagesStore((s) => sessionKey ? (s.sessions[sessionKey]?.thinkingText ?? null) : null);
+  const isRunning = useChatMessagesStore((s) => sessionKey ? (s.sessions[sessionKey]?.isRunning ?? false) : false);
 
-  // Use refs for values accessed inside the event handler to avoid stale closures.
+  const setSessionMessages = useChatMessagesStore((s) => s.setSessionMessages);
+  const updateSessionMessages = useChatMessagesStore((s) => s.updateSessionMessages);
+  const setSessionStream = useChatMessagesStore((s) => s.setSessionStream);
+  const setSessionThinking = useChatMessagesStore((s) => s.setSessionThinking);
+  const setSessionRunning = useChatMessagesStore((s) => s.setSessionRunning);
+
+  // Local state for non-persistent UI elements
+  const [toolStream, setToolStream] = useState<ToolStreamEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [activity, setActivity] = useState<RunActivity | null>(null);
+  const [blockReplies, setBlockReplies] = useState<ChatMessage[]>([]);
+
+  // Refs for values accessed inside event handler to avoid stale closures
   const runIdRef = useRef<string | null>(null);
   const expectingRunRef = useRef(false);
   const streamRef = useRef("");
+  const thinkingRef = useRef("");
+  const streamFilterRef = useRef(createThinkTagStreamFilterState());
+  const toolStreamRef = useRef<ToolStreamEntry[]>([]);
   const agentIdRef = useRef(agentId);
   agentIdRef.current = agentId;
+  const sessionKeyRef = useRef(sessionKey);
+  sessionKeyRef.current = sessionKey;
+  const activityRef = useRef<RunActivity | null>(null);
+  const blockRepliesRef = useRef<ChatMessage[]>([]);
+  const rafPendingRef = useRef(false);
+  const rafHandleRef = useRef(0);
 
-  // Synchronously clear state during render when session changes.
-  // This prevents a flash of old messages before the useEffect fires.
-  const [prevKey, setPrevKey] = useState(sessionKey);
-  if (sessionKey !== prevKey) {
-    setPrevKey(sessionKey);
-    setMessages([]);
-    setStreamText(null);
+  // Add a local message optimistically.
+  // `key` is optional: callers that know the target session key (e.g. new-chat
+  // send flow, where the URL hasn't navigated yet) should pass it explicitly.
+  const addLocalMessage = useCallback((msg: ChatMessage, key?: string) => {
+    const targetKey = key ?? sessionKey;
+    if (targetKey) {
+      updateSessionMessages(targetKey, (prev) => [...prev, msg]);
+    }
+  }, [sessionKey, updateSessionMessages]);
+
+  // Team task handling (extracted hook)
+  const { teamTasks, setTeamTasks } = useChatTeamTasks(addLocalMessage);
+
+  // When transitioning from empty to a new session key (new-chat send flow),
+  // skip the next loadHistory() call. The optimistic user message is already
+  // in state, and loadHistory() would race with chat.send — potentially
+  // returning empty history before the server persists the message.
+  const skipNextHistoryRef = useRef(false);
+
+  // Reset streaming/run state when session changes
+  const prevKeyRef = useRef(sessionKey);
+  useEffect(() => {
+    if (sessionKey === prevKeyRef.current) return;
+    const wasEmpty = !prevKeyRef.current;
+    prevKeyRef.current = sessionKey;
+    if (wasEmpty) {
+      // Only skip history when a send is in flight (expectingRunRef). Selecting
+      // an existing conversation from the sidebar must still load messages.
+      if (expectingRunRef.current) {
+        skipNextHistoryRef.current = true;
+      }
+      return;
+    }
+
+    setSessionStream(sessionKey, null);
+    setSessionThinking(sessionKey, null);
+    setSessionRunning(sessionKey, false);
     setToolStream([]);
-    setIsRunning(false);
-    setLoading(true);
+    setActivity(null);
+    setBlockReplies([]);
+    setTeamTasks([]);
     runIdRef.current = null;
     expectingRunRef.current = false;
     streamRef.current = "";
-  }
+    thinkingRef.current = "";
+    streamFilterRef.current = createThinkTagStreamFilterState();
+    toolStreamRef.current = [];
+    activityRef.current = null;
+    blockRepliesRef.current = [];
+    cancelAnimationFrame(rafHandleRef.current);
+    rafPendingRef.current = false;
+  }, [sessionKey, setTeamTasks, setSessionStream, setSessionThinking, setSessionRunning]);
 
-  // Load history (no loading spinner — the empty state placeholder is shown instead)
-  const loadHistory = useCallback(async () => {
-    if (!ws.isConnected || !sessionKey) {
-      setLoading(false);
-      return;
-    }
+  // Load history
+  const loadHistory = useCallback(async (mediaItems?: MediaItem[]) => {
+    if (!ws.isConnected || !sessionKey) { setLoading(false); return; }
     try {
-      const res = await ws.call<{ messages: Message[] }>(Methods.CHAT_HISTORY, {
-        agentId,
-        sessionKey,
-      });
-      const msgs: ChatMessage[] = (res.messages ?? []).map((m: Message, i: number) => ({
-        ...m,
-        timestamp: Date.now() - (res.messages!.length - i) * 1000,
-      }));
-      setMessages(msgs);
-    } catch {
-      // will retry
-    } finally {
-      setLoading(false);
-    }
-  }, [ws, agentId, sessionKey]);
+      const res = await ws.call<{ messages: Message[] }>(Methods.CHAT_HISTORY, { agentId, sessionKey });
+      setSessionMessages(sessionKey, transformHistoryMessages(res.messages ?? [], mediaItems));
+    } catch { /* will retry */ } finally { setLoading(false); }
+  }, [ws, agentId, sessionKey, setSessionMessages]);
 
-  // Load history when session changes
+  // Load history + restore running state when session changes
   useEffect(() => {
+    let cancelled = false;
     if (sessionKey) {
-      loadHistory();
+      // Skip loadHistory for new-chat flow (empty → key) to avoid racing
+      // with chat.send. The optimistic user message is already displayed.
+      if (skipNextHistoryRef.current) {
+        skipNextHistoryRef.current = false;
+      } else {
+        loadHistory();
+      }
+      ws.call<{ isRunning?: boolean; runId?: string; activity?: RunActivity }>(Methods.CHAT_SESSION_STATUS, { sessionKey })
+        .then((res) => {
+          if (cancelled) return;
+          if (res.isRunning) { setSessionRunning(sessionKey, true); if (res.runId) runIdRef.current = res.runId; }
+          if (res.activity) { setActivity(res.activity); activityRef.current = res.activity; }
+        }).catch((err) => console.error("[useChatMessages] session status failed:", err));
+      ws.call<{ tasks?: ActiveTeamTask[] }>(Methods.TEAMS_TASK_ACTIVE_BY_SESSION, { sessionKey })
+        .then((res) => { if (!cancelled && res.tasks?.length) setTeamTasks(res.tasks); })
+        .catch((err) => console.error("[useChatMessages] active tasks failed:", err));
     }
-  }, [sessionKey, loadHistory]);
+    return () => { cancelled = true; };
+  }, [sessionKey, loadHistory, ws, setTeamTasks, setSessionRunning]);
 
-  // Called before sending a message so the event handler knows to capture run.started
-  const expectRun = useCallback(() => {
-    expectingRunRef.current = true;
-  }, []);
+  // Called before sending so event handler captures run.started
+  const expectRun = useCallback(() => { expectingRunRef.current = true; }, []);
 
-  // Stable event handler using refs for mutable state
+  // Agent event handler
   const handleAgentEvent = useCallback(
     (payload: unknown) => {
       const event = payload as AgentEventPayload;
       if (!event) return;
+      if (event.channel && event.channel !== "ws" && !event.runKind) return;
+      if (event.sessionKey && event.sessionKey !== sessionKeyRef.current) return;
 
-      // Capture run.started when we are expecting a run for this agent
-      if (event.type === "run.started") {
-        if (expectingRunRef.current && event.agentId === agentIdRef.current) {
+      // Capture run.started
+      if (event.type === "run.started" && event.agentId === agentIdRef.current) {
+        if (expectingRunRef.current || event.runKind === "announce") {
           runIdRef.current = event.runId;
           expectingRunRef.current = false;
-          setIsRunning(true);
-          setStreamText(null);
+          setSessionRunning(sessionKeyRef.current, true);
+          setSessionStream(sessionKeyRef.current, null);
+          setSessionThinking(sessionKeyRef.current, null);
           setToolStream([]);
           streamRef.current = "";
+          thinkingRef.current = "";
+          streamFilterRef.current = createThinkTagStreamFilterState();
+          toolStreamRef.current = [];
         }
         return;
       }
 
-      // All other events must match the active runId
       if (!runIdRef.current || event.runId !== runIdRef.current) return;
 
       switch (event.type) {
+        case "thinking": {
+          thinkingRef.current += event.payload?.content ?? "";
+          if (!rafPendingRef.current) {
+            rafPendingRef.current = true;
+            rafHandleRef.current = requestAnimationFrame(() => {
+              rafPendingRef.current = false;
+              setSessionThinking(sessionKeyRef.current, thinkingRef.current);
+              setSessionStream(sessionKeyRef.current, streamRef.current);
+            });
+          }
+          break;
+        }
         case "chunk": {
-          const content = event.payload?.content ?? "";
-          streamRef.current += content;
-          setStreamText(streamRef.current);
+          streamFilterRef.current = appendFilteredThinkingChunk(streamFilterRef.current, event.payload?.content ?? "");
+          if (streamFilterRef.current.thinkingDelta) {
+            thinkingRef.current += streamFilterRef.current.thinkingDelta;
+          }
+          streamRef.current = streamFilterRef.current.text;
+          if (!rafPendingRef.current) {
+            rafPendingRef.current = true;
+            rafHandleRef.current = requestAnimationFrame(() => {
+              rafPendingRef.current = false;
+              setSessionStream(sessionKeyRef.current, streamRef.current);
+              setSessionThinking(sessionKeyRef.current, thinkingRef.current);
+            });
+          }
           break;
         }
         case "tool.call": {
           const entry: ToolStreamEntry = {
-            toolCallId: event.payload?.id ?? "",
-            runId: event.runId,
-            name: event.payload?.name ?? "tool",
-            phase: "calling",
-            startedAt: Date.now(),
-            updatedAt: Date.now(),
+            toolCallId: event.payload?.id ?? "", runId: event.runId,
+            name: event.payload?.name ?? "tool", arguments: event.payload?.arguments,
+            phase: "calling", startedAt: Date.now(), updatedAt: Date.now(),
           };
-          setToolStream((prev) => [...prev, entry]);
+          toolStreamRef.current = [...toolStreamRef.current, entry];
+          setToolStream(toolStreamRef.current);
           break;
         }
         case "tool.result": {
-          setToolStream((prev) =>
-            prev.map((t) =>
-              t.toolCallId === event.payload?.id
-                ? {
-                    ...t,
-                    phase: event.payload?.is_error ? "error" : "completed",
-                    updatedAt: Date.now(),
-                  }
-                : t,
-            ),
+          const isError = event.payload?.is_error;
+          const resultId = event.payload?.id;
+          const now = Date.now();
+          toolStreamRef.current = toolStreamRef.current.map((t) =>
+            t.toolCallId === resultId
+              ? { ...t, phase: isError ? ("error" as const) : ("completed" as const), errorContent: isError ? event.payload?.content : undefined, result: event.payload?.result, updatedAt: now }
+              : t,
           );
+          setToolStream(toolStreamRef.current);
+          break;
+        }
+        case "block.reply": {
+          const content = event.payload?.content ?? "";
+          if (content) {
+            const blockMsg: ChatMessage = { role: "assistant", content, timestamp: Date.now(), isBlockReply: true };
+            blockRepliesRef.current = [...blockRepliesRef.current, blockMsg];
+            setBlockReplies(blockRepliesRef.current);
+          }
+          break;
+        }
+        case "activity": {
+          const phase = event.payload?.phase as RunActivity["phase"];
+          if (phase) {
+            const newActivity: RunActivity = { phase, tool: event.payload?.tool as string | undefined, tools: event.payload?.tools as string[] | undefined, iteration: event.payload?.iteration as number | undefined };
+            activityRef.current = newActivity; setActivity(newActivity);
+          }
+          break;
+        }
+        case "run.retrying": {
+          activityRef.current = { phase: "retrying", retryAttempt: Number(event.payload?.attempt) || 0, retryMax: Number(event.payload?.maxAttempts) || 0 };
+          setActivity(activityRef.current);
           break;
         }
         case "run.completed": {
-          setIsRunning(false);
+          cancelAnimationFrame(rafHandleRef.current); rafPendingRef.current = false;
+          setSessionRunning(sessionKeyRef.current, false);
           runIdRef.current = null;
-          loadHistory();
-          setStreamText(null);
+          const hadTools = toolStreamRef.current.length > 0;
+          const streamed = streamRef.current;
+          const thinking = thinkingRef.current || undefined;
+          setSessionStream(sessionKeyRef.current, null);
+          setSessionThinking(sessionKeyRef.current, null);
           setToolStream([]);
           streamRef.current = "";
+          thinkingRef.current = "";
+          streamFilterRef.current = createThinkTagStreamFilterState();
+          toolStreamRef.current = [];
+          activityRef.current = null;
+          setActivity(null);
+          blockRepliesRef.current = [];
+          setBlockReplies([]);
+          const rawMedia = event.payload?.media;
+          const mediaItems: MediaItem[] | undefined = rawMedia?.length
+            ? rawMedia.map((m) => ({ path: toFileUrl(m.path), mimeType: m.content_type ?? "application/octet-stream", fileName: m.path.split("?")[0]?.split("/").pop() ?? "file", size: m.size, kind: mediaKindFromMime(m.content_type ?? "") }))
+            : undefined;
+          if (streamed && !hadTools) {
+            updateSessionMessages(sessionKeyRef.current, (prev) => [...prev, { role: "assistant", content: streamed, thinking, timestamp: Date.now(), mediaItems }]);
+          } else { loadHistory(mediaItems); }
           break;
         }
         case "run.failed": {
-          setIsRunning(false);
+          cancelAnimationFrame(rafHandleRef.current); rafPendingRef.current = false;
+          setSessionRunning(sessionKeyRef.current, false);
           runIdRef.current = null;
-          setStreamText(null);
+          setSessionStream(sessionKeyRef.current, null);
+          setSessionThinking(sessionKeyRef.current, null);
           setToolStream([]);
           streamRef.current = "";
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "assistant",
-              content: `Error: ${event.payload?.error ?? "Unknown error"}`,
-              timestamp: Date.now(),
-            },
-          ]);
+          thinkingRef.current = "";
+          streamFilterRef.current = createThinkTagStreamFilterState();
+          activityRef.current = null;
+          setActivity(null);
+          blockRepliesRef.current = [];
+          setBlockReplies([]);
+          updateSessionMessages(sessionKeyRef.current, (prev) => [...prev, { role: "assistant", content: `Error: ${event.payload?.error ?? "Unknown error"}`, timestamp: Date.now() }]);
+          break;
+        }
+        case "run.cancelled": {
+          cancelAnimationFrame(rafHandleRef.current); rafPendingRef.current = false;
+          setSessionRunning(sessionKeyRef.current, false);
+          runIdRef.current = null;
+          const streamed = streamRef.current;
+          setSessionStream(sessionKeyRef.current, null);
+          setSessionThinking(sessionKeyRef.current, null);
+          setToolStream([]);
+          streamRef.current = "";
+          thinkingRef.current = "";
+          streamFilterRef.current = createThinkTagStreamFilterState();
+          toolStreamRef.current = [];
+          activityRef.current = null;
+          setActivity(null);
+          blockRepliesRef.current = [];
+          setBlockReplies([]);
+          if (streamed) {
+            updateSessionMessages(sessionKeyRef.current, (prev) => [...prev, { role: "assistant", content: streamed, timestamp: Date.now() }]);
+          } else { loadHistory(); }
           break;
         }
       }
     },
-    [loadHistory],
+    [loadHistory, setSessionRunning, setSessionStream, setSessionThinking, updateSessionMessages],
   );
 
   useWsEvent(Events.AGENT, handleAgentEvent);
 
-  // Add a local message optimistically (shown immediately, replaced on next loadHistory)
-  const addLocalMessage = useCallback((msg: ChatMessage) => {
-    setMessages((prev) => [...prev, msg]);
+  // Leader processing: backend emits when announce queue drains
+  const handleLeaderProcessing = useCallback((payload: unknown) => {
+    const event = payload as { agentId?: string; tasks?: number };
+    if (event?.agentId === agentIdRef.current) {
+      activityRef.current = { phase: "leader_processing" };
+      setActivity(activityRef.current);
+    }
   }, []);
+  useWsEvent(Events.TEAM_LEADER_PROCESSING, handleLeaderProcessing);
+
+  const isBusy = isRunning || teamTasks.length > 0 || activity?.phase === "leader_processing";
 
   return {
-    messages,
-    streamText,
-    toolStream,
-    isRunning,
-    loading,
-    expectRun,
-    loadHistory,
-    addLocalMessage,
+    messages, streamText, thinkingText, toolStream, isRunning, isBusy,
+    loading, activity, blockReplies, teamTasks, expectRun, loadHistory, addLocalMessage,
   };
 }

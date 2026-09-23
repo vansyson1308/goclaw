@@ -2,15 +2,17 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // Matching TS src/agents/tools/web-search.ts constants.
@@ -19,8 +21,25 @@ const (
 	maxSearchCount       = 10
 	searchTimeoutSeconds = 30
 	braveSearchEndpoint  = "https://api.search.brave.com/res/v1/web/search"
+	exaSearchEndpoint    = "https://api.exa.ai/search"
+	tavilySearchEndpoint = "https://api.tavily.com/search"
 	webSearchUserAgent   = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+
+const (
+	searchProviderExa        = "exa"
+	searchProviderTavily     = "tavily"
+	searchProviderBrave      = "brave"
+	searchProviderParallel   = "parallel"
+	searchProviderDuckDuckGo = "duckduckgo"
+)
+
+var defaultSearchProviderOrder = []string{
+	searchProviderExa,
+	searchProviderTavily,
+	searchProviderBrave,
+	searchProviderDuckDuckGo,
+}
 
 // SearchProvider abstracts a web search backend.
 type SearchProvider interface {
@@ -41,173 +60,6 @@ type searchResult struct {
 	Title       string `json:"title"`
 	URL         string `json:"url"`
 	Description string `json:"description"`
-}
-
-// --- Brave Search Provider ---
-
-type braveSearchProvider struct {
-	apiKey string
-	client *http.Client
-}
-
-func newBraveSearchProvider(apiKey string) *braveSearchProvider {
-	return &braveSearchProvider{
-		apiKey: apiKey,
-		client: &http.Client{Timeout: time.Duration(searchTimeoutSeconds) * time.Second},
-	}
-}
-
-func (p *braveSearchProvider) Name() string { return "brave" }
-
-func (p *braveSearchProvider) Search(ctx context.Context, params searchParams) ([]searchResult, error) {
-	q := url.Values{}
-	q.Set("q", params.Query)
-	q.Set("count", fmt.Sprintf("%d", params.Count))
-
-	if params.Country != "" {
-		q.Set("country", params.Country)
-	}
-	if params.SearchLang != "" {
-		q.Set("search_lang", params.SearchLang)
-	}
-	if params.UILang != "" {
-		q.Set("ui_lang", params.UILang)
-	}
-	if f := normalizeFreshness(params.Freshness); f != "" {
-		q.Set("freshness", f)
-	}
-
-	reqURL := braveSearchEndpoint + "?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Subscription-Token", p.apiKey)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("brave API returned %d: %s", resp.StatusCode, truncateStr(string(body), 200))
-	}
-
-	var braveResp struct {
-		Web struct {
-			Results []struct {
-				Title       string `json:"title"`
-				URL         string `json:"url"`
-				Description string `json:"description"`
-			} `json:"results"`
-		} `json:"web"`
-	}
-
-	if err := json.Unmarshal(body, &braveResp); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
-	}
-
-	results := make([]searchResult, 0, len(braveResp.Web.Results))
-	for _, r := range braveResp.Web.Results {
-		results = append(results, searchResult{
-			Title:       r.Title,
-			URL:         r.URL,
-			Description: r.Description,
-		})
-	}
-	return results, nil
-}
-
-// --- DuckDuckGo Search Provider ---
-
-type duckDuckGoSearchProvider struct {
-	client *http.Client
-}
-
-func newDuckDuckGoSearchProvider() *duckDuckGoSearchProvider {
-	return &duckDuckGoSearchProvider{
-		client: &http.Client{Timeout: time.Duration(searchTimeoutSeconds) * time.Second},
-	}
-}
-
-func (p *duckDuckGoSearchProvider) Name() string { return "duckduckgo" }
-
-func (p *duckDuckGoSearchProvider) Search(ctx context.Context, params searchParams) ([]searchResult, error) {
-	searchURL := fmt.Sprintf("https://html.duckduckgo.com/html/?q=%s", url.QueryEscape(params.Query))
-
-	req, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("User-Agent", webSearchUserAgent)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	return extractDDGResults(string(body), params.Count)
-}
-
-var (
-	ddgLinkRe    = regexp.MustCompile(`<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>`)
-	ddgSnippetRe = regexp.MustCompile(`<a class="result__snippet[^"]*".*?>([\s\S]*?)</a>`)
-	htmlTagRe    = regexp.MustCompile(`<[^>]+>`)
-)
-
-func extractDDGResults(html string, count int) ([]searchResult, error) {
-	linkMatches := ddgLinkRe.FindAllStringSubmatch(html, count+5)
-	if len(linkMatches) == 0 {
-		return nil, nil
-	}
-
-	snippetMatches := ddgSnippetRe.FindAllStringSubmatch(html, count+5)
-
-	var results []searchResult
-	for i := 0; i < len(linkMatches) && i < count; i++ {
-		rawURL := linkMatches[i][1]
-		title := strings.TrimSpace(htmlTagRe.ReplaceAllString(linkMatches[i][2], ""))
-
-		// DDG wraps URLs with redirect — extract real URL from uddg= param
-		if strings.Contains(rawURL, "uddg=") {
-			if u, err := url.QueryUnescape(rawURL); err == nil {
-				if idx := strings.Index(u, "uddg="); idx != -1 {
-					extracted := u[idx+5:]
-					// uddg value may have trailing &params
-					if ampIdx := strings.Index(extracted, "&"); ampIdx != -1 {
-						extracted = extracted[:ampIdx]
-					}
-					rawURL = extracted
-				}
-			}
-		}
-
-		desc := ""
-		if i < len(snippetMatches) {
-			desc = strings.TrimSpace(htmlTagRe.ReplaceAllString(snippetMatches[i][1], ""))
-		}
-
-		results = append(results, searchResult{
-			Title:       title,
-			URL:         rawURL,
-			Description: desc,
-		})
-	}
-
-	return results, nil
 }
 
 // --- Freshness validation (matching TS) ---
@@ -237,46 +89,43 @@ func normalizeFreshness(value string) string {
 
 // --- WebSearchTool ---
 
-// WebSearchTool implements the web_search tool matching TS src/agents/tools/web-search.ts.
+// WebSearchTool implements the web_search tool with per-tenant provider chain
+// resolution. Providers are resolved per-request from config_secrets and
+// builtin_tool_tenant_configs.settings, cached per tenant for 60 seconds.
 type WebSearchTool struct {
-	providers []SearchProvider
-	cache     *webCache
+	secrets    store.ConfigSecretsStore
+	cache      *webCache
+	chainCache *tenantChainCache
 }
 
-// WebSearchConfig holds configuration for the web search tool.
-type WebSearchConfig struct {
-	BraveAPIKey    string
-	BraveEnabled   bool
-	BraveMaxResults int
-	DDGEnabled     bool
-	DDGMaxResults  int
-	CacheTTL       time.Duration
-}
-
-func NewWebSearchTool(cfg WebSearchConfig) *WebSearchTool {
-	var providers []SearchProvider
-
-	// Priority: Brave > DuckDuckGo (matching TS)
-	if cfg.BraveEnabled && cfg.BraveAPIKey != "" {
-		providers = append(providers, newBraveSearchProvider(cfg.BraveAPIKey))
-	}
-	if cfg.DDGEnabled {
-		providers = append(providers, newDuckDuckGoSearchProvider())
+// NewWebSearchTool constructs a WebSearchTool. msgBus may be nil (e.g. desktop
+// edition) — cache invalidation then relies on TTL alone.
+func NewWebSearchTool(secrets store.ConfigSecretsStore, msgBus *bus.MessageBus) *WebSearchTool {
+	t := &WebSearchTool{
+		secrets:    secrets,
+		cache:      newWebCache(defaultCacheMaxEntries, defaultCacheTTL),
+		chainCache: newTenantChainCache(),
 	}
 
-	if len(providers) == 0 {
-		return nil
+	if msgBus != nil {
+		msgBus.Subscribe("web_search:cache_invalidate", func(event bus.Event) {
+			if event.Name != protocol.EventCacheInvalidate {
+				return
+			}
+			payload, ok := event.Payload.(bus.CacheInvalidatePayload)
+			if !ok || payload.Kind != bus.CacheKindBuiltinTools || payload.Key != "web_search" {
+				return
+			}
+			if payload.TenantID == uuid.Nil {
+				// Master admin write — wipe all tenants.
+				t.chainCache.InvalidateAll()
+			} else {
+				t.chainCache.Invalidate(payload.TenantID)
+			}
+		})
 	}
 
-	ttl := cfg.CacheTTL
-	if ttl <= 0 {
-		ttl = defaultCacheTTL
-	}
-
-	return &WebSearchTool{
-		providers: providers,
-		cache:     newWebCache(defaultCacheMaxEntries, ttl),
-	}
+	return t
 }
 
 func (t *WebSearchTool) Name() string { return "web_search" }
@@ -285,42 +134,46 @@ func (t *WebSearchTool) Description() string {
 	return "Search the web for current information. Returns titles, URLs, and snippets from search results."
 }
 
-func (t *WebSearchTool) Parameters() map[string]interface{} {
-	return map[string]interface{}{
+func (t *WebSearchTool) Parameters() map[string]any {
+	return map[string]any{
 		"type": "object",
-		"properties": map[string]interface{}{
-			"query": map[string]interface{}{
+		"properties": map[string]any{
+			"query": map[string]any{
 				"type":        "string",
 				"description": "Search query string.",
 			},
-			"count": map[string]interface{}{
+			"count": map[string]any{
 				"type":        "number",
 				"description": "Number of results to return (1-10).",
 				"minimum":     1.0,
 				"maximum":     float64(maxSearchCount),
 			},
-			"country": map[string]interface{}{
+			"country": map[string]any{
 				"type":        "string",
 				"description": "2-letter country code for region-specific results (e.g., 'DE', 'US', 'ALL'). Default: 'US'.",
 			},
-			"search_lang": map[string]interface{}{
+			"search_lang": map[string]any{
 				"type":        "string",
 				"description": "ISO language code for search results (e.g., 'de', 'en', 'fr').",
 			},
-			"ui_lang": map[string]interface{}{
+			"ui_lang": map[string]any{
 				"type":        "string",
 				"description": "ISO language code for UI elements.",
 			},
-			"freshness": map[string]interface{}{
+			"freshness": map[string]any{
 				"type":        "string",
 				"description": "Filter results by discovery time. Supports 'pd' (past day), 'pw' (past week), 'pm' (past month), 'py' (past year), and date range 'YYYY-MM-DDtoYYYY-MM-DD'.",
+			},
+			"provider": map[string]any{
+				"type":        "string",
+				"description": "Optional: force a specific provider (e.g., 'tavily', 'exa', 'brave', 'parallel', 'duckduckgo'). When omitted, the tenant's configured provider chain is used (first-success-wins). Use this to force cross-engine corroboration — call once with each provider and compare results.",
 			},
 		},
 		"required": []string{"query"},
 	}
 }
 
-func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}) *Result {
+func (t *WebSearchTool) Execute(ctx context.Context, args map[string]any) *Result {
 	query, _ := args["query"].(string)
 	if query == "" {
 		return ErrorResult("query is required")
@@ -335,6 +188,7 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}
 	searchLang, _ := args["search_lang"].(string)
 	uiLang, _ := args["ui_lang"].(string)
 	freshness, _ := args["freshness"].(string)
+	requestedProvider, _ := args["provider"].(string)
 
 	params := searchParams{
 		Query:      query,
@@ -345,16 +199,42 @@ func (t *WebSearchTool) Execute(ctx context.Context, args map[string]interface{}
 		Freshness:  freshness,
 	}
 
-	// Check cache
-	cacheKey := buildSearchCacheKey(params)
+	// Check cache (scoped per channel + provider to prevent cross-engine cache mixing)
+	channel := ToolChannelFromCtx(ctx)
+	cacheKey := fmt.Sprintf("%s:%s:%s", channel, requestedProvider, buildSearchCacheKey(params))
 	if cached, ok := t.cache.get(cacheKey); ok {
-		slog.Debug("web_search cache hit", "query", query)
+		slog.Debug("web_search cache hit", "query", query, "provider", requestedProvider)
 		return NewResult(cached)
 	}
 
-	// Try providers in order (first success wins)
+	// Resolve per-request provider chain from tenant config_secrets + settings overlay.
+	chain := t.resolveChain(ctx)
+
+	// If caller explicitly named a provider, narrow the chain to just that one.
+	// This unlocks cross-engine corroboration (caller invokes once per engine
+	// and compares results) — without a provider param, the first-success-wins
+	// chain hides everything after the first hit.
+	if requestedProvider != "" {
+		filtered := make([]SearchProvider, 0, 1)
+		for _, p := range chain {
+			if strings.EqualFold(p.Name(), requestedProvider) {
+				filtered = append(filtered, p)
+				break
+			}
+		}
+		if len(filtered) == 0 {
+			available := make([]string, 0, len(chain))
+			for _, p := range chain {
+				available = append(available, p.Name())
+			}
+			return ErrorResult(fmt.Sprintf("provider %q not configured for this tenant; available: %v", requestedProvider, available))
+		}
+		chain = filtered
+	}
+
+	// Try providers in order (first success wins, unless narrowed above)
 	var lastErr error
-	for _, provider := range t.providers {
+	for _, provider := range chain {
 		results, err := provider.Search(ctx, params)
 		if err != nil {
 			slog.Warn("web_search provider failed", "provider", provider.Name(), "error", err)
@@ -409,11 +289,4 @@ func formatSearchResults(query string, results []searchResult, provider string) 
 		sb.WriteByte('\n')
 	}
 	return sb.String()
-}
-
-func truncateStr(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
 }

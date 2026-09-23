@@ -3,9 +3,14 @@ package methods
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"regexp"
 
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
+	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
@@ -14,11 +19,13 @@ var cronSlugRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // CronMethods handles cron.list, cron.create, cron.update, cron.delete, cron.toggle.
 type CronMethods struct {
-	service store.CronStore
+	service  store.CronStore
+	eventBus bus.EventPublisher
+	cfg      *config.Config
 }
 
-func NewCronMethods(service store.CronStore) *CronMethods {
-	return &CronMethods{service: service}
+func NewCronMethods(service store.CronStore, eventBus bus.EventPublisher, cfg *config.Config) *CronMethods {
+	return &CronMethods{service: service, eventBus: eventBus, cfg: cfg}
 }
 
 func (m *CronMethods) Register(router *gateway.MethodRouter) {
@@ -32,7 +39,7 @@ func (m *CronMethods) Register(router *gateway.MethodRouter) {
 	router.Register(protocol.MethodCronRuns, m.handleRuns)
 }
 
-func (m *CronMethods) handleList(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleList(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	var params struct {
 		IncludeDisabled bool `json:"includeDisabled"`
 	}
@@ -40,53 +47,107 @@ func (m *CronMethods) handleList(_ context.Context, client *gateway.Client, req 
 		json.Unmarshal(req.Params, &params)
 	}
 
-	jobs := m.service.ListJobs(params.IncludeDisabled, "", "")
+	userID := ""
+	if !canSeeAll(client.Role(), m.cfg.Gateway.OwnerIDs, client.UserID()) {
+		userID = client.UserID()
+	}
+	jobs := m.service.ListJobs(ctx, params.IncludeDisabled, "", userID)
+	jobs = store.RedactCronJobsCredentialContext(jobs)
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"jobs":   jobs,
 		"status": m.service.Status(),
 	}))
 }
 
-func (m *CronMethods) handleCreate(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleCreate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		Name     string        `json:"name"`
-		Schedule store.CronSchedule `json:"schedule"`
-		Message  string        `json:"message"`
-		Deliver  bool          `json:"deliver"`
-		Channel  string        `json:"channel"`
-		To       string        `json:"to"`
-		AgentID  string        `json:"agentId"`
+		Name           string                 `json:"name"`
+		Schedule       store.CronSchedule     `json:"schedule"`
+		Message        string                 `json:"message"`
+		Command        *store.CronCommandSpec `json:"command"` // set → deterministic command payload (no LLM)
+		Deliver        bool                   `json:"deliver"`
+		DeliverChannel string                 `json:"deliverChannel"`
+		DeliverTo      string                 `json:"deliverTo"`
+		WakeHeartbeat  bool                   `json:"wakeHeartbeat"`
+		Stateless      *bool                  `json:"stateless"` // default true for new crons
+		AgentID        string                 `json:"agentId"`
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
 	}
 
 	if params.Name == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "name is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "name")))
 		return
 	}
 	if !cronSlugRe.MatchString(params.Name) {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "name must be a valid slug (lowercase letters, numbers, hyphens only)"))
-		return
-	}
-	if params.Message == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "message is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidSlug, "name")))
 		return
 	}
 
-	job, err := m.service.AddJob(params.Name, params.Schedule, params.Message, params.Deliver, params.Channel, params.To, params.AgentID, "")
+	isCommand := params.Command != nil
+	if isCommand {
+		if !m.cfg.Cron.CommandEnabled {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgCommandCronDisabled)))
+			return
+		}
+		if err := store.ValidateCronCommandSpec(params.Command); err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+			return
+		}
+	} else if params.Message == "" {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgMsgRequired)))
+		return
+	}
+
+	job, err := m.service.AddJob(ctx, params.Name, params.Schedule, params.Message, params.Deliver, params.DeliverChannel, params.DeliverTo, params.AgentID, client.UserID())
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
 		return
 	}
+	// Anti-panic guard: a store may return (nil, nil) if the insert succeeded but
+	// the tenant-scoped readback failed (e.g. tenant asymmetry). Never dereference
+	// a nil job below.
+	if job == nil {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgInternalError, "cron job created but could not be loaded")))
+		return
+	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
-		"job": job,
+	// Apply extra fields not in AddJob signature via an immediate patch.
+	// Default stateless=true for new crons (saves tokens); override with explicit false.
+	statelessVal := true
+	if params.Stateless != nil {
+		statelessVal = *params.Stateless
+	}
+	{
+		patch := store.CronJobPatch{Stateless: &statelessVal}
+		if params.WakeHeartbeat {
+			patch.WakeHeartbeat = &params.WakeHeartbeat
+		}
+		if isCommand {
+			patch.Command = params.Command
+		}
+		// Patch under a tenant-consistent context: the job was inserted under
+		// job.TenantID (which falls back to MasterTenantID for nil-tenant /
+		// master-scope connections). Using the raw ctx here would make
+		// lockCronJobForMutation miss the row for nil-tenant callers, silently
+		// dropping the stateless/command patch.
+		updateCtx := store.WithTenantID(ctx, job.TenantID)
+		if updated, pErr := m.service.UpdateJob(updateCtx, job.ID, patch); pErr == nil {
+			job = updated
+		}
+	}
+
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
+		"job": store.RedactCronJobCredentialContext(*job),
 	}))
+	emitAudit(m.eventBus, client, "cron.created", "cron", job.ID)
 }
 
-func (m *CronMethods) handleDelete(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleDelete(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		JobID string `json:"jobId"`
 	}
@@ -95,21 +156,34 @@ func (m *CronMethods) handleDelete(_ context.Context, client *gateway.Client, re
 	}
 
 	if params.JobID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "jobId is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "jobId")))
 		return
 	}
 
-	if err := m.service.RemoveJob(params.JobID); err != nil {
+	job, ok := m.service.GetJob(ctx, params.JobID)
+	if !ok {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgJobNotFound)))
+		return
+	}
+	if !canSeeAll(client.Role(), m.cfg.Gateway.OwnerIDs, client.UserID()) {
+		if job.UserID != client.UserID() {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job")))
+			return
+		}
+	}
+	if err := m.service.RemoveJob(ctx, params.JobID); err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
 		return
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"deleted": true,
 	}))
+	emitAudit(m.eventBus, client, "cron.deleted", "cron", params.JobID)
 }
 
-func (m *CronMethods) handleToggle(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleToggle(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		JobID   string `json:"jobId"`
 		Enabled bool   `json:"enabled"`
@@ -119,29 +193,53 @@ func (m *CronMethods) handleToggle(_ context.Context, client *gateway.Client, re
 	}
 
 	if params.JobID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "jobId is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "jobId")))
 		return
 	}
 
-	if err := m.service.EnableJob(params.JobID, params.Enabled); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
+	job, ok := m.service.GetJob(ctx, params.JobID)
+	if !ok {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgJobNotFound)))
+		return
+	}
+	if !canSeeAll(client.Role(), m.cfg.Gateway.OwnerIDs, client.UserID()) {
+		if job.UserID != client.UserID() {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job")))
+			return
+		}
+	}
+	if params.Enabled {
+		if err := store.CheckCronCredentialOwner(ctx, job); err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job credential context")))
+			return
+		}
+	}
+
+	if err := m.service.EnableJob(ctx, params.JobID, params.Enabled); err != nil {
+		code := protocol.ErrInvalidRequest
+		if errors.Is(err, store.ErrCronJobNotFound) {
+			code = protocol.ErrNotFound
+		}
+		client.SendResponse(protocol.NewErrorResponse(req.ID, code, err.Error()))
 		return
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"jobId":   params.JobID,
 		"enabled": params.Enabled,
 	}))
+	emitAudit(m.eventBus, client, "cron.toggled", "cron", params.JobID)
 }
 
 func (m *CronMethods) handleStatus(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	client.SendResponse(protocol.NewOKResponse(req.ID, m.service.Status()))
 }
 
-func (m *CronMethods) handleUpdate(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleUpdate(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		JobID string        `json:"jobId"`
-		ID    string        `json:"id"` // alias (matching TS)
+		JobID string             `json:"jobId"`
+		ID    string             `json:"id"` // alias (matching TS)
 		Patch store.CronJobPatch `json:"patch"`
 	}
 	if req.Params != nil {
@@ -153,22 +251,59 @@ func (m *CronMethods) handleUpdate(_ context.Context, client *gateway.Client, re
 		jobID = params.ID
 	}
 	if jobID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "jobId is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "jobId")))
 		return
 	}
 
-	job, err := m.service.UpdateJob(jobID, params.Patch)
+	existing, ok := m.service.GetJob(ctx, jobID)
+	if !ok {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgJobNotFound)))
+		return
+	}
+	if !canSeeAll(client.Role(), m.cfg.Gateway.OwnerIDs, client.UserID()) {
+		if existing.UserID != client.UserID() {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job")))
+			return
+		}
+	}
+	if err := store.CheckCronCredentialOwner(ctx, existing); err != nil {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job credential context")))
+		return
+	}
+
+	// A command payload on update must clear the same gate as create: command
+	// cron must be enabled and the spec must be valid. Without this, a normal job
+	// could be mutated into a command job (or persisted with an invalid spec) on a
+	// gateway where command cron is disabled.
+	if params.Patch.Command != nil {
+		if !m.cfg.Cron.CommandEnabled {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgCommandCronDisabled)))
+			return
+		}
+		if err := store.ValidateCronCommandSpec(params.Patch.Command); err != nil {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+			return
+		}
+	}
+
+	job, err := m.service.UpdateJob(ctx, jobID, params.Patch)
 	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, err.Error()))
+		code := protocol.ErrInvalidRequest
+		if errors.Is(err, store.ErrCronJobNotFound) {
+			code = protocol.ErrNotFound
+		}
+		client.SendResponse(protocol.NewErrorResponse(req.ID, code, err.Error()))
 		return
 	}
 
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
-		"job": job,
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
+		"job": store.RedactCronJobCredentialContext(*job),
 	}))
+	emitAudit(m.eventBus, client, "cron.updated", "cron", jobID)
 }
 
-func (m *CronMethods) handleRun(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleRun(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+	locale := store.LocaleFromContext(ctx)
 	var params struct {
 		JobID string `json:"jobId"`
 		ID    string `json:"id"`
@@ -183,32 +318,53 @@ func (m *CronMethods) handleRun(_ context.Context, client *gateway.Client, req *
 		jobID = params.ID
 	}
 	if jobID == "" {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "jobId is required"))
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "jobId")))
 		return
 	}
 
 	force := params.Mode == "force"
-	ran, reason, err := m.service.RunJob(jobID, force)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, err.Error()))
+
+	// Validate job exists before responding
+	job, ok := m.service.GetJob(ctx, jobID)
+	if !ok {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgJobNotFound)))
 		return
 	}
 
-	resp := map[string]interface{}{
+	if !canSeeAll(client.Role(), m.cfg.Gateway.OwnerIDs, client.UserID()) {
+		if job.UserID != client.UserID() {
+			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job")))
+			return
+		}
+	}
+	if err := store.CheckCronCredentialOwner(ctx, job); err != nil {
+		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "cron job credential context")))
+		return
+	}
+
+	// Respond immediately — job execution happens in background
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"ok":  true,
-		"ran": ran,
-	}
-	if !ran && reason != "" {
-		resp["reason"] = reason
-	}
-	client.SendResponse(protocol.NewOKResponse(req.ID, resp))
+		"ran": true,
+	}))
+	emitAudit(m.eventBus, client, "cron.run", "cron", jobID)
+
+	// Preserve tenant scope for async execution.
+	tenantID := store.TenantIDFromContext(ctx)
+	go func() {
+		bgCtx := store.WithTenantID(context.Background(), tenantID)
+		if _, _, err := m.service.RunJob(bgCtx, jobID, force); err != nil {
+			slog.Warn("cron.run background error", "jobId", jobID, "error", err)
+		}
+	}()
 }
 
-func (m *CronMethods) handleRuns(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+func (m *CronMethods) handleRuns(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	var params struct {
-		JobID string `json:"jobId"`
-		ID    string `json:"id"`
-		Limit int    `json:"limit"`
+		JobID  string `json:"jobId"`
+		ID     string `json:"id"`
+		Limit  int    `json:"limit"`
+		Offset int    `json:"offset"`
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
@@ -219,8 +375,9 @@ func (m *CronMethods) handleRuns(_ context.Context, client *gateway.Client, req 
 		jobID = params.ID
 	}
 
-	entries := m.service.GetRunLog(jobID, params.Limit)
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]interface{}{
+	entries, total := m.service.GetRunLog(ctx, jobID, params.Limit, params.Offset)
+	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"entries": entries,
+		"total":   total,
 	}))
 }

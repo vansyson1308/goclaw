@@ -21,6 +21,24 @@ type RetryConfig struct {
 	Jitter   float64       // jitter factor ±N (default 0.1 = ±10%)
 }
 
+// RetryHookFunc is called before each retry attempt.
+// attempt is the failed attempt number (1-based), maxAttempts is the total.
+type RetryHookFunc func(attempt, maxAttempts int, err error)
+
+type retryHookKey struct{}
+
+// WithRetryHook injects a retry notification callback into the context.
+// RetryDo will call this hook before each retry attempt.
+func WithRetryHook(ctx context.Context, fn RetryHookFunc) context.Context {
+	return context.WithValue(ctx, retryHookKey{}, fn)
+}
+
+// retryHookFromContext returns the retry hook from context, or nil.
+func retryHookFromContext(ctx context.Context) RetryHookFunc {
+	fn, _ := ctx.Value(retryHookKey{}).(RetryHookFunc)
+	return fn
+}
+
 // DefaultRetryConfig returns sensible defaults matching TS provider retry behavior.
 func DefaultRetryConfig() RetryConfig {
 	return RetryConfig{
@@ -65,12 +83,20 @@ func IsRetryableError(err error) bool {
 		return true // includes timeouts
 	}
 
-	// Check for connection reset / broken pipe / EOF in error string
+	// Check for connection reset / broken pipe / EOF in error string.
+	// Some streaming providers (notably Codex/Responses) surface transient
+	// backend failures as SSE `response.failed` events instead of HTTP 429/5xx.
+	// Treat explicit retry guidance/rate-limit wording as retryable too.
 	errStr := err.Error()
+	lowerErr := strings.ToLower(errStr)
 	if strings.Contains(errStr, "connection reset") ||
 		strings.Contains(errStr, "broken pipe") ||
 		strings.Contains(errStr, "EOF") ||
-		strings.Contains(errStr, "timeout") {
+		strings.Contains(lowerErr, "timeout") ||
+		strings.Contains(lowerErr, "rate limit") ||
+		strings.Contains(lowerErr, "429") ||
+		(strings.Contains(lowerErr, "response failed") && strings.Contains(lowerErr, "retry")) ||
+		strings.Contains(lowerErr, "while processing your request") {
 		return true
 	}
 
@@ -108,6 +134,11 @@ func RetryDo[T any](ctx context.Context, cfg RetryConfig, fn func() (T, error)) 
 			"delay", delay,
 			"error", err.Error(),
 		)
+
+		// Notify retry hook (for placeholder updates, etc.)
+		if hook := retryHookFromContext(ctx); hook != nil {
+			hook(attempt, cfg.Attempts, err)
+		}
 
 		// Wait with context cancellation support
 		select {

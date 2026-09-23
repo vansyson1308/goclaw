@@ -3,7 +3,9 @@ package scheduler
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 )
@@ -22,6 +24,7 @@ type Scheduler struct {
 	config          QueueConfig
 	runFn           RunFunc
 	mu              sync.RWMutex
+	draining        atomic.Bool       // set during graceful shutdown to reject new requests
 	tokenEstimateFn TokenEstimateFunc // optional: for adaptive throttle
 }
 
@@ -45,15 +48,35 @@ func (s *Scheduler) SetTokenEstimateFunc(fn TokenEstimateFunc) {
 	s.tokenEstimateFn = fn
 }
 
+// MarkDraining signals that the gateway is shutting down.
+// New Schedule/ScheduleWithOpts calls will return ErrGatewayDraining immediately.
+// Active runs continue to completion.
+func (s *Scheduler) MarkDraining() {
+	s.draining.Store(true)
+	slog.Info("scheduler: marked as draining, new requests will be rejected")
+}
+
 // Schedule submits a run request to the appropriate session queue and lane.
 // Returns a channel that receives the result when the run completes.
 func (s *Scheduler) Schedule(ctx context.Context, lane string, req agent.RunRequest) <-chan RunOutcome {
+	if s.draining.Load() {
+		ch := make(chan RunOutcome, 1)
+		ch <- RunOutcome{Err: ErrGatewayDraining}
+		close(ch)
+		return ch
+	}
 	sq := s.getOrCreateSession(req.SessionKey, lane)
 	return sq.Enqueue(ctx, req)
 }
 
 // ScheduleWithOpts submits a run request with per-session overrides.
 func (s *Scheduler) ScheduleWithOpts(ctx context.Context, lane string, req agent.RunRequest, opts ScheduleOpts) <-chan RunOutcome {
+	if s.draining.Load() {
+		ch := make(chan RunOutcome, 1)
+		ch <- RunOutcome{Err: ErrGatewayDraining}
+		close(ch)
+		return ch
+	}
 	sq := s.getOrCreateSession(req.SessionKey, lane)
 	if opts.MaxConcurrent > 0 {
 		sq.SetMaxConcurrent(opts.MaxConcurrent)
@@ -115,8 +138,24 @@ func (s *Scheduler) CancelOneSession(sessionKey string) bool {
 }
 
 // Stop shuts down all lanes and clears session queues.
+// Automatically marks the scheduler as draining before stopping.
 func (s *Scheduler) Stop() {
+	s.MarkDraining()
 	s.lanes.StopAll()
+}
+
+// HasActiveSessionsForAgent checks if any session queue for the given agent has active runs.
+// Used by heartbeat ticker to skip agents currently processing other requests.
+func (s *Scheduler) HasActiveSessionsForAgent(agentID string) bool {
+	prefix := "agent:" + agentID + ":"
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for key, sq := range s.sessions {
+		if strings.HasPrefix(key, prefix) && sq.IsActive() {
+			return true
+		}
+	}
+	return false
 }
 
 // LaneStats returns utilization metrics for all lanes.

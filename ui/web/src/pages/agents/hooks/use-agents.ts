@@ -1,7 +1,12 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useWs, useHttp } from "@/hooks/use-ws";
 import { useAuthStore } from "@/stores/use-auth-store";
 import { Methods } from "@/api/protocol";
+import { queryKeys } from "@/lib/query-keys";
+import { toast } from "@/stores/use-toast-store";
+import i18n from "@/i18n";
+import { userFriendlyError } from "@/lib/error-utils";
 import type { AgentData } from "@/types/agent";
 
 interface AgentInfoWs {
@@ -14,33 +19,25 @@ export function useAgents() {
   const ws = useWs();
   const http = useHttp();
   const connected = useAuthStore((s) => s.connected);
-  const [agents, setAgents] = useState<AgentData[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
+  const { data: agents = [], isPending: loading, error: queryError, refetch } = useQuery({
+    queryKey: queryKeys.agents.all,
+    queryFn: async () => {
       // Try HTTP first (returns full agent data, filtered by user access)
-      const res = await http.get<{ agents: AgentData[] }>("/v1/agents");
-      if (res.agents && res.agents.length > 0) {
-        setAgents(res.agents);
-        setLoading(false);
-        return;
+      try {
+        const res = await http.get<{ agents: AgentData[] }>("/v1/agents");
+        if (res.agents && res.agents.length > 0) {
+          return res.agents;
+        }
+      } catch {
+        // HTTP may fail if user doesn't have access - fall through to WS
       }
-    } catch {
-      // HTTP may fail if user doesn't have access - fall through to WS
-    }
 
-    // Fallback: WS agents.list returns all running agents (no access filter)
-    try {
-      if (!ws.isConnected) {
-        setLoading(false);
-        return;
-      }
+      // Fallback: WS agents.list returns all running agents (no access filter)
+      if (!ws.isConnected) return [];
       const res = await ws.call<{ agents: AgentInfoWs[] }>(Methods.AGENTS_LIST);
-      const wsAgents: AgentData[] = (res.agents ?? []).map((a) => ({
+      return (res.agents ?? []).map((a): AgentData => ({
         id: a.id,
         agent_key: a.id,
         owner_id: "",
@@ -50,40 +47,81 @@ export function useAgents() {
         max_tool_iterations: 0,
         workspace: "",
         restrict_to_workspace: false,
-        agent_type: "open" as const,
+        agent_type: (a as unknown as { agentType?: string }).agentType === "predefined" ? "predefined" as const : "open" as const,
         is_default: false,
-        status: a.isRunning ? "running" : "idle",
+        status: a.isRunning ? "active" : "inactive",
       }));
-      setAgents(wsAgents);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load agents");
-    } finally {
-      setLoading(false);
-    }
-  }, [http, ws]);
+    },
+    staleTime: 60_000,
+    enabled: connected,
+  });
 
-  useEffect(() => {
-    if (connected) {
-      load();
-    }
-  }, [connected, load]);
+  const error = queryError instanceof Error ? queryError.message : queryError ? "Failed to load agents" : null;
+
+  const invalidate = useCallback(
+    async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.agents.all });
+      await refetch();
+    },
+    [queryClient, refetch],
+  );
 
   const createAgent = useCallback(
     async (data: Partial<AgentData>) => {
-      const res = await http.post<AgentData>("/v1/agents", data);
-      setAgents((prev) => [...prev, res]);
-      return res;
+      try {
+        const res = await http.post<AgentData>("/v1/agents", data);
+        await invalidate();
+        toast.success(i18n.t("agents:toast.created"), `${data.display_name || data.agent_key || "Agent"} has been added`);
+        return res;
+      } catch (err) {
+        toast.error(i18n.t("agents:toast.createFailed"), userFriendlyError(err));
+        throw err;
+      }
     },
-    [http],
+    [http, invalidate],
+  );
+
+  const updateAgent = useCallback(
+    async (id: string, data: Partial<AgentData>) => {
+      try {
+        await http.put(`/v1/agents/${id}`, data);
+        await invalidate();
+        toast.success(i18n.t("agents:toast.updated"), `${data.display_name || data.agent_key || "Agent"} has been updated`);
+      } catch (err) {
+        toast.error(i18n.t("agents:toast.updateFailed"), userFriendlyError(err));
+        throw err;
+      }
+    },
+    [http, invalidate],
   );
 
   const deleteAgent = useCallback(
     async (id: string) => {
-      await http.delete(`/v1/agents/${id}`);
-      setAgents((prev) => prev.filter((a) => a.id !== id));
+      try {
+        await http.delete(`/v1/agents/${id}`);
+        await invalidate();
+        toast.success(i18n.t("agents:toast.deleted"));
+      } catch (err) {
+        toast.error(i18n.t("agents:toast.deleteFailed"), userFriendlyError(err));
+        throw err;
+      }
+    },
+    [http, invalidate],
+  );
+
+  const resummonAgent = useCallback(
+    async (id: string) => {
+      await http.post(`/v1/agents/${id}/resummon`);
     },
     [http],
   );
 
-  return { agents, loading, error, refresh: load, createAgent, deleteAgent };
+  const cancelSummonAgent = useCallback(
+    async (id: string) => {
+      await http.post(`/v1/agents/${id}/cancel-summon`);
+    },
+    [http],
+  );
+
+  return { agents, loading, error, refresh: invalidate, createAgent, updateAgent, deleteAgent, resummonAgent, cancelSummonAgent };
 }

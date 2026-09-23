@@ -1,0 +1,373 @@
+package i18n
+
+func init() {
+	register(LocaleZH, map[string]string{
+		// Common validation
+		MsgRequired:         "%s 是必填项",
+		MsgInvalidID:        "无效的 %s ID",
+		MsgNotFound:         "未找到 %s：%s",
+		MsgAlreadyExists:    "%s 已存在：%s",
+		MsgInvalidRequest:   "无效请求：%s",
+		MsgInvalidJSON:      "无效的 JSON",
+		MsgUnauthorized:     "未授权",
+		MsgPermissionDenied: "权限不足：%s",
+		MsgInternalError:    "内部错误：%s",
+		MsgInvalidSlug:      "%s 必须是有效的 slug（小写字母、数字、连字符）",
+		MsgFailedToList:     "获取 %s 列表失败",
+		MsgFailedToCreate:   "创建 %s 失败：%s",
+		MsgFailedToUpdate:   "更新 %s 失败：%s",
+		MsgFailedToDelete:   "删除 %s 失败：%s",
+		MsgFailedToSave:     "保存 %s 失败：%s",
+		MsgInvalidUpdates:   "更新内容无效",
+
+		// Agent
+		MsgAgentNotFound:                       "未找到Agent：%s",
+		MsgCannotDeleteDefault:                 "无法删除默认Agent",
+		MsgUserCtxRequired:                     "需要用户上下文",
+		MsgGatewayOperatorSecureCLIUnavailable: "已跳过网关 operator 访问，因为 SecureCLI 存储不可用。",
+		MsgGatewayOperatorEligibilityFailed:    "Agent 已创建，但无法验证其是否为第一个 Agent 来授予网关 operator 访问。",
+		MsgGatewayOperatorNotFirstAgent:        "未授予网关 operator 访问，因为这不是第一个 Agent。",
+		MsgGatewayOperatorTokenMissing:         "已跳过网关 operator 访问，因为未配置网关 token。",
+		MsgGatewayOperatorBinaryMissing:        "已跳过网关 operator 访问，因为无法发现 goclaw binary。",
+		MsgGatewayOperatorExistingReview:       "已跳过网关 operator 访问，因为现有 goclaw CLI credential 需要手动检查。",
+		MsgGatewayOperatorRegisterFailed:       "已跳过网关 operator 访问，因为无法注册 goclaw CLI credential。",
+		MsgGatewayOperatorCredentialFailed:     "已跳过网关 operator 访问，因为无法存储 credential。",
+
+		// Chat
+		MsgRateLimitExceeded: "请求频率超限 — 请稍候",
+		MsgNoUserMessage:     "未找到用户消息",
+		MsgUserIDRequired:    "user_id 是必填项",
+		MsgMsgRequired:       "消息是必填项",
+
+		// Abort
+		MsgAbortStopped:         "已停止运行",
+		MsgAbortForced:          "已强制中止运行（超过 3 秒宽限期）",
+		MsgAbortAlreadyAborting: "正在中止中",
+		MsgAbortNotFound:        "运行未找到或已结束",
+		MsgAbortUnauthorized:    "无权中止此运行",
+		MsgAbortFailed:          "无法中止运行：%s",
+
+		// Channel instances
+		MsgInvalidChannelType: "Channel类型无效",
+		MsgInstanceNotFound:   "未找到实例",
+
+		// Cron
+		MsgJobNotFound:         "未找到任务",
+		MsgInvalidCronExpr:     "无效的 cron 表达式：%s",
+		MsgCommandCronDisabled: "此网关已禁用命令型 cron 任务（设置 cron.command_enabled=true 以允许）",
+
+		// Config
+		MsgConfigHashMismatch: "配置已更改（hash 不匹配）",
+
+		// Exec approval
+		MsgExecApprovalDisabled: "执行审批未启用",
+
+		// Pairing
+		MsgSenderChannelRequired: "senderId 和 channel 是必填项",
+		MsgCodeRequired:          "代码是必填项",
+		MsgSenderIDRequired:      "sender_id 是必填项",
+
+		// HTTP API
+		MsgInvalidAuth:            "身份验证无效",
+		MsgMsgsRequired:           "messages 是必填项",
+		MsgUserIDHeader:           "需要 X-GoClaw-User-Id 请求头",
+		MsgFileTooLarge:           "文件过大或 multipart 表单无效",
+		MsgMissingFileField:       "缺少 'file' 字段",
+		MsgInvalidFilename:        "文件名无效",
+		MsgChannelKeyReq:          "channel 和 key 是必填项",
+		MsgMethodNotAllowed:       "不允许的请求方法",
+		MsgStreamingNotSupported:  "不支持流式传输",
+		MsgOwnerOnly:              "只有所有者才能%s",
+		MsgNoAccess:               "无权访问此%s",
+		MsgAlreadySummoning:       "Agent正在被召唤中",
+		MsgSummoningUnavailable:   "召唤功能不可用",
+		MsgRunTimelineUnavailable: "运行时间线不可用",
+		MsgNoDescription:          "Agent没有可供重新召唤的描述",
+		MsgSummonCancelled:        "已取消召唤",
+		MsgCannotCancel:           "Agent 未处于召唤状态",
+		MsgInvalidPath:            "路径无效",
+
+		// Browser cookies
+		MsgBrowserCookieTooMany:            "单次同步请求中的浏览器 Cookie 过多",
+		MsgInvalidCookieURL:                "Cookie URL 无效",
+		MsgBrowserCookieValueTooLarge:      "Cookie 值过大",
+		MsgBrowserCookieEncryptionRequired: "尚未配置浏览器 Cookie 加密",
+
+		// Tenant backup / restore
+		MsgRestoreNewModeRejectsTenantID: "mode=new 会创建新租户；请传 tenant_slug（而非 tenant_id）作为新租户的 slug",
+
+		// Scheduler
+		MsgQueueFull:    "Session队列已满",
+		MsgShuttingDown: "网关正在关闭，请稍后重试",
+
+		// Provider
+		MsgProviderReqFailed: "%s：请求失败：%s",
+
+		// Usage caps / pricing
+		MsgUsageCapsListPoliciesFailed:          "无法列出 usage cap 策略",
+		MsgUsageCapPolicyValidationFailed:       "usage cap 策略验证失败",
+		MsgUsageCapPolicyManaged:                "无法修改系统托管的 usage cap 策略",
+		MsgUsageCapsDeletePolicyFailed:          "无法删除 usage cap 策略",
+		MsgUsageCapsUtilizationFailed:           "无法加载 usage cap 使用量",
+		MsgUsageCapsEventsFailed:                "无法加载 usage cap 事件",
+		MsgUsagePricingSyncOpenRouterFailed:     "无法同步 OpenRouter 价格：%s",
+		MsgUsagePricingStoreCatalogFailed:       "无法保存价格目录",
+		MsgUsagePricingListFailed:               "无法列出模型价格",
+		MsgUsagePricingProviderModelRequired:    "provider_id 和 model_id 是必填项",
+		MsgUsagePricingOverrideValidationFailed: "价格覆盖验证失败",
+		MsgUsagePricingListOverridesFailed:      "无法列出价格覆盖",
+		MsgUsagePricingDeleteOverrideFailed:     "无法删除价格覆盖",
+
+		// Unknown method
+		MsgUnknownMethod: "未知方法：%s",
+
+		// Not implemented
+		MsgNotImplemented: "%s 尚未实现",
+
+		// Agent links
+		MsgLinksNotConfigured: "Agent链接未配置",
+		MsgInvalidDirection:   "方向必须是 outbound、inbound 或 bidirectional",
+		MsgSourceTargetSame:   "源和目标必须是不同的Agent",
+		MsgCannotDelegateOpen: "无法委派给开放型Agent — 只有预定义Agent才能作为委派目标",
+		MsgNoUpdatesProvided:  "未提供更新内容",
+		MsgInvalidLinkStatus:  "状态必须是 active 或 disabled",
+
+		// Teams
+		MsgTeamsNotConfigured:   "团队未配置",
+		MsgAgentIsTeamLead:      "该Agent已是团队负责人",
+		MsgCannotRemoveTeamLead: "无法移除团队负责人",
+
+		// Channels
+		MsgCannotDeleteDefaultInst: "无法删除默认Channel实例",
+		MsgCannotRemoveLastWriter:  "无法移除最后一个文件管理员",
+
+		// Skills
+		MsgSkillsUpdateNotSupported:    "基于文件的Skill不支持 skills.update",
+		MsgCannotResolveSkillID:        "无法解析基于文件的Skill ID",
+		MsgInvalidVisibility:           "无效的 visibility %q：必须为 private 或 public",
+		MsgSkillEvolutionNotConfigured: "技能演进存储未配置",
+		MsgActivityStoreNotConfigured:  "活动存储未配置",
+		MsgInvalidEvolutionMode:        "无效的 evolution mode",
+		MsgSystemSkillMutationBlocked:  "禁止修改系统Skill",
+		MsgSuggestionMustBeApproved:    "应用前必须先批准建议",
+		MsgInvalidDraftPatch:           "无效的 draft_patch：%s",
+		MsgDraftPatchRequired:          "draft_patch 需要 content 或 find/replace",
+		MsgFindTextNotFound:            "在目标文件中未找到要替换的文本",
+
+		// Logs
+		MsgInvalidLogAction: "action 必须是 'start' 或 'stop'",
+
+		// Config
+		MsgRawConfigRequired:     "raw 配置是必填项",
+		MsgRawPatchRequired:      "raw 补丁是必填项",
+		MsgConfigMasterScopeOnly: "config.* 方法仅适用于主作用域；使用租户工具配置端点进行租户级覆盖",
+		MsgMasterScopeRequired:   "此操作需要主租户范围",
+
+		// Storage / File
+		MsgCannotDeleteSkillsDir: "无法删除Skill目录",
+		MsgFailedToReadFile:      "读取文件失败",
+		MsgFileNotFound:          "文件未找到",
+		MsgInvalidVersion:        "版本无效",
+		MsgVersionNotFound:       "未找到该版本",
+		MsgFailedToDeleteFile:    "删除失败",
+
+		// OAuth
+		MsgNoPendingOAuth:       "没有待处理的 OAuth 流程",
+		MsgFailedToSaveToken:    "保存令牌失败",
+		MsgOAuthCallbackSuccess: "授权成功。您可以关闭此窗口。",
+		MsgOAuthCallbackFailed:  "授权失败。您可以关闭此窗口。",
+
+		// Intent Classify
+		MsgStatusWorking:       "🔄 我正在处理您的请求...请稍候。",
+		MsgStatusDetailed:      "🔄 我正在处理您的请求...\n%s（第 %d 次迭代）\n已运行：%s\n\n请稍候——完成后我会回复您。",
+		MsgStatusPhaseThinking: "阶段：思考中...",
+		MsgStatusPhaseToolExec: "阶段：正在运行 %s",
+		MsgStatusPhaseTools:    "阶段：执行工具中...",
+		MsgStatusPhaseCompact:  "阶段：压缩上下文中...",
+		MsgStatusPhaseDefault:  "阶段：处理中...",
+		MsgCancelledReply:      "✋ 已取消。您接下来想做什么？",
+		MsgInjectedAck:         "收到，我会在当前任务中处理。",
+
+		// Knowledge Graph
+		MsgEntityIDRequired:       "entity_id 是必填项",
+		MsgEntityFieldsRequired:   "external_id、name 和 entity_type 是必填项",
+		MsgTextRequired:           "text 是必填项",
+		MsgProviderModelRequired:  "provider 和 model 是必填项",
+		MsgInvalidProviderOrModel: "provider 或 model 无效",
+
+		// 内置工具描述
+		MsgToolReadFile:           "按路径读取代理工作区中的文件内容",
+		MsgToolWriteFile:          "将内容写入工作区中的文件，自动创建所需目录",
+		MsgToolListFiles:          "列出工作区指定路径中的文件和目录",
+		MsgToolEdit:               "通过查找和替换对现有文件进行定向编辑，无需重写整个文件",
+		MsgToolExec:               "在工作区中执行 shell 命令并返回标准输出/错误",
+		MsgToolWebSearch:          "使用搜索引擎（Brave 或 DuckDuckGo）在网络上搜索信息",
+		MsgToolWebFetch:           "获取网页或 API 端点并提取其文本内容",
+		MsgToolMemorySearch:       "使用语义相似度搜索代理的长期记忆",
+		MsgToolMemoryGet:          "按文件路径检索特定的记忆文档",
+		MsgToolKGSearch:           "搜索代理知识图谱中的实体、关系和观察记录",
+		MsgToolReadImage:          "使用具有视觉能力的 LLM 提供商分析图像",
+		MsgToolReadDocument:       "使用 LLM 分析文档（PDF、Word、Excel、PowerPoint、CSV 等）",
+		MsgToolCreateImage:        "使用 AI 图像生成提供商从文本提示生成图像",
+		MsgToolReadAudio:          "使用具有音频能力的 LLM 分析音频文件（语音、音乐、声音）",
+		MsgToolReadVideo:          "使用具有视频能力的 LLM 分析视频文件",
+		MsgToolCreateVideo:        "使用 AI 从文本描述生成视频",
+		MsgToolCreateAudio:        "使用 AI 从文本描述生成音乐或音效",
+		MsgToolTTS:                "将文本转换为自然语音音频",
+		MsgToolBrowser:            "自动化浏览器交互：导航页面、点击元素、填写表单、截图",
+		MsgToolSessionsList:       "列出所有渠道中的活跃聊天会话",
+		MsgToolSessionStatus:      "获取特定聊天会话的当前状态和元数据",
+		MsgToolSessionsHistory:    "检索特定聊天会话的消息历史",
+		MsgToolSessionsSend:       "代理代表向活跃聊天会话发送消息",
+		MsgToolMessage:            "在已连接的渠道（Telegram、Discord 等）上向用户主动发送消息",
+		MsgToolCron:               "使用 cron 表达式、定时或间隔来调度或管理定期任务",
+		MsgToolSpawn:              "创建子代理执行后台工作或将任务委派给已链接的代理",
+		MsgToolSkillSearch:        "按关键字或描述搜索可用技能以查找相关功能",
+		MsgToolUseSkill:           "激活技能以使用其专门功能（追踪标记）",
+		MsgToolSkillManage:        "从对话经验中创建、修补或删除技能",
+		MsgToolPublishSkill:       "将技能目录注册到系统数据库中，使其可被发现和授权",
+		MsgToolTeamTasks:          "查看、创建、更新和完成团队任务板上的任务",
+		MsgToolAnnouncementSingle: "我将使用 %s 处理下一步。",
+		MsgToolAnnouncementMulti:  "我将使用 %s 处理下一步。",
+
+		MsgSkillNudgePostscript: "此任务涉及多个步骤。要我将此过程保存为可重用技能吗？回复 **\"保存技能\"** 或 **\"跳过\"**。",
+		MsgSkillNudge70Pct:      "[System] 您已使用 70% 的迭代预算。请考虑本次会话中的模式是否值得保存为技能。",
+		MsgSkillNudge90Pct:      "[System] 您已使用 90% 的迭代预算。如果本次会话涉及可重用的模式，请考虑在完成前将其保存为技能。",
+		MsgEmptyReplyFallback:   "⚠️ 代理无法生成响应。注意：部分工具操作可能已经执行 — 请先确认后再重试",
+
+		MsgInvalidRole: "无效角色：允许的值为 owner、admin、operator、member、viewer",
+
+		MsgContactIDsRequired:  "contact_ids 为必填项",
+		MsgMergeTargetRequired: "必须提供 tenant_user_id 或 create_user 其中之一",
+		MsgTenantUserNotFound:  "未找到租户用户",
+		MsgTenantMismatch:      "租户用户不属于此租户",
+		MsgTenantScopeRequired: "此操作需要指定租户范围",
+
+		// TTS / 声音
+		MsgTtsUnknownModel:        "未知的 tts 模型：%s",
+		MsgVoicesListFailed:       "获取声音列表失败：%s",
+		MsgTtsGeminiInvalidVoice:  "无效的 Gemini 声音：%s",
+		MsgTtsGeminiSpeakerLimit:  "Gemini TTS 最多支持 2 位发言人",
+		MsgTtsGeminiInvalidModel:  "无效的 Gemini TTS 模型：%s",
+		MsgTtsGeminiTextOnly:      "Gemini 拒绝生成音频。请尝试更简单的文本，不要翻译或添加评论。",
+		MsgTtsParamOutOfRange:     "TTS 参数 %q 的值 %v 超出范围 [%v, %v]",
+		MsgTtsParamUnknownKey:     "TTS 参数 %q 不受此提供商支持",
+		MsgTtsMiniMaxVoicesFailed: "获取 MiniMax 声音列表失败：%s",
+
+		// STT
+		MsgSTTAllProvidersFailed:     "所有 STT 提供商均失败",
+		MsgSTTLegacyConfigDeprecated: "旧版 STT 配置已弃用；请迁移至 builtin_tools[stt]",
+		MsgSTTWhatsappPrivacyWarning: "为 WhatsApp 启用 STT 将破坏发送至此 Agent 的语音消息的端对端加密。",
+		MsgVoiceMessageFallback:      "[语音消息]",
+
+		// Webhooks
+		MsgWebhookAuthFailed:                  "Webhook 身份验证失败",
+		MsgWebhookHMACInvalid:                 "HMAC 签名无效",
+		MsgWebhookHMACTimestampSkew:           "请求时间戳超出可接受窗口",
+		MsgWebhookBearerRequiredHMAC:          "此 Webhook 需要 HMAC 身份验证",
+		MsgWebhookRevoked:                     "Webhook 已被撤销",
+		MsgWebhookKindMismatch:                "请求类型与 Webhook 配置不匹配",
+		MsgWebhookRateLimited:                 "超出 Webhook 速率限制",
+		MsgWebhookBodyTooLarge:                "请求正文超出大小限制",
+		MsgWebhookIdempotencyConflict:         "幂等键冲突：请求正文不匹配",
+		MsgWebhookTenantMismatch:              "Webhook 租户不匹配",
+		MsgWebhookAgentNotFound:               "未找到 Webhook 代理",
+		MsgWebhookChannelNotFound:             "未找到 Webhook 频道",
+		MsgWebhookMediaSSRFBlocked:            "媒体 URL 被 SSRF 策略拦截",
+		MsgWebhookMediaTooLarge:               "媒体文件超出大小限制",
+		MsgWebhookMediaMIMEDenied:             "媒体 MIME 类型不被允许",
+		MsgWebhookCallbackURLInvalid:          "回调 URL 无效或被拦截",
+		MsgWebhookLLMTimeout:                  "LLM 处理超时",
+		MsgWebhookLaneSaturated:               "Webhook 处理通道已满",
+		MsgWebhookLocalhostOnlyViolation:      "此 Webhook 仅限本地调用",
+		MsgWebhookMediaChannelUnsupported:     "频道不支持媒体附件",
+		MsgWebhookIPDenied:                    "请求来源不在 IP 白名单中",
+		MsgWebhookEncryptionUnavailable:       "Webhook 加密密钥未配置；请设置 GOCLAW_ENCRYPTION_KEY 以启用 Webhook",
+		MsgWebhookMessageTestRequiresStandard: "测试 message 类型 Webhook 需要 Standard 版本",
+
+		// Hooks
+		// Workstation
+		MsgWorkstationNotFound:     "未找到工作站：%s",
+		MsgWorkstationKeyExists:    "工作站键已被使用：%s",
+		MsgInvalidBackend:          "无效的后端类型：%s（必须是 ssh|docker）",
+		MsgWorkstationInactive:     "工作站未激活：%s",
+		MsgInvalidMetadataShape:    "%s 后端的元数据无效：%s",
+		MsgWorkstationRequired:     "Agent 未绑定工作站，请提供 workstation_id",
+		MsgWorkstationAccessDenied: "Agent %s 无权访问工作站 %s",
+		MsgBackendNotReady:         "工作站后端未就绪：%s",
+
+		MsgHookInvalidMatcher:          "无效的匹配器正则表达式: %s",
+		MsgHookCommandDisabledStandard: "命令类型钩子仅在 Lite 版本可用",
+		MsgHookPromptRequiresMatcher:   "prompt 钩子必须指定 matcher 或 if_expr(成本失控保护)",
+		MsgHookCircuitBreakerTripped:   "钩子在多次失败后已自动禁用",
+		MsgHookBudgetExceeded:          "租户钩子令牌预算已耗尽",
+		MsgHookPerTurnCapReached:       "单轮钩子调用次数已达上限",
+		MsgHookBuiltinReadOnly:         "内置钩子只读,仅允许切换启用状态",
+
+		// Workstation permissions (Phase 6)
+		MsgWorkstationCmdDenied:    "命令被工作站策略拒绝: %s",
+		MsgWorkstationEnvDenied:    "环境变量被策略拒绝: %s",
+		MsgWorkstationInputInvalid: "命令包含无效字符: %s",
+		MsgWorkstationRateLimit:    "已超过工作站速率限制",
+		MsgWorkstationPermNotFound: "未找到权限条目: %s",
+		// Workstation activity (Phase 7)
+		MsgWorkstationActivityTitle: "近期活动",
+		MsgWorkstationActionExec:    "执行",
+		MsgWorkstationActionDeny:    "拒绝",
+
+		// Package updates (Phase 4+5)
+		MsgPackageNotInstalled:  "软件包 %s 未安装",
+		MsgPackageUpdateLocked:  "软件包 %s 正在被其他请求更新",
+		MsgReleaseNotFound:      "%s 未找到版本 %s",
+		MsgAssetNotFound:        "没有适用于 %s/%s 的文件",
+		MsgChecksumMismatch:     "%s 校验和不匹配",
+		MsgUpdateSwapFailed:     "安装 %s 失败；已恢复旧版本",
+		MsgUpdateManifestDesync: "二进制文件已更新但清单保存失败 — %s 需要手动恢复",
+		MsgUpdateCacheStale:     "更新缓存已过期；请先刷新再应用更新",
+
+		// Grant env validation
+		MsgGrantEnvDeniedKeys:   "不允许的环境变量键：%s",
+		MsgGrantEnvValueInvalid: "无效的环境变量值：%s",
+		MsgGrantEnvTooManyKeys:  "环境变量键过多：最多 50 个",
+		MsgGrantEnvRevealLimit:  "env 查看请求超出速率限制，请稍后再试",
+
+		// Git 凭据适配器
+		MsgGitCredHostMismatch:             "已存储的 git 凭据属于 %s，但命令目标是 %s",
+		MsgGitCredNoMatch:                  "没有为主机 %s 配置 git 凭据",
+		MsgGitCredUnsupportedType:          "不支持的 git 凭据类型 %q",
+		MsgGitCredTokenInvalid:             "已存储的 git token 无效或为空",
+		MsgGitCredTokenControlChar:         "已存储的 git token 包含被禁止的控制字符",
+		MsgGitCredHostUserinfoRejected:     "git URL 中嵌入的 userinfo 因含义不明被拒绝",
+		MsgGitCredSSHPassphraseUnsupported: "暂不支持带密码短语的 SSH 私钥；请先用 `ssh-keygen -p` 移除密码短语再保存",
+		MsgGitCredSSHKeyInvalid:            "SSH 私钥无效:%s",
+		MsgGitCredHostScopeRequired:        "credential_type %s 需要 host_scope",
+		MsgGitCredHostScopeInvalid:         "host_scope %q 不是有效的主机名",
+		MsgGitCredBlobMissingField:         "凭据 blob 缺少必填字段 %q",
+		MsgGitCredUnsupportedCredType:      "不支持的 credential_type %q",
+
+		// Message tool cross-target forward notice
+		MessageCrossTargetForwarded: "📤 已按请求转发至 %s:%q",
+
+		// Package update source labels
+		MsgPackagesUpdatesSourceGithub: "GitHub",
+		MsgPackagesUpdatesSourcePip:    "pip",
+		MsgPackagesUpdatesSourceNpm:    "npm",
+		MsgPackagesUpdatesSourceApk:    "apk",
+
+		// Package update availability messages
+		MsgPackagesUpdatesUnavailablePip: "系统中未安装 pip",
+		MsgPackagesUpdatesUnavailableNpm: "系统中未安装 npm",
+		MsgPackagesUpdatesUnavailableApk: "此系统不可用 apk",
+
+		// Package update failure reasons
+		MsgPackagesUpdatesReasonDependencyConflict: "依赖冲突",
+		MsgPackagesUpdatesReasonPermission:         "权限被拒绝",
+		MsgPackagesUpdatesReasonNetwork:            "网络错误",
+		MsgPackagesUpdatesReasonNotFound:           "未找到软件包",
+		MsgPackagesUpdatesReasonTargetMissing:      "版本不可用",
+		MsgPackagesUpdatesReasonExternallyManaged:  "环境由外部管理",
+		MsgPackagesUpdatesReasonLocked:             "软件包数据库已锁定",
+		MsgPackagesUpdatesReasonDiskFull:           "磁盘已满",
+		MsgPackagesUpdatesReasonHelperUnavailable:  "特权助手不可用",
+	})
+}

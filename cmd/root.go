@@ -15,6 +15,10 @@ var Version = "dev"
 var (
 	cfgFile string
 	verbose bool
+
+	gatewayServerOverride string
+	gatewayTokenOverride  string
+	gatewayOutputFormat   string
 )
 
 var rootCmd = &cobra.Command{
@@ -29,6 +33,8 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: config.json or $GOCLAW_CONFIG)")
 	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "enable debug logging")
+	rootCmd.PersistentFlags().StringVar(&gatewayServerOverride, "server", "", "gateway server URL override")
+	rootCmd.PersistentFlags().StringVar(&gatewayTokenOverride, "token", "", "gateway bearer token override")
 
 	rootCmd.AddCommand(onboardCmd())
 	rootCmd.AddCommand(versionCmd())
@@ -36,12 +42,24 @@ func init() {
 	rootCmd.AddCommand(agentCmd())
 	rootCmd.AddCommand(doctorCmd())
 	rootCmd.AddCommand(configCmd())
-	rootCmd.AddCommand(modelsCmd())
+	rootCmd.AddCommand(providersCmd())
 	rootCmd.AddCommand(channelsCmd())
+	rootCmd.AddCommand(bitrixPortalCmd())
 	rootCmd.AddCommand(cronCmd())
 	rootCmd.AddCommand(skillsCmd())
 	rootCmd.AddCommand(sessionsCmd())
+	rootCmd.AddCommand(tracesCmd())
 	rootCmd.AddCommand(migrateCmd())
+	rootCmd.AddCommand(upgradeCmd())
+	rootCmd.AddCommand(evolutionCmd())
+	rootCmd.AddCommand(missionCmd())
+	rootCmd.AddCommand(improveCmd())
+	rootCmd.AddCommand(backupCmd())
+	rootCmd.AddCommand(restoreCmd())
+	rootCmd.AddCommand(tenantBackupCmd())
+	rootCmd.AddCommand(tenantRestoreCmd())
+	rootCmd.AddCommand(authCmd())
+	rootCmd.AddCommand(setupCmd())
 }
 
 func versionCmd() *cobra.Command {

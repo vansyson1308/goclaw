@@ -1,4 +1,5 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -8,7 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const PAGE_SIZES = [10, 20, 50, 100];
+const PAGE_SIZES = [20, 50, 100, 200];
 
 interface PaginationProps {
   page: number;
@@ -18,6 +19,7 @@ interface PaginationProps {
   onPageChange: (page: number) => void;
   onPageSizeChange: (size: number) => void;
   pageSizes?: number[];
+  className?: string;
 }
 
 export function Pagination({
@@ -28,22 +30,24 @@ export function Pagination({
   onPageChange,
   onPageSizeChange,
   pageSizes = PAGE_SIZES,
+  className,
 }: PaginationProps) {
+  const { t } = useTranslation("common");
   if (total === 0) return null;
 
   return (
-    <div className="flex items-center justify-between border-t px-4 py-3">
+    <div className={`flex flex-col items-center gap-2 border-t px-4 py-3 sm:flex-row sm:justify-between ${className ?? ""}`}>
       <div className="text-sm text-muted-foreground">
-        {total} {total === 1 ? "item" : "items"}
+        {total} {t("items")}
       </div>
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2 sm:gap-4">
         <div className="flex items-center gap-2">
-          <span className="text-sm text-muted-foreground">Rows</span>
+          <span className="text-sm text-muted-foreground">{t("rows")}</span>
           <Select
             value={String(pageSize)}
             onValueChange={(v) => onPageSizeChange(Number(v))}
           >
-            <SelectTrigger size="sm" className="w-[70px]">
+            <SelectTrigger size="sm" className="w-[84px]">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -56,7 +60,7 @@ export function Pagination({
           </Select>
         </div>
         <span className="text-sm text-muted-foreground">
-          Page {page} of {totalPages}
+          {t("pageOf", { page, totalPages })}
         </span>
         <div className="flex items-center gap-1">
           <Button

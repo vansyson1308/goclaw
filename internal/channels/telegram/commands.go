@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/google/uuid"
@@ -10,6 +11,7 @@ import (
 	tu "github.com/mymmrac/telego/telegoutil"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // resolveAgentUUID looks up the agent UUID from the channel's agent key.
@@ -25,7 +27,8 @@ func (c *Channel) resolveAgentUUID(ctx context.Context) (uuid.UUID, error) {
 		return id, nil
 	}
 
-	// Look up by agent key.
+	// Inject tenant scope so the store can filter by tenant_id.
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	agent, err := c.agentStore.GetByKey(ctx, key)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("agent %q not found: %w", key, err)
@@ -42,8 +45,21 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 
 	// Extract command (strip @botname suffix if present)
 	cmd := strings.SplitN(text, " ", 2)[0]
-	cmd = strings.SplitN(cmd, "@", 2)[0]
 	cmd = strings.ToLower(cmd)
+
+	// In groups, ignore commands addressed to other bots (e.g. /help@other_bot)
+	if isGroup {
+		if parts := strings.SplitN(cmd, "@", 2); len(parts) == 2 {
+			if !strings.EqualFold(parts[1], c.bot.Username()) {
+				return false
+			}
+		}
+	}
+
+	cmd = strings.SplitN(cmd, "@", 2)[0]
+
+	// Inject tenant scope so all command handlers have tenant_id in context.
+	ctx = store.WithTenantID(ctx, c.TenantID())
 
 	chatIDObj := tu.ID(chatID)
 
@@ -69,11 +85,17 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 			"/stopall — Stop all running tasks\n" +
 			"/reset — Reset conversation history\n" +
 			"/status — Show bot status\n" +
+			"/reactions — Show reaction emoji legend\n" +
 			"/tasks — List team tasks\n" +
 			"/task_detail <id> — View task detail\n" +
+			"/subagents — List subagent tasks\n" +
+			"/subagent <id> — View subagent task detail\n" +
 			"/writers — List file writers for this group\n" +
 			"/addwriter — Add a file writer (reply to their message)\n" +
 			"/removewriter — Remove a file writer (reply to their message)\n" +
+			"/croners — List cron managers for this group\n" +
+			"/addcron — Add a cron manager (reply to their message)\n" +
+			"/removecron — Remove a cron manager (reply to their message)\n" +
 			"\nJust send a message to chat with the AI."
 		msg := tu.Message(chatIDObj, helpText)
 		setThread(msg)
@@ -81,6 +103,25 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 		return true
 
 	case "/reset":
+		// In group chats, only file writers can reset conversation history.
+		if isGroup && c.configPermStore != nil {
+			agentID, err := c.resolveAgentUUID(ctx)
+			if err == nil {
+				groupID := fmt.Sprintf("group:%s:%s", c.Name(), chatIDStr)
+				senderNumericID := strings.SplitN(senderID, "|", 2)[0]
+				isWriter, err := c.configPermStore.CheckPermission(ctx, agentID, groupID, store.ConfigTypeFileWriter, senderNumericID)
+				if err != nil {
+					slog.Warn("security.reset_writer_check_failed", "error", err, "sender", senderNumericID)
+					// fail-open: allow reset if DB check fails
+				} else if !isWriter {
+					msg := tu.Message(chatIDObj, "Only file writers can reset conversation history in this group.")
+					setThread(msg)
+					c.bot.SendMessage(ctx, msg)
+					return true
+				}
+			}
+		}
+
 		// Fix: use correct PeerKind so the gateway consumer builds the right session key.
 		peerKind := "direct"
 		if isGroup {
@@ -94,6 +135,7 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 			PeerKind: peerKind,
 			AgentID:  c.AgentID(),
 			UserID:   strings.SplitN(senderID, "|", 2)[0],
+			TenantID: c.TenantID(),
 			Metadata: map[string]string{
 				"command":           "reset",
 				"local_key":         localKey,
@@ -119,6 +161,7 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 			PeerKind: peerKind,
 			AgentID:  c.AgentID(),
 			UserID:   strings.SplitN(senderID, "|", 2)[0],
+			TenantID: c.TenantID(),
 			Metadata: map[string]string{
 				"command":           "stop",
 				"local_key":         localKey,
@@ -142,6 +185,7 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 			PeerKind: peerKind,
 			AgentID:  c.AgentID(),
 			UserID:   strings.SplitN(senderID, "|", 2)[0],
+			TenantID: c.TenantID(),
 			Metadata: map[string]string{
 				"command":           "stopall",
 				"local_key":         localKey,
@@ -160,11 +204,19 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 		return true
 
 	case "/tasks":
-		c.handleTasksList(ctx, chatID, setThread)
+		c.handleTasksList(ctx, chatID, isGroup, setThread)
 		return true
 
 	case "/task_detail":
-		c.handleTaskDetail(ctx, chatID, text, setThread)
+		c.handleTaskDetail(ctx, chatID, text, isGroup, setThread)
+		return true
+
+	case "/subagents":
+		c.handleSubagentsList(ctx, chatID, isGroup, setThread)
+		return true
+
+	case "/subagent":
+		c.handleSubagentDetail(ctx, chatID, text, isGroup, setThread)
 		return true
 
 	case "/addwriter":
@@ -178,8 +230,31 @@ func (c *Channel) handleBotCommand(ctx context.Context, message *telego.Message,
 	case "/writers":
 		c.handleListWriters(ctx, chatID, chatIDStr, isGroup, setThread)
 		return true
+
+	case "/addcron":
+		c.handleCronPermCommand(ctx, message, chatID, chatIDStr, senderID, isGroup, setThread, "add")
+		return true
+
+	case "/removecron":
+		c.handleCronPermCommand(ctx, message, chatID, chatIDStr, senderID, isGroup, setThread, "remove")
+		return true
+
+	case "/croners":
+		c.handleListCronPerm(ctx, chatID, chatIDStr, isGroup, setThread)
+		return true
+
+	case "/reactions":
+		var lines strings.Builder
+		for _, r := range reactionLegend {
+			lines.WriteString(fmt.Sprintf("%s  %s\n", r.Emoji, r.Desc))
+		}
+		reactText := fmt.Sprintf("<b>Reaction Emoji Legend</b>\n\n<pre>%s</pre>\nReaction level: <b>%s</b>", lines.String(), c.config.ReactionLevel)
+		msg := tu.Message(chatIDObj, reactText)
+		msg.ParseMode = telego.ModeHTML
+		setThread(msg)
+		c.bot.SendMessage(ctx, msg)
+		return true
 	}
 
 	return false
 }
-

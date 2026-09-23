@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { useWs } from "@/hooks/use-ws";
+import { useAuthStore } from "@/stores/use-auth-store";
 import { Methods } from "@/api/protocol";
 
 export interface UsageRecord {
@@ -10,6 +11,7 @@ export interface UsageRecord {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  cost: number;
   timestamp: number;
 }
 
@@ -28,14 +30,15 @@ export interface UsageSummary {
 
 export function useUsage() {
   const ws = useWs();
+  const connected = useAuthStore((s) => s.connected);
   const [records, setRecords] = useState<UsageRecord[]>([]);
   const [total, setTotal] = useState(0);
   const [summary, setSummary] = useState<UsageSummary | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
 
   const loadRecords = useCallback(
     async (opts?: { agentId?: string; limit?: number; offset?: number }) => {
-      if (!ws.isConnected) return;
+      if (!connected) return;
       setLoading(true);
       try {
         const res = await ws.call<{ records: UsageRecord[]; total?: number }>(Methods.USAGE_GET, {
@@ -51,18 +54,18 @@ export function useUsage() {
         setLoading(false);
       }
     },
-    [ws],
+    [ws, connected],
   );
 
   const loadSummary = useCallback(async () => {
-    if (!ws.isConnected) return;
+    if (!connected) return;
     try {
       const res = await ws.call<UsageSummary>(Methods.USAGE_SUMMARY);
       setSummary(res);
     } catch {
       // ignore
     }
-  }, [ws]);
+  }, [ws, connected]);
 
   useEffect(() => {
     loadRecords();

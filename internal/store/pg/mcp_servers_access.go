@@ -1,0 +1,428 @@
+package pg
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/nextlevelbuilder/goclaw/internal/crypto"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
+)
+
+// --- Agent Grants ---
+
+func (s *PGMCPServerStore) GrantToAgent(ctx context.Context, g *store.MCPAgentGrant) error {
+	if err := store.ValidateUserID(g.GrantedBy); err != nil {
+		return err
+	}
+	if g.ID == uuid.Nil {
+		g.ID = store.GenNewID()
+	}
+	g.CreatedAt = time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO mcp_agent_grants (id, server_id, agent_id, enabled, tool_allow, tool_deny, config_overrides, granted_by, created_at, tenant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		 ON CONFLICT (server_id, agent_id) DO UPDATE SET
+		   enabled = EXCLUDED.enabled, tool_allow = EXCLUDED.tool_allow,
+		   tool_deny = EXCLUDED.tool_deny, config_overrides = EXCLUDED.config_overrides,
+		   granted_by = EXCLUDED.granted_by`,
+		g.ID, g.ServerID, g.AgentID, g.Enabled,
+		jsonOrNull(g.ToolAllow), jsonOrNull(g.ToolDeny), jsonOrNull(g.ConfigOverrides),
+		g.GrantedBy, g.CreatedAt, tenantIDForInsert(ctx),
+	)
+	return err
+}
+
+func (s *PGMCPServerStore) RevokeFromAgent(ctx context.Context, serverID, agentID uuid.UUID) error {
+	tClause, tArgs, _, err := scopeClause(ctx, 3)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		"DELETE FROM mcp_agent_grants WHERE server_id = $1 AND agent_id = $2"+tClause,
+		append([]any{serverID, agentID}, tArgs...)...)
+	return err
+}
+
+func (s *PGMCPServerStore) ListAgentGrants(ctx context.Context, agentID uuid.UUID) ([]store.MCPAgentGrant, error) {
+	tClause, tArgs, _, err := scopeClause(ctx, 2)
+	if err != nil {
+		return nil, err
+	}
+	var result []store.MCPAgentGrant
+	err = pkgSqlxDB.SelectContext(ctx, &result,
+		`SELECT id, server_id, agent_id, enabled,
+		 COALESCE(tool_allow, 'null'::jsonb) AS tool_allow,
+		 COALESCE(tool_deny, 'null'::jsonb) AS tool_deny,
+		 COALESCE(config_overrides, 'null'::jsonb) AS config_overrides,
+		 granted_by, created_at
+		 FROM mcp_agent_grants WHERE agent_id = $1`+tClause,
+		append([]any{agentID}, tArgs...)...)
+	return result, err
+}
+
+func (s *PGMCPServerStore) ListServerGrants(ctx context.Context, serverID uuid.UUID) ([]store.MCPAgentGrant, error) {
+	tClause, tArgs, _, err := scopeClause(ctx, 2)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]store.MCPAgentGrant, 0)
+	err = pkgSqlxDB.SelectContext(ctx, &result,
+		`SELECT id, server_id, agent_id, enabled,
+		 COALESCE(tool_allow, '[]'::jsonb) AS tool_allow,
+		 COALESCE(tool_deny, '[]'::jsonb) AS tool_deny,
+		 COALESCE(config_overrides, '{}'::jsonb) AS config_overrides,
+		 granted_by, created_at
+		 FROM mcp_agent_grants WHERE server_id = $1`+tClause+` ORDER BY created_at`,
+		append([]any{serverID}, tArgs...)...)
+	return result, err
+}
+
+// --- Counts ---
+
+func (s *PGMCPServerStore) CountAgentGrantsByServer(ctx context.Context) (map[uuid.UUID]int, error) {
+	tClause, tArgs, _, err := scopeClause(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT server_id, COUNT(*) FROM mcp_agent_grants WHERE 1=1`+tClause+` GROUP BY server_id`,
+		tArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[uuid.UUID]int)
+	for rows.Next() {
+		var serverID uuid.UUID
+		var count int
+		if err := rows.Scan(&serverID, &count); err != nil {
+			continue
+		}
+		result[serverID] = count
+	}
+	return result, nil
+}
+
+// --- User Grants ---
+
+func (s *PGMCPServerStore) GrantToUser(ctx context.Context, g *store.MCPUserGrant) error {
+	if err := store.ValidateUserID(g.UserID); err != nil {
+		return err
+	}
+	if err := store.ValidateUserID(g.GrantedBy); err != nil {
+		return err
+	}
+	if g.ID == uuid.Nil {
+		g.ID = store.GenNewID()
+	}
+	g.CreatedAt = time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO mcp_user_grants (id, server_id, user_id, enabled, tool_allow, tool_deny, granted_by, created_at, tenant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 ON CONFLICT (server_id, user_id) DO UPDATE SET
+		   enabled = EXCLUDED.enabled, tool_allow = EXCLUDED.tool_allow,
+		   tool_deny = EXCLUDED.tool_deny, granted_by = EXCLUDED.granted_by`,
+		g.ID, g.ServerID, g.UserID, g.Enabled,
+		jsonOrNull(g.ToolAllow), jsonOrNull(g.ToolDeny),
+		g.GrantedBy, g.CreatedAt, tenantIDForInsert(ctx),
+	)
+	return err
+}
+
+func (s *PGMCPServerStore) RevokeFromUser(ctx context.Context, serverID uuid.UUID, userID string) error {
+	tClause, tArgs, _, err := scopeClause(ctx, 3)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		"DELETE FROM mcp_user_grants WHERE server_id = $1 AND user_id = $2"+tClause,
+		append([]any{serverID, userID}, tArgs...)...)
+	return err
+}
+
+// --- Resolution ---
+
+func (s *PGMCPServerStore) ListAccessible(ctx context.Context, agentID uuid.UUID, userID string) ([]store.MCPAccessInfo, error) {
+	tClause, tArgs, _, err := scopeClauseAlias(ctx, 2, "ms")
+	if err != nil {
+		return nil, err
+	}
+	// Synthetic owner identities ("" at startup registration, "system" for
+	// WS direct/owner chat) are not real external actors — they cannot have
+	// a per-user grant that anyone deliberately provisioned. Skipping the
+	// mcp_user_grants join for those keeps registration (userID="") and
+	// execute (userID="system") symmetric. Without this, a stale row in
+	// mcp_user_grants with user_id='system' AND enabled=false would silently
+	// hide tools at execute time that registration saw fine, producing
+	// "grant revoked (reason: server_not_accessible)" with no DB change.
+	if userID == "" || userID == "system" {
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT ms.id, ms.name, ms.display_name, ms.transport, ms.command, ms.args, ms.url, ms.headers, ms.env,
+			 ms.api_key, ms.tool_prefix, ms.timeout_sec, ms.settings, ms.enabled, ms.created_by, ms.created_at, ms.updated_at,
+			 mag.tool_allow, mag.tool_deny
+			 FROM mcp_servers ms
+			 INNER JOIN mcp_agent_grants mag ON ms.id = mag.server_id AND mag.agent_id = $1 AND mag.enabled = true
+			 WHERE ms.enabled = true`+tClause,
+			append([]any{agentID}, tArgs...)...)
+		if err != nil {
+			return nil, err
+		}
+		result, err := s.scanAccessibleRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		return s.applyContextMCPAccess(ctx, result)
+	}
+	tClause, tArgs, _, err = scopeClauseAlias(ctx, 3, "ms")
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ms.id, ms.name, ms.display_name, ms.transport, ms.command, ms.args, ms.url, ms.headers, ms.env,
+		 ms.api_key, ms.tool_prefix, ms.timeout_sec, ms.settings, ms.enabled, ms.created_by, ms.created_at, ms.updated_at,
+		 mag.tool_allow, mag.tool_deny
+		 FROM mcp_servers ms
+		 INNER JOIN mcp_agent_grants mag ON ms.id = mag.server_id AND mag.agent_id = $1 AND mag.enabled = true
+		 LEFT JOIN mcp_user_grants mug ON ms.id = mug.server_id AND mug.user_id = $2
+		 WHERE ms.enabled = true
+		   AND (mug.id IS NULL OR mug.enabled = true)`+tClause,
+		append([]any{agentID, userID}, tArgs...)...)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.scanAccessibleRows(rows)
+	if err != nil {
+		return nil, err
+	}
+	return s.applyContextMCPAccess(ctx, result)
+}
+
+func (s *PGMCPServerStore) applyContextMCPAccess(ctx context.Context, result []store.MCPAccessInfo) ([]store.MCPAccessInfo, error) {
+	scopes := store.ChannelContextScopeChainFromContext(ctx)
+	if len(scopes) == 0 {
+		return result, nil
+	}
+	for _, scope := range scopes {
+		grants, err := s.ListContextGrantsForScope(ctx, scope)
+		if err != nil {
+			return nil, err
+		}
+		if len(grants) == 0 {
+			continue
+		}
+		byServer := make(map[uuid.UUID]int, len(result))
+		for i := range result {
+			byServer[result[i].Server.ID] = i
+		}
+		for _, grant := range grants {
+			if idx, exists := byServer[grant.ServerID]; exists {
+				if !grant.Enabled {
+					result = append(result[:idx], result[idx+1:]...)
+					byServer = make(map[uuid.UUID]int, len(result))
+					for i := range result {
+						byServer[result[i].Server.ID] = i
+					}
+					continue
+				}
+				result[idx].ToolAllow = decodeGrantStringList(grant.ToolAllow)
+				result[idx].ToolDeny = decodeGrantStringList(grant.ToolDeny)
+				continue
+			}
+			if !grant.Enabled {
+				continue
+			}
+			server, err := s.GetServer(ctx, grant.ServerID)
+			if err != nil || server == nil || !server.Enabled {
+				continue
+			}
+			result = append(result, store.MCPAccessInfo{
+				Server:    *server,
+				ToolAllow: decodeGrantStringList(grant.ToolAllow),
+				ToolDeny:  decodeGrantStringList(grant.ToolDeny),
+			})
+		}
+	}
+	return result, nil
+}
+
+func decodeGrantStringList(raw json.RawMessage) []string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var list []string
+	_ = json.Unmarshal(raw, &list)
+	return list
+}
+
+// scanAccessibleRows decodes the shared SELECT projection used by both the
+// system-user (no per-user-grant filter) and external-user paths of
+// ListAccessible. Kept private so callers go through ListAccessible.
+func (s *PGMCPServerStore) scanAccessibleRows(rows *sql.Rows) ([]store.MCPAccessInfo, error) {
+	defer rows.Close()
+
+	result := make([]store.MCPAccessInfo, 0)
+	for rows.Next() {
+		var srv store.MCPServerData
+		var displayName, command, url, apiKey, toolPrefix *string
+		var args, headers, env *[]byte
+		var toolAllowJSON, toolDenyJSON *[]byte
+
+		if err := rows.Scan(
+			&srv.ID, &srv.Name, &displayName, &srv.Transport, &command,
+			&args, &url, &headers, &env,
+			&apiKey, &toolPrefix, &srv.TimeoutSec,
+			&srv.Settings, &srv.Enabled, &srv.CreatedBy, &srv.CreatedAt, &srv.UpdatedAt,
+			&toolAllowJSON, &toolDenyJSON,
+		); err != nil {
+			continue
+		}
+		srv.DisplayName = derefStr(displayName)
+		srv.Command = derefStr(command)
+		srv.URL = derefStr(url)
+		srv.ToolPrefix = derefStr(toolPrefix)
+		srv.Args = derefBytes(args)
+		srv.Headers = s.decryptJSONB(derefBytes(headers))
+		srv.Env = s.decryptJSONB(derefBytes(env))
+		if apiKey != nil && *apiKey != "" && s.encKey != "" {
+			if decrypted, err := crypto.Decrypt(*apiKey, s.encKey); err == nil {
+				srv.APIKey = decrypted
+			}
+		} else {
+			srv.APIKey = derefStr(apiKey)
+		}
+
+		info := store.MCPAccessInfo{Server: srv}
+		if toolAllowJSON != nil {
+			json.Unmarshal(*toolAllowJSON, &info.ToolAllow)
+		}
+		if toolDenyJSON != nil {
+			json.Unmarshal(*toolDenyJSON, &info.ToolDeny)
+		}
+		result = append(result, info)
+	}
+	return result, nil
+}
+
+// --- Access Requests ---
+
+func (s *PGMCPServerStore) CreateRequest(ctx context.Context, req *store.MCPAccessRequest) error {
+	if err := store.ValidateUserID(req.RequestedBy); err != nil {
+		return err
+	}
+	if req.ID == uuid.Nil {
+		req.ID = store.GenNewID()
+	}
+	req.Status = "pending"
+	req.CreatedAt = time.Now()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO mcp_access_requests (id, server_id, agent_id, user_id, scope, status, reason, tool_allow, requested_by, created_at, tenant_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		req.ID, req.ServerID, nilUUID(req.AgentID), nilStr(req.UserID),
+		req.Scope, req.Status, nilStr(req.Reason),
+		jsonOrNull(req.ToolAllow), req.RequestedBy, req.CreatedAt, tenantIDForInsert(ctx),
+	)
+	return err
+}
+
+func (s *PGMCPServerStore) ListPendingRequests(ctx context.Context) ([]store.MCPAccessRequest, error) {
+	tClause, tArgs, _, err := scopeClause(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	var scanned []mcpAccessRequestRow
+	if err := pkgSqlxDB.SelectContext(ctx, &scanned,
+		`SELECT id, server_id, agent_id, user_id, scope, status, reason, tool_allow, requested_by,
+		 reviewed_by, reviewed_at, review_note, created_at
+		 FROM mcp_access_requests WHERE status = 'pending'`+tClause+` ORDER BY created_at`,
+		tArgs...); err != nil {
+		return nil, err
+	}
+	result := make([]store.MCPAccessRequest, 0, len(scanned))
+	for i := range scanned {
+		result = append(result, scanned[i].toMCPAccessRequest())
+	}
+	return result, nil
+}
+
+func (s *PGMCPServerStore) ReviewRequest(ctx context.Context, requestID uuid.UUID, approved bool, reviewedBy, note string) error {
+	if err := store.ValidateUserID(reviewedBy); err != nil {
+		return err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Load the request
+	var req store.MCPAccessRequest
+	var agentID *uuid.UUID
+	var userID *string
+	tClause, tArgs, _, err2 := scopeClause(ctx, 2)
+	if err2 != nil {
+		return err2
+	}
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, server_id, agent_id, user_id, scope, status, tool_allow
+		 FROM mcp_access_requests WHERE id = $1 AND status = 'pending'`+tClause,
+		append([]any{requestID}, tArgs...)...,
+	).Scan(&req.ID, &req.ServerID, &agentID, &userID, &req.Scope, &req.Status, &req.ToolAllow)
+	if err != nil {
+		return fmt.Errorf("request not found or not pending: %w", err)
+	}
+
+	status := "rejected"
+	if approved {
+		status = "approved"
+	}
+	now := time.Now()
+
+	// Update request status
+	_, err = tx.ExecContext(ctx,
+		`UPDATE mcp_access_requests SET status = $1, reviewed_by = $2, reviewed_at = $3, review_note = $4 WHERE id = $5`,
+		status, reviewedBy, now, nilStr(note), requestID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// If approved, insert the grant
+	if approved {
+		switch req.Scope {
+		case "agent":
+			if agentID == nil {
+				return fmt.Errorf("agent_id required for agent scope")
+			}
+			_, err = tx.ExecContext(ctx,
+				`INSERT INTO mcp_agent_grants (id, server_id, agent_id, enabled, tool_allow, granted_by, created_at, tenant_id)
+				 VALUES ($1,$2,$3,true,$4,$5,$6,$7)
+				 ON CONFLICT (server_id, agent_id) DO UPDATE SET enabled = true, tool_allow = EXCLUDED.tool_allow, granted_by = EXCLUDED.granted_by`,
+				store.GenNewID(), req.ServerID, *agentID, jsonOrNull(req.ToolAllow), reviewedBy, now, tenantIDForInsert(ctx),
+			)
+		case "user":
+			if userID == nil || *userID == "" {
+				return fmt.Errorf("user_id required for user scope")
+			}
+			_, err = tx.ExecContext(ctx,
+				`INSERT INTO mcp_user_grants (id, server_id, user_id, enabled, tool_allow, granted_by, created_at, tenant_id)
+				 VALUES ($1,$2,$3,true,$4,$5,$6,$7)
+				 ON CONFLICT (server_id, user_id) DO UPDATE SET enabled = true, tool_allow = EXCLUDED.tool_allow, granted_by = EXCLUDED.granted_by`,
+				store.GenNewID(), req.ServerID, *userID, jsonOrNull(req.ToolAllow), reviewedBy, now, tenantIDForInsert(ctx),
+			)
+		default:
+			return fmt.Errorf("unknown scope: %s", req.Scope)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}

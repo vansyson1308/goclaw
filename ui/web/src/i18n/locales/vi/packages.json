@@ -1,0 +1,125 @@
+{
+  "title": "Runtime & Gói phần mềm",
+  "description": "Quản lý runtime và các gói đã cài đặt bên trong container GoClaw đang hoạt động",
+  "runtimes": {
+    "title": "Runtimes",
+    "scopeTitle": "Trạng thái runtime theo container",
+    "scopeDesc": "Các kiểm tra này chạy bên trong container runtime GoClaw hiện tại. Runtime cài trên máy host, thay đổi shell profile và binary do nvm quản lý sẽ không được dùng ở đây.",
+    "minimalImageHint": "Image latest được phát hành có Python nhưng chưa có Node. Dùng image full để có Node/npm và extras, dùng base cho image nhỏ nhất, build lại với ENABLE_NODE=true / ENABLE_FULL_SKILLS=true, hoặc cài runtime trực tiếp trong container này.",
+    "available": "Sẵn sàng",
+    "missing": "Chưa cài",
+    "missingInContainer": "Thiếu trong container"
+  },
+  "system": {
+    "title": "Gói hệ thống",
+    "placeholder": "Tên gói (vd: github-cli)"
+  },
+  "pip": {
+    "title": "Gói Python",
+    "placeholder": "Tên gói (vd: pandas)"
+  },
+  "npm": {
+    "title": "Gói Node",
+    "placeholder": "Tên gói (vd: typescript)"
+  },
+  "github": {
+    "title": "Binary GitHub",
+    "placeholder": "owner/repo[@tag] (vd: cli/cli@v2.45.0)",
+    "browse": "Xem release",
+    "muslWarning": "Alpine Linux dùng musl libc. Binary biên dịch với glibc có thể fail runtime. Chọn binary static hoặc release musl-compatible.",
+    "muslDismiss": "Đóng",
+    "pickerTitle": "Chọn release từ {{repo}}",
+    "pickerEmpty": "Không tìm thấy release cho {{repo}}",
+    "pickerLoading": "Đang tải releases...",
+    "pickerMatchingAssets": "{{count}} phù hợp / {{total}} tổng",
+    "pickerPrerelease": "Pre-release",
+    "pickerSelect": "Chọn",
+    "columns": {
+      "repo": "Repository",
+      "tag": "Phiên bản",
+      "binaries": "Binaries",
+      "installedAt": "Ngày cài"
+    }
+  },
+  "updates": {
+    "available": "{{count}} cập nhật khả dụng",
+    "none": "Tất cả gói đã mới nhất",
+    "refresh": "Làm mới",
+    "refreshing": "Đang làm mới...",
+    "lastCheckedAgo": "Kiểm tra lần cuối {{ago}}",
+    "neverChecked": "Chưa kiểm tra",
+    "update": "Cập nhật",
+    "updateAll": "Cập nhật tất cả",
+    "updating": "Đang cập nhật {{name}}...",
+    "updateSucceeded": "{{name}} đã cập nhật lên {{version}}",
+    "updateFailed": "Cập nhật {{name}} thất bại: {{reason}}",
+    "updateAllResult": "{{succeeded}} thành công, {{failed}} thất bại",
+    "confirmAllTitle": "Cập nhật {{count}} gói?",
+    "confirmAllBody": "Quá trình có thể mất vài phút. Các gói được cập nhật tuần tự.",
+    "selected": "{{count}} đã chọn",
+    "manifestDesyncWarn": "Binary đã cập nhật nhưng lưu manifest thất bại. Cần khôi phục thủ công cho {{name}}.",
+    "cacheStale": "Cache cập nhật đã cũ. Hãy làm mới trước.",
+    "adminOnly": "Cần quyền quản trị viên",
+    "empty": "Không có bản cập nhật",
+    "source": {
+      "github": "GitHub",
+      "pip": "pip",
+      "npm": "npm",
+      "apk": "apk"
+    },
+    "filter": {
+      "all": "Tất cả nguồn",
+      "label": "Lọc"
+    },
+    "unavailable": {
+      "pip": "Chưa cài pip",
+      "npm": "Chưa cài npm",
+      "apk": "apk không khả dụng trên hệ thống"
+    },
+    "button": {
+      "tooltip": {
+        "github": "Cập nhật từ bản phát hành GitHub",
+        "pip": "Cập nhật qua pip",
+        "npm": "Cập nhật qua npm",
+        "apk": "Cập nhật qua apk (gói hệ thống)"
+      }
+    },
+    "summary": {
+      "perSource": "{{source}}: {{count}}"
+    }
+  },
+  "actions": {
+    "install": "Cài đặt",
+    "uninstall": "Gỡ bỏ",
+    "installing": "Đang cài...",
+    "uninstalling": "Đang gỡ..."
+  },
+  "messages": {
+    "installSuccess": "Đã cài {{name}} thành công",
+    "installError": "Cài {{name}} thất bại",
+    "uninstallSuccess": "Đã gỡ {{name}} thành công",
+    "uninstallError": "Gỡ {{name}} thất bại"
+  },
+  "confirmUninstall": {
+    "title": "Xác nhận gỡ bỏ",
+    "description": "Bạn có chắc muốn gỡ {{name}}? Thao tác này không thể hoàn tác."
+  },
+  "table": {
+    "name": "Tên",
+    "version": "Phiên bản",
+    "actions": "Thao tác",
+    "empty": "Chưa có gói nào được cài"
+  },
+  "tabs": {
+    "system": "Hệ thống",
+    "python": "Python",
+    "node": "Node",
+    "github": "GitHub",
+    "cliCredentials": "Thông tin CLI"
+  },
+  "runtimesHeader": {
+    "title": "Runtimes",
+    "available": "Sẵn sàng",
+    "missing": "Chưa cài"
+  }
+}

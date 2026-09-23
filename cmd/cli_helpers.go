@@ -1,38 +1,20 @@
 package cmd
 
-import (
-	"fmt"
-	"os"
+import "net/http"
 
-	"github.com/nextlevelbuilder/goclaw/internal/config"
-)
+// requireGateway exits with a helpful error if the gateway is not reachable.
+// Uses HTTP /health endpoint (faster and doesn't require WS handshake).
+func requireGateway() {
+	requireRunningGatewayHTTP()
+}
 
-// isManagedMode returns true if the config specifies managed (Postgres) mode.
-func isManagedMode() bool {
-	cfg, err := config.Load(resolveConfigPath())
+// isGatewayReachable checks if the gateway is up via HTTP health endpoint.
+func isGatewayReachable() bool {
+	base := resolveGatewayBaseURL()
+	resp, err := healthClient.Get(base + "/health")
 	if err != nil {
 		return false
 	}
-	return cfg.Database.Mode == "managed" && cfg.Database.PostgresDSN != ""
-}
-
-// requireGatewayForManaged exits with a helpful error if managed mode is active
-// and the gateway is not reachable.
-func requireGatewayForManaged() {
-	if !isManagedMode() {
-		return
-	}
-	if !isGatewayReachable() {
-		fmt.Fprintln(os.Stderr, "Error: managed mode requires the gateway to be running.")
-		fmt.Fprintln(os.Stderr, "Start it first:  goclaw")
-		os.Exit(1)
-	}
-}
-
-// isGatewayReachable tries a quick RPC ping to check if the gateway is up.
-func isGatewayReachable() bool {
-	_, err := gatewayRPC("ping", nil)
-	// Any response (even error) means the gateway is up.
-	// Only connection failure means it's down.
-	return err == nil
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
