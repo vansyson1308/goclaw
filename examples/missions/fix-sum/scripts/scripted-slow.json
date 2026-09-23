@@ -1,0 +1,7 @@
+{
+  "model": "scripted-slow",
+  "steps": [
+    {"tool_calls": [{"name": "exec", "arguments": {"command": "sleep 97"}}]},
+    {"text": "Finished waiting."}
+  ]
+}

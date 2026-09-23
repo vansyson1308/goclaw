@@ -67,6 +67,23 @@
     "cancelled": "任务已取消",
     "provesChange": "证明变更",
     "baseline": "基线：{{status}}",
-    "expectedTest": "必需测试 {{name}}：{{status}}"
+    "expectedTest": "必需测试 {{name}}：{{status}}",
+    "attempt": "尝试",
+    "usageIncomplete": "某次尝试结束时未上报用量（例如网关重启），因此 token 与费用合计只是下限。",
+    "toolCalls": "工具调用",
+    "toolCallsHint": "每次调用执行前记录。“已开始”但没有结果表示结果从未被确认。",
+    "noToolCalls": "没有记录到工具调用。",
+    "receiptAttempt": "#",
+    "receiptTool": "工具",
+    "receiptClass": "类别",
+    "receiptStatus": "结果",
+    "receiptDuration": "耗时"
+  },
+  "costAtLeast": "至少 {{value}}",
+  "receipt": {
+    "denied": "已拒绝",
+    "started": "已开始（无结果）",
+    "ok": "成功",
+    "error": "错误"
   }
 }

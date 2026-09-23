@@ -1,0 +1,51 @@
+{
+  "model": "scripted-slow-fix",
+  "steps": [
+    {
+      "tool_calls": [
+        {
+          "name": "exec",
+          "arguments": {
+            "command": "sleep 8"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "name": "read_file",
+          "arguments": {
+            "path": "sum.go"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "name": "edit",
+          "arguments": {
+            "path": "sum.go",
+            "old_string": "\t\tif x > 0 {\n\t\t\ttotal += x\n\t\t}\n",
+            "new_string": "\t\ttotal += x\n"
+          }
+        }
+      ]
+    },
+    {
+      "tool_calls": [
+        {
+          "name": "write_file",
+          "arguments": {
+            "path": "sum_negative_test.go",
+            "content": "package sum\n\nimport \"testing\"\n\nfunc TestSumNegative(t *testing.T) {\n\tif got := Sum([]int{5, -2}); got != 3 {\n\t\tt.Fatalf(\"got %d, want 3\", got)\n\t}\n}\n"
+          }
+        }
+      ]
+    },
+    {
+      "text": "Fixed Sum to include negative numbers and added TestSumNegative."
+    }
+  ]
+}

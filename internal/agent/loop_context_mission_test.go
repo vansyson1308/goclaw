@@ -15,7 +15,7 @@ func TestInjectContext_MissionWorkspacePinsToolWorkspace(t *testing.T) {
 	if err := os.MkdirAll(ws, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	req := &RunRequest{SessionKey: "agent:worker:mission:m1", UserID: "u1", MissionWorkspace: ws}
+	req := &RunRequest{SessionKey: "agent:worker:mission:m1", UserID: "u1", MissionWorkspace: ws, ToolGuard: allowAllGuard{}}
 	setup, err := newArtifactTestLoop(root).injectContext(context.Background(), req)
 	if err != nil {
 		t.Fatalf("injectContext: %v", err)
@@ -30,17 +30,27 @@ func TestInjectContext_MissionWorkspacePinsToolWorkspace(t *testing.T) {
 	if got := tools.ToolTeamWorkspaceFromCtx(setup.ctx); got != "" {
 		t.Fatalf("mission run has a team workspace %q", got)
 	}
+	if tools.CallGuardFromContext(setup.ctx) == nil {
+		t.Fatal("mission run has no tool guard installed")
+	}
+}
+
+type allowAllGuard struct{}
+
+func (allowAllGuard) Begin(context.Context, string, map[string]any) (func(bool), error) {
+	return func(bool) {}, nil
 }
 
 func TestInjectContext_MissionWorkspaceFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	loop := newArtifactTestLoop(root)
 	cases := map[string]*RunRequest{
-		"missing dir":   {SessionKey: "s", UserID: "u", MissionWorkspace: filepath.Join(root, "nope")},
-		"relative path": {SessionKey: "s", UserID: "u", MissionWorkspace: "rel/ws"},
-		"with team ws":  {SessionKey: "s", UserID: "u", MissionWorkspace: root, TeamWorkspace: filepath.Join(root, "team")},
-		"with team id":  {SessionKey: "s", UserID: "u", MissionWorkspace: root, TeamID: "00000000-0000-0000-0000-000000000001"},
-		"with leader":   {SessionKey: "s", UserID: "u", MissionWorkspace: root, LeaderAgentID: "lead"},
+		"missing dir":   {SessionKey: "s", UserID: "u", MissionWorkspace: filepath.Join(root, "nope"), ToolGuard: allowAllGuard{}},
+		"relative path": {SessionKey: "s", UserID: "u", MissionWorkspace: "rel/ws", ToolGuard: allowAllGuard{}},
+		"without guard": {SessionKey: "s", UserID: "u", MissionWorkspace: root},
+		"with team ws":  {SessionKey: "s", UserID: "u", MissionWorkspace: root, TeamWorkspace: filepath.Join(root, "team"), ToolGuard: allowAllGuard{}},
+		"with team id":  {SessionKey: "s", UserID: "u", MissionWorkspace: root, TeamID: "00000000-0000-0000-0000-000000000001", ToolGuard: allowAllGuard{}},
+		"with leader":   {SessionKey: "s", UserID: "u", MissionWorkspace: root, LeaderAgentID: "lead", ToolGuard: allowAllGuard{}},
 	}
 	for name, req := range cases {
 		if _, err := loop.injectContext(context.Background(), req); err == nil {

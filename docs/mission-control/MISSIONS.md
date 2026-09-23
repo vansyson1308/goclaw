@@ -36,7 +36,8 @@ A **mission** is a durable, verifiable unit of work. It has an objective, an iso
      "must_change": true, "overlay_dir": "sumrepo-acceptance", "expect_tests": ["TestAcceptanceSumIncludesNegatives"]},
     {"id": "regression-test", "description": "a regression test was added", "kind": "file_changed", "glob": "*_test.go"}
   ],
-  "limits": {"max_iterations": 30, "timeout_seconds": 900, "max_cost_usd": 1.0}
+  "limits": {"max_iterations": 30, "timeout_seconds": 900, "max_cost_usd": 1.0,
+             "max_tokens": 200000, "max_attempts": 2, "tools": ["read_file", "list_files", "write_file", "edit", "exec"]}
 }
 ```
 
@@ -73,7 +74,25 @@ planned → preparing → running → verifying → succeeded | partial | failed
 
 Precedence: `blocked` wins over `failed` when a criterion could not be evaluated, even if the agent run also failed, because the evidence is incomplete. A failed or over-budget run can never be `succeeded` or `partial`.
 
-A mission that was running when the process died is marked `failed` with reason `interrupted` at startup. Durable resume arrives in Phase D.
+## Durability (attempts, leases, recovery)
+
+- **Claim.** A worker claims a planned mission by moving it to `preparing`. This increments `attempt` and sets a lease `(lease_owner, lease_expires_at)`. `max_attempts` (default 2, at most 5) bounds how many attempts may be claimed.
+- **Heartbeat.** The worker renews the lease every TTL/3 (`GOCLAW_MISSIONS_LEASE_SECONDS`, default 60). If the lease is lost (cancelled from any gateway, or taken over after a partition), or cannot be renewed for a full TTL, the worker stops its run immediately.
+- **Fencing.** Every transition and every tool receipt is conditional on `(lease_owner, attempt)`. A stale worker cannot overwrite a newer attempt and cannot run tools.
+- **Recovery** runs at startup and every TTL/2, on every gateway:
+  - planned and unleased: started;
+  - active with an expired lease: requeued for a fresh attempt, or `failed` ("no attempts left");
+  - a live lease held by another gateway: left alone.
+- **Fresh attempts.** Each attempt works in `attempt-<n>/workspace`, copied from the pinned source. A retried attempt never sees what a crashed attempt did; the old attempt directory is kept for inspection. Retries start a new agent conversation, not a mid-run resume. Only lost attempts are retried; a verification failure is final.
+- **Usage.** Totals are summed across attempts. `usage_incomplete` is set when an attempt ended without reporting usage, and the totals are then a lower bound. Cost stays unknown rather than being summed as zero.
+- A graceful shutdown behaves like a crash: the mission continues after the lease expires (crash-only design).
+
+## Tools and receipts
+
+- **Allowlist.** A mission's agent may only call tools in `limits.tools` (default: `read_file`, `list_files`, `write_file`, `edit`, `exec`, `datetime`; `web_fetch`/`web_search`/`read_document` can be enabled). Messaging, scheduling, delegation, memory, skills, MCP and every other tool are refused. Their effects leave the workspace and could not be safely repeated on retry.
+- **Receipts.** Every call, allowed or denied, gets a receipt `(attempt, seq, tool, class, status, args digest, duration)`. The receipt is written **before** the call runs and is fenced by the lease. If it cannot be written, the call is refused, so no side effect happens without a durable record. `started` without a later `ok`/`error` means the outcome was never acknowledged (for example, a crash mid-call).
+- **Providers.** Providers that execute their own tools (Claude CLI, ACP) are refused for missions, because the guard cannot see those calls.
+- **Budget.** `limits.max_tokens` stops the run before the model call that would start over budget.
 
 ## Workspace and evidence
 
@@ -114,6 +133,7 @@ Verifier commands **execute code the agent wrote** (a `go test` compiles the age
 - `GET /v1/missions`: list
 - `GET /v1/missions/{id}`
 - `GET /v1/missions/{id}/events`
+- `GET /v1/missions/{id}/receipts`
 - `POST /v1/missions/{id}/cancel`
 
 **CLI**
@@ -123,4 +143,4 @@ Verifier commands **execute code the agent wrote** (a `go test` compiles the age
 - `goclaw mission cancel <id>`
 
 **Web**
-- Missions page: list; create from a contract; detail with criteria, evidence, diff, usage and events.
+- Missions page: list; create from a contract; detail with criteria, evidence, diff, usage (with attempt and lower-bound marking), tool calls and events.

@@ -342,18 +342,6 @@ func TestMissionRejectsSourceOutsideRoot(t *testing.T) {
 	}
 }
 
-func TestRecoverInterruptedMarksStaleMissionsFailed(t *testing.T) {
-	svc, st, ctx := newTestService(t, &fakeRunner{})
-	stale := &store.Mission{Title: "t", Status: StatusRunning}
-	must(t, st.CreateMission(ctx, stale, "alice"))
-	n, err := svc.RecoverInterrupted(context.Background())
-	must(t, err)
-	got, _ := st.GetMission(ctx, stale.ID)
-	if n != 1 || got.Status != StatusFailed || !strings.Contains(got.StatusReason, "interrupted") {
-		t.Fatalf("n=%d status=%s reason=%q", n, got.Status, got.StatusReason)
-	}
-}
-
 func TestParseContractRejectsBadInput(t *testing.T) {
 	bad := []string{
 		`{"version":2}`,

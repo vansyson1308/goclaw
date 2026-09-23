@@ -38,6 +38,7 @@ func (h *MissionsHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/missions", requireAuth(permissions.RoleOperator, h.handleCreate))
 	mux.HandleFunc("GET /v1/missions/{id}", requireAuth(permissions.RoleViewer, h.handleGet))
 	mux.HandleFunc("GET /v1/missions/{id}/events", requireAuth(permissions.RoleViewer, h.handleEvents))
+	mux.HandleFunc("GET /v1/missions/{id}/receipts", requireAuth(permissions.RoleViewer, h.handleReceipts))
 	mux.HandleFunc("POST /v1/missions/{id}/cancel", requireAuth(permissions.RoleOperator, h.handleCancel))
 }
 
@@ -119,6 +120,28 @@ func (h *MissionsHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		events = []store.MissionEvent{}
 	}
 	writeJSON(w, http.StatusOK, events)
+}
+
+// handleReceipts lists the tool calls of every attempt, in order. Arguments
+// are only stored as digests.
+func (h *MissionsHandler) handleReceipts(w http.ResponseWriter, r *http.Request) {
+	id, ok := missionID(w, r)
+	if !ok {
+		return
+	}
+	if m, err := h.store.GetMission(r.Context(), id); err != nil || m == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "mission not found"})
+		return
+	}
+	recs, err := h.store.ListMissionReceipts(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if recs == nil {
+		recs = []store.MissionReceipt{}
+	}
+	writeJSON(w, http.StatusOK, recs)
 }
 
 func (h *MissionsHandler) handleCancel(w http.ResponseWriter, r *http.Request) {

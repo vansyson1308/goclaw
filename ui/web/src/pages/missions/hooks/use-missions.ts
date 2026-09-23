@@ -1,12 +1,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 import { useHttp } from "@/hooks/use-ws";
-import { ACTIVE_MISSION_STATUSES, type Mission, type MissionEvent } from "@/types/mission";
+import { ACTIVE_MISSION_STATUSES, type Mission, type MissionEvent, type MissionReceipt } from "@/types/mission";
 
 const keys = {
   list: ["missions", "list"] as const,
   detail: (id: string) => ["missions", "detail", id] as const,
   events: (id: string) => ["missions", "events", id] as const,
+  receipts: (id: string) => ["missions", "receipts", id] as const,
 };
 
 const isActive = (m?: Mission) => !!m && ACTIVE_MISSION_STATUSES.includes(m.status);
@@ -40,7 +41,18 @@ export function useMission(id: string) {
     queryFn: () => http.get<MissionEvent[]>(`/v1/missions/${id}/events`),
     refetchInterval: isActive(detail.data) ? 2000 : false,
   });
-  return { mission: detail.data, events: events.data ?? [], loading: detail.isLoading, error: detail.error };
+  const receipts = useQuery({
+    queryKey: keys.receipts(id),
+    queryFn: () => http.get<MissionReceipt[]>(`/v1/missions/${id}/receipts`),
+    refetchInterval: isActive(detail.data) ? 2000 : false,
+  });
+  return {
+    mission: detail.data,
+    events: events.data ?? [],
+    receipts: receipts.data ?? [],
+    loading: detail.isLoading,
+    error: detail.error,
+  };
 }
 
 export function useMissionActions() {

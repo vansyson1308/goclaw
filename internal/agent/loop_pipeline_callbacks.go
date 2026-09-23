@@ -380,6 +380,9 @@ func (l *Loop) makeCallLLM(req *RunRequest, emitRun func(AgentEvent)) func(ctx c
 	return func(ctx context.Context, state *pipeline.RunState, chatReq providers.ChatRequest) (*providers.ChatResponse, error) {
 		provider := state.Provider
 		model := state.Model
+		if err := checkRunLimits(req, state, provider); err != nil {
+			return nil, err
+		}
 
 		// Issue 3: surface transient provider retries to the user ("Provider busy,
 		// retrying...") instead of a silent failure ending in a 💔 reaction. The

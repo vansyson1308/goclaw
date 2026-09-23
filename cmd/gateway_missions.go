@@ -19,8 +19,9 @@ import (
 // Missions env configuration. Missions run verifier commands on the host
 // (see docs/mission-control/MISSIONS.md), so they are opt-in.
 const (
-	envMissionsEnabled    = "GOCLAW_MISSIONS"             // "1" enables create/cancel
-	envMissionsSourceRoot = "GOCLAW_MISSIONS_SOURCE_ROOT" // default <data>/mission-sources
+	envMissionsEnabled    = "GOCLAW_MISSIONS"               // "1" enables create/cancel
+	envMissionsSourceRoot = "GOCLAW_MISSIONS_SOURCE_ROOT"   // default <data>/mission-sources
+	envMissionsLease      = "GOCLAW_MISSIONS_LEASE_SECONDS" // default 60; a dead worker's attempt is retried after this
 	envMissionsMax        = "GOCLAW_MISSIONS_MAX_CONCURRENT"
 )
 
@@ -37,15 +38,9 @@ func (d *gatewayDeps) wireMissions(ctx context.Context, sched *scheduler.Schedul
 			slog.Error("missions disabled: configuration error", "error", err)
 		} else {
 			svc = s
-			go func() {
-				rctx, cancel := context.WithTimeout(ctx, time.Minute)
-				defer cancel()
-				if n, err := s.RecoverInterrupted(rctx); err != nil {
-					slog.Warn("missions.recover_failed", "error", err)
-				} else if n > 0 {
-					slog.Warn("missions.recovered_interrupted", "count", n)
-				}
-			}()
+			// Resume queued missions and retry attempts whose worker died
+			// (this process before a restart, or another gateway).
+			go s.RunRecovery(ctx, 0)
 		}
 	}
 	d.server.SetMissionsHandler(httpapi.NewMissionsHandler(d.pgStores.Missions, svc))
@@ -71,8 +66,10 @@ func (d *gatewayDeps) buildMissionService(sched *scheduler.Scheduler) (*mission.
 		return nil, err
 	}
 	maxConc, _ := strconv.Atoi(os.Getenv(envMissionsMax))
+	leaseSec, _ := strconv.Atoi(os.Getenv(envMissionsLease))
 	runner := &schedulerMissionRunner{sched: sched, tenants: d.pgStores.Tenants}
-	svc, err := mission.NewService(mission.Config{SourceRoot: sourceRoot, DataRoot: dataRoot, MaxConcurrent: maxConc},
+	svc, err := mission.NewService(mission.Config{SourceRoot: sourceRoot, DataRoot: dataRoot, MaxConcurrent: maxConc,
+		LeaseTTL: time.Duration(leaseSec) * time.Second},
 		d.pgStores.Missions, runner, mission.HostExecutor{})
 	if err != nil {
 		return nil, err
@@ -100,6 +97,8 @@ func (r *schedulerMissionRunner) RunMission(ctx context.Context, in mission.RunI
 		UserID:           in.UserID,
 		RunID:            in.RunID,
 		MissionWorkspace: in.Workspace,
+		ToolGuard:        in.Guard,
+		TokenBudget:      in.TokenBudget,
 		MaxIterations:    in.MaxIterations,
 		TraceName:        "Mission " + in.RunID,
 		TraceTags:        []string{"mission"},
@@ -114,7 +113,7 @@ func (r *schedulerMissionRunner) RunMission(ctx context.Context, in mission.RunI
 		return nil, outcome.Err
 	}
 	res := outcome.Result
-	out := &mission.RunOutput{Content: res.Content, Iterations: res.Iterations}
+	out := &mission.RunOutput{Content: res.Content, Iterations: res.Iterations, LoopKilled: res.LoopKilled}
 	if res.Usage != nil {
 		out.InputTokens, out.OutputTokens = int64(res.Usage.PromptTokens), int64(res.Usage.CompletionTokens)
 	}

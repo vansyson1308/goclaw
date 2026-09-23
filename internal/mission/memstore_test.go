@@ -118,7 +118,7 @@ func (s *memStore) TransitionMission(ctx context.Context, id uuid.UUID, from []s
 		return nil, fmt.Errorf("%w: %w", store.ErrMissionStateConflict, store.ErrMissionLeaseLost)
 	}
 	if u.Claim != nil && m.Attempt >= m.MaxAttempts {
-		return nil, fmt.Errorf("%w: no attempts left", store.ErrMissionStateConflict)
+		return nil, fmt.Errorf("%w: %w", store.ErrMissionStateConflict, store.ErrMissionNoAttempts)
 	}
 	s.events = append(s.events, store.MissionEvent{MissionID: id, Kind: "transition", FromStatus: m.Status, ToStatus: to, Actor: actor, Message: msg})
 	m.Status = to

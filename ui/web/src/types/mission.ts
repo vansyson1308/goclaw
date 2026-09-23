@@ -46,9 +46,27 @@ export interface Mission {
   /** null/undefined = unknown (unpriced), never assumed zero. */
   cost_usd?: number | null;
   iterations: number;
+  /** An attempt ended without reporting usage: totals are a lower bound. */
+  usage_incomplete?: boolean;
+  attempt: number;
+  max_attempts: number;
   created_at: string;
   started_at?: string | null;
   finished_at?: string | null;
+}
+
+/** One tool call of a mission attempt, written before the call ran. */
+export interface MissionReceipt {
+  attempt: number;
+  seq: number;
+  tool: string;
+  action_class: string;
+  /** "started" without a later outcome means the result was never acknowledged. */
+  status: "denied" | "started" | "ok" | "error";
+  reason?: string;
+  args_digest: string;
+  duration_ms: number;
+  created_at: string;
 }
 
 export interface MissionEvent {

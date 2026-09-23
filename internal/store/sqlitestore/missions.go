@@ -176,7 +176,7 @@ func (s *SQLiteMissionStore) TransitionMission(ctx context.Context, id uuid.UUID
 		return nil, fmt.Errorf("%w: %w (held by %q attempt %d)", store.ErrMissionStateConflict, store.ErrMissionLeaseLost, leaseOwner, attempt)
 	}
 	if u.Claim != nil && attempt >= maxAttempts {
-		return nil, fmt.Errorf("%w: no attempts left (%d/%d)", store.ErrMissionStateConflict, attempt, maxAttempts)
+		return nil, fmt.Errorf("%w: %w (%d/%d)", store.ErrMissionStateConflict, store.ErrMissionNoAttempts, attempt, maxAttempts)
 	}
 	sets := []string{"status = ?", "updated_at = ?", "state_version = state_version + 1"}
 	args := []any{to, nowText()}

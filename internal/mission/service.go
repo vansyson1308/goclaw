@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // Status aliases for readability inside the package.
@@ -44,6 +45,11 @@ type RunInput struct {
 	Message       string
 	Workspace     string
 	MaxIterations int
+	// Guard must be installed on every tool call of the run (allowlist +
+	// write-ahead receipts).
+	Guard tools.CallGuard
+	// TokenBudget caps prompt+completion tokens of the run (0 = none).
+	TokenBudget int64
 }
 
 // RunOutput is what came back from the agent run. CostUSD is nil when the
@@ -54,6 +60,9 @@ type RunOutput struct {
 	OutputTokens int64
 	CostUSD      *float64
 	Iterations   int
+	// LoopKilled is set when the loop detector stopped the run; such a run
+	// cannot count as successful.
+	LoopKilled bool
 }
 
 // AgentRunner executes one agent run pinned to a mission workspace.
@@ -65,13 +74,23 @@ type AgentRunner interface {
 type Config struct {
 	// SourceRoot is the only directory contract source_dir may resolve under.
 	SourceRoot string
-	// DataRoot holds per-mission workspaces: <DataRoot>/<tenant>/<mission>/.
+	// DataRoot holds per-mission workspaces: <DataRoot>/<tenant>/<mission>/attempt-<n>/.
 	DataRoot string
 	// MaxConcurrent bounds simultaneously executing missions (default 1).
 	MaxConcurrent int
+	// WorkerID identifies this process in leases (default host:pid:random).
+	WorkerID string
+	// LeaseTTL is how long a claim survives without a heartbeat (default
+	// 60s). The attempt of a worker that died is retried once it expires.
+	LeaseTTL time.Duration
+	// Now is the clock used for leases (tests).
+	Now func() time.Time
 }
 
-// Service creates, executes, cancels and recovers missions.
+// Service creates, executes, cancels and recovers missions. Several
+// services (gateway processes) may share one store: a mission is executed
+// by whichever worker holds its lease, and every write a worker makes is
+// fenced by (worker, attempt).
 type Service struct {
 	cfg    Config
 	store  store.MissionStore
@@ -80,7 +99,7 @@ type Service struct {
 
 	sem     chan struct{}
 	mu      sync.Mutex
-	running map[uuid.UUID]context.CancelFunc
+	running map[uuid.UUID]context.CancelCauseFunc
 	wg      sync.WaitGroup
 }
 
@@ -95,18 +114,39 @@ func NewService(cfg Config, st store.MissionStore, runner AgentRunner, exec Exec
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 1
 	}
+	if cfg.WorkerID == "" {
+		cfg.WorkerID = defaultWorkerID()
+	}
+	if cfg.LeaseTTL <= 0 {
+		cfg.LeaseTTL = 60 * time.Second
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	if exec == nil {
 		exec = HostExecutor{}
 	}
 	return &Service{
 		cfg: cfg, store: st, runner: runner, exec: exec,
 		sem:     make(chan struct{}, cfg.MaxConcurrent),
-		running: map[uuid.UUID]context.CancelFunc{},
+		running: map[uuid.UUID]context.CancelCauseFunc{},
 	}, nil
+}
+
+func defaultWorkerID() string {
+	host, _ := os.Hostname()
+	return fmt.Sprintf("%s:%d:%s", host, os.Getpid(), uuid.NewString()[:8])
 }
 
 // ErrInvalidContract wraps contract validation failures (HTTP 400).
 var ErrInvalidContract = errors.New("invalid mission contract")
+
+// Causes recorded on an attempt's context when it is stopped.
+var (
+	errCancelled        = errors.New("mission cancelled")
+	errLeaseLost        = errors.New("mission lease lost (cancelled or claimed by another worker)")
+	errLeaseUnrenewable = errors.New("mission lease could not be renewed")
+)
 
 // Create validates the contract, persists the mission and starts it.
 // ctx must carry the tenant; owner is the authenticated creator.
@@ -130,6 +170,7 @@ func (s *Service) Create(ctx context.Context, raw []byte, owner string) (*store.
 		Contract:       c.Canonical(),
 		ContractDigest: c.Digest(),
 		Status:         StatusPlanned,
+		MaxAttempts:    c.Limits.MaxAttempts,
 		Pins:           pinsJSON,
 	}
 	if err := s.store.CreateMission(ctx, m, owner); err != nil {
@@ -139,14 +180,15 @@ func (s *Service) Create(ctx context.Context, raw []byte, owner string) (*store.
 	return m, nil
 }
 
-// Cancel stops a mission that has not finished.
+// Cancel stops a mission that has not finished. A worker in another
+// process notices on its next heartbeat and stops its run.
 func (s *Service) Cancel(ctx context.Context, id uuid.UUID, actor, reason string) (*store.Mission, error) {
 	if reason == "" {
 		reason = "cancelled by " + actor
 	}
 	now := time.Now().UTC()
 	m, err := s.store.TransitionMission(ctx, id, store.MissionActiveStatuses, StatusCancelled, actor, reason,
-		store.MissionUpdate{StatusReason: &reason, FinishedAt: &now})
+		store.MissionUpdate{StatusReason: &reason, FinishedAt: &now, ClearLease: true})
 	if err != nil {
 		return nil, err
 	}
@@ -154,45 +196,35 @@ func (s *Service) Cancel(ctx context.Context, id uuid.UUID, actor, reason string
 	cancel := s.running[id]
 	s.mu.Unlock()
 	if cancel != nil {
-		cancel()
+		cancel(errCancelled)
 	}
 	return m, nil
-}
-
-// RecoverInterrupted marks missions left active by a previous process as
-// failed ("interrupted"). Durable resume is out of scope for v1.
-func (s *Service) RecoverInterrupted(ctx context.Context) (int, error) {
-	active, err := s.store.ListActiveMissionsAllTenants(ctx)
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, m := range active {
-		s.mu.Lock()
-		_, live := s.running[m.ID]
-		s.mu.Unlock()
-		if live {
-			continue
-		}
-		reason := "interrupted: gateway restarted while the mission was " + m.Status
-		now := time.Now().UTC()
-		tctx := store.WithTenantID(ctx, m.TenantID)
-		if _, err := s.store.TransitionMission(tctx, m.ID, store.MissionActiveStatuses, StatusFailed, ActorSystem, reason,
-			store.MissionUpdate{StatusReason: &reason, FinishedAt: &now}); err == nil {
-			n++
-		}
-	}
-	return n, nil
 }
 
 // Wait blocks until all started missions have finished (tests, shutdown).
 func (s *Service) Wait() { s.wg.Wait() }
 
-func (s *Service) start(reqCtx context.Context, id uuid.UUID, c *Contract) {
+func (s *Service) isLive(id uuid.UUID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.running[id]
+	return ok
+}
+
+// start queues a mission for execution in this process. It is a no-op if
+// the mission is already queued or running here.
+func (s *Service) start(reqCtx context.Context, id uuid.UUID, c *Contract) bool {
 	// Detach from the HTTP request; keep tenant, slug and locale.
 	base := context.WithoutCancel(reqCtx)
-	runCtx, cancel := context.WithTimeout(base, time.Duration(c.Limits.TimeoutSeconds)*time.Second+10*time.Minute)
+	bounded, cancelTimeout := context.WithTimeout(base, time.Duration(c.Limits.TimeoutSeconds)*time.Second+10*time.Minute)
+	runCtx, cancel := context.WithCancelCause(bounded)
 	s.mu.Lock()
+	if _, dup := s.running[id]; dup {
+		s.mu.Unlock()
+		cancel(nil)
+		cancelTimeout()
+		return false
+	}
 	s.running[id] = cancel
 	s.mu.Unlock()
 	s.wg.Add(1)
@@ -202,174 +234,33 @@ func (s *Service) start(reqCtx context.Context, id uuid.UUID, c *Contract) {
 			s.mu.Lock()
 			delete(s.running, id)
 			s.mu.Unlock()
-			cancel()
+			cancel(nil)
+			cancelTimeout()
 		}()
 		select {
 		case s.sem <- struct{}{}:
 			defer func() { <-s.sem }()
 		case <-runCtx.Done():
-			// Timed out while queued (or cancelled: then the CAS below is a no-op).
-			s.finish(base, id, StatusPlanned, StatusFailed, "timed out waiting for a free mission slot", store.MissionUpdate{})
+			// Timed out while queued (a cancel makes the CAS below a no-op).
+			s.finishUnleased(base, id, StatusPlanned, StatusFailed, "timed out waiting for a free mission slot", store.MissionUpdate{})
 			return
 		}
 		s.execute(runCtx, id, c)
 	}()
+	return true
 }
 
-// execute drives one mission through its lifecycle. Every transition is a
-// compare-and-set; a conflict (e.g. user cancelled) stops execution quietly.
-func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
-	log := slog.With("mission", id)
-	// Bookkeeping uses a context that outlives run timeouts so the mission
-	// can always reach a terminal state. A user cancel is detected by the
-	// compare-and-set transitions failing, not by context errors.
-	bctx := context.WithoutCancel(ctx)
-	m, err := s.store.GetMission(bctx, id)
-	if err != nil || m == nil {
-		log.Warn("mission.execute: load failed", "error", err)
-		return
-	}
-	started := time.Now().UTC()
-	execName := s.exec.Name()
-	if m, err = s.transition(bctx, id, StatusPlanned, StatusPreparing, "preparing workspace",
-		store.MissionUpdate{StartedAt: &started, Executor: &execName}); err != nil {
-		return
-	}
-
-	var pins Pins
-	if err := json.Unmarshal(m.Pins, &pins); err != nil || pins.Source == "" {
-		s.finish(bctx, id, StatusPreparing, StatusBlocked, "mission inputs were not pinned at creation", store.MissionUpdate{})
-		return
-	}
-	src, err := s.resolveSource(c.Workspace.SourceDir)
-	missionDir := filepath.Join(s.cfg.DataRoot, m.TenantID.String(), id.String())
-	var pw *PreparedWorkspace
-	if err == nil {
-		pw, err = PrepareWorkspace(ctx, src, filepath.Join(missionDir, "workspace"), filepath.Join(missionDir, "base.git"))
-	}
-	if err != nil {
-		s.finish(bctx, id, StatusPreparing, StatusBlocked, "workspace preparation failed: "+err.Error(), store.MissionUpdate{})
-		return
-	}
-	if pw.SourceDigest != pins.Source {
-		s.finish(bctx, id, StatusPreparing, StatusBlocked,
-			fmt.Sprintf("source %q changed since the mission was created (%s, pinned %s)", c.Workspace.SourceDir, pw.SourceDigest, pins.Source), store.MissionUpdate{})
-		return
-	}
-	if len(pw.Skipped) > 0 {
-		s.note(bctx, id, fmt.Sprintf("skipped %d non-regular entries (symlinks/special files)", len(pw.Skipped)), pw.Skipped)
-	}
-	overlays, err := s.resolveOverlays(c)
-	if err != nil {
-		s.finish(bctx, id, StatusPreparing, StatusBlocked, "acceptance overlay unavailable: "+err.Error(), store.MissionUpdate{})
-		return
-	}
-	scratch := filepath.Join(missionDir, "scratch")
-	// The scratch dir (caches, throwaway check copies) is not evidence.
-	defer os.RemoveAll(scratch)
-	env := VerifyEnv{Workspace: pw.Path, Scratch: scratch, Overlays: overlays, OverlayPins: pins.Overlays, Exec: s.exec}
-	// Checks that must prove the change are run on the untouched baseline first.
-	baseline := Baseline(ctx, c, env)
-	if len(baseline) > 0 {
-		s.note(bctx, id, fmt.Sprintf("baseline evaluated for %d must_change check(s)", len(baseline)), baselineSummary(baseline))
-	}
-	if _, err = s.transition(bctx, id, StatusPreparing, StatusRunning, "agent run started",
-		store.MissionUpdate{WorkspacePath: &pw.Path, BaseRevision: &pw.BaseRevision}); err != nil {
-		return
-	}
-
-	runCtx, cancelRun := context.WithTimeout(ctx, time.Duration(c.Limits.TimeoutSeconds)*time.Second)
-	out, runErr := s.runner.RunMission(runCtx, RunInput{
-		TenantID:      m.TenantID,
-		AgentKey:      c.Agent,
-		SessionKey:    fmt.Sprintf("agent:%s:mission:%s", c.Agent, id),
-		RunID:         "mission:" + id.String(),
-		UserID:        m.OwnerID,
-		Message:       BuildPrompt(c),
-		Workspace:     pw.Path,
-		MaxIterations: c.Limits.MaxIterations,
-	})
-	cancelRun()
-	usage := store.MissionUpdate{}
-	var runReason string
-	if out != nil {
-		summary := cleanText(out.Content)
-		usage.Summary = &summary
-		usage.InputTokens, usage.OutputTokens = &out.InputTokens, &out.OutputTokens
-		usage.CostUSD, usage.Iterations = out.CostUSD, &out.Iterations
-		if c.Limits.MaxCostUSD > 0 && out.CostUSD != nil && *out.CostUSD > c.Limits.MaxCostUSD {
-			runReason = fmt.Sprintf("cost limit exceeded: $%.4f > $%.4f", *out.CostUSD, c.Limits.MaxCostUSD)
-		}
-	}
-	if runErr != nil {
-		runReason = "agent run failed: " + runErr.Error()
-	}
-	if _, err = s.transition(bctx, id, StatusRunning, StatusVerifying, "verifying acceptance criteria", usage); err != nil {
-		return
-	}
-
-	// Evidence is collected even when the run failed, so users see real state.
-	diff, diffErr := Diff(bctx, pw)
-	upd := store.MissionUpdate{}
-	if diffErr == nil {
-		env.Changed = diff.Present
-		upd.Diff, upd.DiffTruncated, upd.ChangedFiles = &diff.Patch, &diff.Truncated, orEmpty(diff.ChangedFiles)
-	}
-	results := Verify(ctx, c, env, baseline)
-	if diffErr != nil {
-		results = append(results, CriterionResult{ID: "_diff", Kind: "internal", Status: ResultError,
-			Detail: "could not compute diff: " + cleanText(diffErr.Error()), Executor: s.exec.Name(), ContractDigest: c.Digest()})
-	} else if findings := IntegrityFindings(diff, diff.Full); len(findings) > 0 {
-		// Verifier commands execute agent-written code; changes that can
-		// subvert them need a human to confirm the checks are meaningful.
-		results = append(results, CriterionResult{ID: "_integrity", Kind: "internal", Status: ResultError,
-			Detail: "needs human review: " + strings.Join(findings, "; "), Executor: s.exec.Name(), ContractDigest: c.Digest()})
-	}
-	verification, _ := json.Marshal(results)
-	upd.Verification = verification
-
-	final := Outcome(results)
-	reason := summarizeOutcome(results)
-	if c.Limits.MaxCostUSD > 0 && (out == nil || out.CostUSD == nil) && (final == StatusSucceeded || final == StatusPartial) {
-		// Unknown is not zero: the limit cannot be shown to hold.
-		final = StatusBlocked
-		reason = "cost limit is set but the run reported no cost, so the limit cannot be verified; " + reason
-	}
-	if runReason != "" {
-		// A failed or over-budget run cannot be reported as success even if
-		// the checks happen to pass.
-		if final == StatusSucceeded || final == StatusPartial {
-			final = StatusFailed
-		}
-		reason = runReason + "; " + reason
-	}
-	s.finish(bctx, id, StatusVerifying, final, reason, upd)
-}
-
-func (s *Service) transition(ctx context.Context, id uuid.UUID, from, to, msg string, u store.MissionUpdate) (*store.Mission, error) {
-	m, err := s.store.TransitionMission(ctx, id, []string{from}, to, ActorSystem, msg, u)
-	if err != nil && !errors.Is(err, store.ErrMissionStateConflict) {
-		slog.Warn("mission.transition failed", "mission", id, "from", from, "to", to, "error", err)
-	}
-	return m, err
-}
-
-func (s *Service) finish(ctx context.Context, id uuid.UUID, from, to, reason string, u store.MissionUpdate) {
+// finishUnleased ends a mission that no worker holds (queued/planned).
+func (s *Service) finishUnleased(ctx context.Context, id uuid.UUID, from, to, reason string, u store.MissionUpdate) {
 	now := time.Now().UTC()
 	reason = cleanText(reason)
-	u.FinishedAt, u.StatusReason = &now, &reason
-	// Persist the terminal state even if the run context expired.
+	u.FinishedAt, u.StatusReason, u.ClearLease = &now, &reason, true
 	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	_, err := s.transition(fctx, id, from, to, reason, u)
-	if err == nil || errors.Is(err, store.ErrMissionStateConflict) || errors.Is(err, store.ErrMissionNotFound) {
-		return
+	if _, err := s.store.TransitionMission(fctx, id, []string{from}, to, ActorSystem, reason, u); err != nil &&
+		!errors.Is(err, store.ErrMissionStateConflict) {
+		slog.Warn("mission.finish failed", "mission", id, "to", to, "error", err)
 	}
-	// The evidence itself could not be stored (e.g. rejected content): do
-	// not leave the mission active forever. Record that it could not be
-	// judged, without the payload.
-	msg := cleanText("could not persist verification evidence: " + err.Error())
-	_, _ = s.transition(fctx, id, from, StatusBlocked, msg, store.MissionUpdate{StatusReason: &msg, FinishedAt: &now})
 }
 
 func (s *Service) note(ctx context.Context, id uuid.UUID, msg string, detail any) {
@@ -516,6 +407,7 @@ func BuildPrompt(c *Contract) string {
 			fmt.Fprintf(&b, "- [%s] %s — file %s must contain %q\n", cr.ID, desc, cr.Path, cr.Text)
 		}
 	}
+	fmt.Fprintf(&b, "\nTools available in this mission: %s. Other tools are refused.\n", strings.Join(c.AllowedTools(), ", "))
 	b.WriteString("\nWork only inside your current workspace directory using relative paths. When finished, reply with a short summary of what you changed and which checks you ran.\n")
 	return b.String()
 }

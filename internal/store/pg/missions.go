@@ -312,7 +312,7 @@ func (c missionLockState) check(from []string, u store.MissionUpdate) error {
 		return fmt.Errorf("%w: %w (held by %q attempt %d)", store.ErrMissionStateConflict, store.ErrMissionLeaseLost, c.leaseOwner, c.attempt)
 	}
 	if u.Claim != nil && c.attempt >= c.maxAttempts {
-		return fmt.Errorf("%w: no attempts left (%d/%d)", store.ErrMissionStateConflict, c.attempt, c.maxAttempts)
+		return fmt.Errorf("%w: %w (%d/%d)", store.ErrMissionStateConflict, store.ErrMissionNoAttempts, c.attempt, c.maxAttempts)
 	}
 	return nil
 }

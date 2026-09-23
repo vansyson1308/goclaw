@@ -131,7 +131,7 @@ func MissionLeases(t *testing.T, ms store.MissionStore, ctxA, ctxB context.Conte
 		t.Fatal(err)
 	}
 	if _, err := ms.TransitionMission(ctxA, m.ID, []string{store.MissionPlanned}, store.MissionPreparing, "sys", "claim",
-		store.MissionUpdate{Claim: &store.MissionClaim{Owner: "worker-3", Until: now.Add(time.Minute)}}); !errors.Is(err, store.ErrMissionStateConflict) {
+		store.MissionUpdate{Claim: &store.MissionClaim{Owner: "worker-3", Until: now.Add(time.Minute)}}); !errors.Is(err, store.ErrMissionStateConflict) || !errors.Is(err, store.ErrMissionNoAttempts) {
 		t.Fatalf("claim beyond max attempts: want conflict, got %v", err)
 	}
 	// Terminal transition with ClearLease leaves no lease behind.

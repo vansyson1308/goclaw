@@ -67,6 +67,23 @@
     "cancelled": "Mission cancelled",
     "provesChange": "proves change",
     "baseline": "baseline: {{status}}",
-    "expectedTest": "expected test {{name}}: {{status}}"
+    "expectedTest": "expected test {{name}}: {{status}}",
+    "attempt": "Attempt",
+    "usageIncomplete": "An attempt ended without reporting its usage (for example the gateway restarted), so token and cost totals are a lower bound.",
+    "toolCalls": "Tool calls",
+    "toolCallsHint": "Recorded before each call ran. \"Started\" without an outcome means the result was never acknowledged.",
+    "noToolCalls": "No tool calls recorded.",
+    "receiptAttempt": "#",
+    "receiptTool": "Tool",
+    "receiptClass": "Class",
+    "receiptStatus": "Result",
+    "receiptDuration": "Duration"
+  },
+  "costAtLeast": "at least {{value}}",
+  "receipt": {
+    "denied": "denied",
+    "started": "started (no outcome)",
+    "ok": "ok",
+    "error": "error"
   }
 }

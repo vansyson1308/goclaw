@@ -67,6 +67,23 @@
     "cancelled": "Đã hủy nhiệm vụ",
     "provesChange": "chứng minh thay đổi",
     "baseline": "baseline: {{status}}",
-    "expectedTest": "test yêu cầu {{name}}: {{status}}"
+    "expectedTest": "test yêu cầu {{name}}: {{status}}",
+    "attempt": "Lần chạy",
+    "usageIncomplete": "Có một lần chạy kết thúc mà không báo cáo mức sử dụng (ví dụ gateway khởi động lại), nên tổng token và chi phí chỉ là giới hạn dưới.",
+    "toolCalls": "Lệnh gọi công cụ",
+    "toolCallsHint": "Được ghi lại trước khi mỗi lệnh chạy. \"Đã bắt đầu\" mà không có kết quả nghĩa là kết quả chưa từng được xác nhận.",
+    "noToolCalls": "Chưa ghi nhận lệnh gọi công cụ nào.",
+    "receiptAttempt": "#",
+    "receiptTool": "Công cụ",
+    "receiptClass": "Loại",
+    "receiptStatus": "Kết quả",
+    "receiptDuration": "Thời gian"
+  },
+  "costAtLeast": "ít nhất {{value}}",
+  "receipt": {
+    "denied": "bị từ chối",
+    "started": "đã bắt đầu (không có kết quả)",
+    "ok": "ok",
+    "error": "lỗi"
   }
 }

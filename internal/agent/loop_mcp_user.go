@@ -331,7 +331,7 @@ func (l *Loop) executeToolForActor(
 				if pa, ok := t.(tools.PeerKindAware); ok {
 					pa.SetPeerKind(peerKind)
 				}
-				return t.Execute(ctx, args)
+				return tools.GuardedExecute(ctx, t.Name(), args, func() *tools.Result { return t.Execute(ctx, args) })
 			}
 		}
 	}

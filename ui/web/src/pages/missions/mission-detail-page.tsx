@@ -27,7 +27,7 @@ export function MissionDetailPage() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
   const tz = useUiStore((s) => s.timezone);
-  const { mission: m, events, loading, error } = useMission(id);
+  const { mission: m, events, receipts, loading, error } = useMission(id);
   const { cancel } = useMissionActions();
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [showDiff, setShowDiff] = useState(true);
@@ -77,10 +77,12 @@ export function MissionDetailPage() {
 
       <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-sm">
         <Stat label={t("detail.tokens")} value={`${formatTokens(m.input_tokens)} / ${formatTokens(m.output_tokens)}`} />
-        <Stat label={t("detail.cost")} value={formatCost(m.cost_usd, t)} />
+        <Stat label={t("detail.cost")} value={formatCost(m.cost_usd, t, m.usage_incomplete)} />
         <Stat label={t("detail.executor")} value={m.executor || "—"} />
+        <Stat label={t("detail.attempt")} value={`${m.attempt} / ${m.max_attempts}`} />
         <Stat label={t("detail.finished")} value={m.finished_at ? formatDate(m.finished_at, tz) : "—"} />
       </section>
+      {m.usage_incomplete && <p className="text-xs text-amber-600" data-testid="mission-usage-incomplete">{t("detail.usageIncomplete")}</p>}
 
       <section className="space-y-2">
         <h2 className="text-sm font-medium">{t("detail.criteria")}</h2>
@@ -118,6 +120,39 @@ export function MissionDetailPage() {
           <p className="text-sm whitespace-pre-wrap rounded-md bg-muted/40 p-3">{m.summary}</p>
         </section>
       )}
+
+      <section className="space-y-2">
+        <h2 className="text-sm font-medium">{t("detail.toolCalls")}</h2>
+        <p className="text-xs text-muted-foreground">{t("detail.toolCallsHint")}</p>
+        {receipts.length === 0 ? (
+          <p className="text-xs text-muted-foreground">{t("detail.noToolCalls")}</p>
+        ) : (
+          <div className="overflow-x-auto rounded-md border">
+            <table className="w-full text-xs" data-testid="mission-receipts">
+              <thead className="bg-muted/40 text-muted-foreground">
+                <tr>
+                  <th className="px-2 py-1 text-left font-medium">{t("detail.receiptAttempt")}</th>
+                  <th className="px-2 py-1 text-left font-medium">{t("detail.receiptTool")}</th>
+                  <th className="px-2 py-1 text-left font-medium">{t("detail.receiptClass")}</th>
+                  <th className="px-2 py-1 text-left font-medium">{t("detail.receiptStatus")}</th>
+                  <th className="px-2 py-1 text-right font-medium">{t("detail.receiptDuration")}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {receipts.map((r) => (
+                  <tr key={`${r.attempt}-${r.seq}`} data-testid="mission-receipt" data-status={r.status}>
+                    <td className="px-2 py-1 font-mono">{r.attempt}.{r.seq}</td>
+                    <td className="px-2 py-1 font-mono">{r.tool}</td>
+                    <td className="px-2 py-1">{r.action_class}</td>
+                    <td className="px-2 py-1" title={r.reason}>{t(`receipt.${r.status}`)}</td>
+                    <td className="px-2 py-1 text-right">{r.status === "ok" || r.status === "error" ? `${r.duration_ms} ms` : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       <section className="space-y-2">
         <h2 className="text-sm font-medium">{t("detail.events")}</h2>

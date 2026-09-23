@@ -67,6 +67,23 @@
     "cancelled": "미션이 취소되었습니다",
     "provesChange": "변경 증명",
     "baseline": "기준: {{status}}",
-    "expectedTest": "필수 테스트 {{name}}: {{status}}"
+    "expectedTest": "필수 테스트 {{name}}: {{status}}",
+    "attempt": "시도",
+    "usageIncomplete": "사용량을 보고하지 못하고 끝난 시도가 있어(예: 게이트웨이 재시작) 토큰과 비용 합계는 하한값입니다.",
+    "toolCalls": "도구 호출",
+    "toolCallsHint": "각 호출이 실행되기 전에 기록됩니다. 결과 없이 \"시작됨\"이면 결과가 확인되지 않은 것입니다.",
+    "noToolCalls": "기록된 도구 호출이 없습니다.",
+    "receiptAttempt": "#",
+    "receiptTool": "도구",
+    "receiptClass": "분류",
+    "receiptStatus": "결과",
+    "receiptDuration": "소요 시간"
+  },
+  "costAtLeast": "최소 {{value}}",
+  "receipt": {
+    "denied": "거부됨",
+    "started": "시작됨(결과 없음)",
+    "ok": "성공",
+    "error": "오류"
   }
 }

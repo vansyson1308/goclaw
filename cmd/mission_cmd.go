@@ -16,23 +16,26 @@ import (
 
 // missionView mirrors the /v1/missions response fields the CLI prints.
 type missionView struct {
-	ID            string          `json:"id"`
-	Title         string          `json:"title"`
-	AgentKey      string          `json:"agent_key"`
-	Status        string          `json:"status"`
-	StatusReason  string          `json:"status_reason"`
-	Executor      string          `json:"executor"`
-	OwnerID       string          `json:"owner_id"`
-	ChangedFiles  []string        `json:"changed_files"`
-	Diff          string          `json:"diff"`
-	DiffTruncated bool            `json:"diff_truncated"`
-	Verification  json.RawMessage `json:"verification"`
-	Summary       string          `json:"summary"`
-	InputTokens   int64           `json:"input_tokens"`
-	OutputTokens  int64           `json:"output_tokens"`
-	CostUSD       *float64        `json:"cost_usd"`
-	CreatedAt     time.Time       `json:"created_at"`
-	FinishedAt    *time.Time      `json:"finished_at"`
+	ID              string          `json:"id"`
+	Title           string          `json:"title"`
+	AgentKey        string          `json:"agent_key"`
+	Status          string          `json:"status"`
+	StatusReason    string          `json:"status_reason"`
+	Executor        string          `json:"executor"`
+	OwnerID         string          `json:"owner_id"`
+	ChangedFiles    []string        `json:"changed_files"`
+	Diff            string          `json:"diff"`
+	DiffTruncated   bool            `json:"diff_truncated"`
+	Verification    json.RawMessage `json:"verification"`
+	Summary         string          `json:"summary"`
+	InputTokens     int64           `json:"input_tokens"`
+	OutputTokens    int64           `json:"output_tokens"`
+	CostUSD         *float64        `json:"cost_usd"`
+	UsageIncomplete bool            `json:"usage_incomplete"`
+	Attempt         int             `json:"attempt"`
+	MaxAttempts     int             `json:"max_attempts"`
+	CreatedAt       time.Time       `json:"created_at"`
+	FinishedAt      *time.Time      `json:"finished_at"`
 }
 
 type criterionView struct {
@@ -172,7 +175,16 @@ func printMission(m missionView, withDiff bool) {
 	if m.CostUSD != nil {
 		cost = fmt.Sprintf("$%.4f", *m.CostUSD)
 	}
-	fmt.Printf("Usage     %d in / %d out tokens, cost %s\nExecutor  %s\n", m.InputTokens, m.OutputTokens, cost, m.Executor)
+	usage := ""
+	if m.UsageIncomplete {
+		// An attempt ended without reporting usage: totals are a lower bound.
+		usage, cost = " (incomplete: an attempt's usage was lost)", "at least "+cost
+		if m.CostUSD == nil {
+			cost = "unknown"
+		}
+	}
+	fmt.Printf("Usage     %d in / %d out tokens, cost %s%s\nExecutor  %s\nAttempt   %d of %d\n",
+		m.InputTokens, m.OutputTokens, cost, usage, m.Executor, m.Attempt, m.MaxAttempts)
 	var crs []criterionView
 	if len(m.Verification) > 0 && json.Unmarshal(m.Verification, &crs) == nil && len(crs) > 0 {
 		fmt.Println("\nAcceptance criteria:")

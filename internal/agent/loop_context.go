@@ -258,8 +258,12 @@ func (l *Loop) injectContext(ctx context.Context, req *RunRequest) (contextSetup
 		if err != nil || !info.IsDir() || !filepath.IsAbs(req.MissionWorkspace) {
 			return contextSetupResult{}, fmt.Errorf("mission workspace unavailable: %q", req.MissionWorkspace)
 		}
+		if req.ToolGuard == nil {
+			return contextSetupResult{}, fmt.Errorf("mission run requires a tool guard")
+		}
 		ctx = tools.WithToolWorkspace(ctx, filepath.Clean(req.MissionWorkspace))
 		ctx = tools.WithWorkspaceConfined(ctx)
+		ctx = tools.WithCallGuard(ctx, req.ToolGuard)
 	}
 
 	// Team workspace: dispatched task overrides default workspace.

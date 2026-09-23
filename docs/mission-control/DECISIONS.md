@@ -38,3 +38,18 @@
 - **D16 Surface parity.**
   - API, CLI and web: done.
   - Desktop (Lite): the SQLite store and schema v62 exist and compile, but there is no desktop UI for missions in v1. The executor and data-root assumptions target the Standard server edition.
+- **D17 Verifiers do not trust exit codes of agent-written code.** Command checks run code the agent wrote. `expect_tests` requires explicit per-test passes, and an integrity scan blocks diffs that can take over a test binary. The residual risk (forged output from code that discovers hidden test names) is documented rather than claimed prevented. Mission creation is restricted to the master scope until the sandboxed executor exists.
+- **D18 Durability is crash-only, with leases and fencing.**
+  - A worker claims an attempt (`attempt+1`, lease `owner` + expiry) and renews it every TTL/3.
+  - Every write it makes, including each tool receipt, is conditional on `(owner, attempt)`.
+  - A worker stops its run when the lease is lost, or when it cannot renew for a full TTL.
+  - Recovery requeues attempts whose lease expired, while `attempt < max_attempts`; otherwise the mission fails.
+  - A graceful shutdown takes the same path as a crash: the attempt is retried after the lease expires. There is no separate shutdown protocol to get wrong.
+  - Retries start from a fresh copy of the pinned source (`attempt-N/`), never from a partial workspace. Interrupted runs are **not resumed mid-conversation**, because the agent's partial state cannot be trusted.
+  - Verification failures are never retried; only lost attempts are.
+- **D19 Missions allow only side-effect-contained tools.**
+  - The default allowlist is workspace read/write, `exec` and `datetime`. Network reads are opt-in via `limits.tools`.
+  - Messaging, scheduling, delegation, memory, skills, MCP and other external or non-idempotent tools can never be enabled, so retrying an attempt cannot duplicate an external effect.
+  - Every call gets a receipt, written before it runs (fail-closed). A receipt that stays `started` means the outcome is unknown.
+  - Providers that run their own tools (Claude CLI, ACP) are refused for missions, because the guard cannot see their calls.
+  - `limits.max_tokens` is enforced before each model call. Compaction and summarization calls are not counted (documented gap).

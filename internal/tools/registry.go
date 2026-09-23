@@ -224,7 +224,8 @@ func (r *Registry) ExecuteWithContext(ctx context.Context, name string, args map
 	}
 
 	start := time.Now()
-	result := safeExecute(tool, ctx, args)
+	// A run-scoped guard (missions) authorizes and records the call first.
+	result := GuardedExecute(ctx, tool.Name(), args, func() *Result { return safeExecute(tool, ctx, args) })
 	duration := time.Since(start)
 
 	// Scrub credentials from tool output before returning to LLM

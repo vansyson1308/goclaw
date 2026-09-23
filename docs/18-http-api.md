@@ -1026,7 +1026,7 @@ Returns the append-only list of transitions, oldest first:
 
 Verifiable, objective-driven agent work. Design: [mission-control/MISSIONS.md](mission-control/MISSIONS.md).
 
-Missions must be enabled on the gateway with `GOCLAW_MISSIONS=1`. The contract `source_dir` and `overlay_dir` resolve under `GOCLAW_MISSIONS_SOURCE_ROOT` (default `<data>/mission-sources`). While missions are disabled, reads still work and writes return `503`.
+Missions must be enabled on the gateway with `GOCLAW_MISSIONS=1`. `GOCLAW_MISSIONS_LEASE_SECONDS` (default 60) sets how long a crashed worker's attempt holds its lease before another attempt is started. The contract `source_dir` and `overlay_dir` resolve under `GOCLAW_MISSIONS_SOURCE_ROOT` (default `<data>/mission-sources`). While missions are disabled, reads still work and writes return `503`.
 
 | Method | Path | Role | Description |
 |--------|------|------|-------------|
@@ -1034,6 +1034,7 @@ Missions must be enabled on the gateway with `GOCLAW_MISSIONS=1`. The contract `
 | `POST` | `/v1/missions` | operator + master scope | Body: the contract JSON (≤ 64 KiB). Returns `202` with the mission, `400` with the validation reason, or `403` for tenant-scoped callers (verifiers run on the gateway host) |
 | `GET` | `/v1/missions/{id}` | viewer | Full mission: `verification[]`, `diff`, `changed_files`, usage, `cost_usd` (`null` means unknown), `pins` (input digests). `workspace_path` is only returned to the master scope |
 | `GET` | `/v1/missions/{id}/events` | viewer | Append-only timeline (transitions and notes) |
+| `GET` | `/v1/missions/{id}/receipts` | viewer | Tool calls of every attempt: `attempt`, `seq`, `tool`, `action_class`, `status` (`denied`/`started`/`ok`/`error`; `started` alone = outcome unknown), `args_digest`, `duration_ms` |
 | `POST` | `/v1/missions/{id}/cancel` | operator | `409` if the mission already finished |
 
 Each `verification[]` element contains:

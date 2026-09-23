@@ -36,6 +36,10 @@ var ErrMissionNotFound = errors.New("mission not found")
 // It is also an ErrMissionStateConflict.
 var ErrMissionLeaseLost = errors.New("mission lease lost")
 
+// ErrMissionNoAttempts means a claim was refused because attempt has
+// reached max_attempts. It is also an ErrMissionStateConflict.
+var ErrMissionNoAttempts = errors.New("mission has no attempts left")
+
 // Receipt statuses. A "started" receipt without a later ok/error means the
 // tool may have run but its outcome was never acknowledged (crash).
 const (

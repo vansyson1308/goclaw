@@ -33,6 +33,8 @@ const (
 	maxRunTimeout       = 7200
 	defaultMaxIteration = 30
 	maxIterations       = 200
+	defaultMaxAttempts  = 2
+	maxAttemptsLimit    = 5
 )
 
 // Contract is the versioned, immutable description of a mission.
@@ -84,6 +86,14 @@ type Limits struct {
 	MaxIterations  int     `json:"max_iterations,omitempty"`
 	TimeoutSeconds int     `json:"timeout_seconds,omitempty"`
 	MaxCostUSD     float64 `json:"max_cost_usd,omitempty"`
+	// MaxTokens caps prompt+completion tokens of one attempt; the run is
+	// stopped before the next model call once reached. 0 = no cap.
+	MaxTokens int64 `json:"max_tokens,omitempty"`
+	// MaxAttempts bounds how often an interrupted mission (crash, lost
+	// lease) is retried. Verification failures are never retried.
+	MaxAttempts int `json:"max_attempts,omitempty"`
+	// Tools narrows the mission tool allowlist (default: DefaultTools).
+	Tools []string `json:"tools,omitempty"`
 }
 
 // ParseContract decodes and validates a contract, rejecting unknown fields
@@ -156,6 +166,18 @@ func (c *Contract) Validate() error {
 		return fmt.Errorf("limits.timeout_seconds must be 0..%d", maxRunTimeout)
 	case l.MaxCostUSD < 0:
 		return fmt.Errorf("limits.max_cost_usd must be >= 0")
+	case l.MaxTokens < 0:
+		return fmt.Errorf("limits.max_tokens must be >= 0")
+	case l.MaxAttempts < 0 || l.MaxAttempts > maxAttemptsLimit:
+		return fmt.Errorf("limits.max_attempts must be 0..%d", maxAttemptsLimit)
+	}
+	for _, name := range l.Tools {
+		if _, ok := toolClasses[name]; !ok {
+			return fmt.Errorf("limits.tools: %q is not available to missions (allowed: %s)", name, strings.Join(SafeTools(), ", "))
+		}
+	}
+	if l.MaxAttempts == 0 {
+		l.MaxAttempts = defaultMaxAttempts
 	}
 	if l.MaxIterations == 0 {
 		l.MaxIterations = defaultMaxIteration

@@ -684,6 +684,13 @@ type RunRequest struct {
 	// isolated workspace. Unlike TeamWorkspace it is fail-closed: the
 	// directory must already exist and no fallback workspace is used.
 	MissionWorkspace string
+	// ToolGuard authorizes and records every tool call of the run. Required
+	// when MissionWorkspace is set (fail-closed).
+	ToolGuard tools.CallGuard
+	// TokenBudget caps prompt+completion tokens across the run's model
+	// calls; the run fails before the call that would start over budget.
+	// 0 = no cap.
+	TokenBudget int64
 
 	// enrichedInputMessage is populated by the media stage and consumed by the
 	// first persistence checkpoint. It keeps current-turn MediaRefs and logical
