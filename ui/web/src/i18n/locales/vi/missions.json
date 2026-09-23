@@ -1,0 +1,71 @@
+{
+  "title": "Nhiệm vụ",
+  "description": "Giao cho agent một mục tiêu kèm các bước kiểm tra nghiệm thu. Kết quả được đánh giá bằng kiểm tra, không dựa vào lời agent tự nhận.",
+  "newMission": "Nhiệm vụ mới",
+  "disabledTitle": "Tính năng nhiệm vụ đang tắt trên gateway này",
+  "disabledHint": "Đặt GOCLAW_MISSIONS=1 (và GOCLAW_MISSIONS_SOURCE_ROOT) rồi khởi động lại gateway. Lệnh kiểm tra chạy trên executor của máy chủ.",
+  "emptyTitle": "Chưa có nhiệm vụ nào",
+  "emptyDescription": "Tạo nhiệm vụ từ một hợp đồng để xem kết quả đã kiểm chứng tại đây.",
+  "col": {
+    "status": "Trạng thái",
+    "title": "Nhiệm vụ",
+    "agent": "Agent",
+    "created": "Tạo lúc",
+    "cost": "Chi phí"
+  },
+  "costUnknown": "không xác định",
+  "status": {
+    "planned": "Đã lên kế hoạch",
+    "preparing": "Đang chuẩn bị",
+    "running": "Đang chạy",
+    "verifying": "Đang kiểm tra",
+    "succeeded": "Thành công",
+    "partial": "Một phần",
+    "failed": "Thất bại",
+    "blocked": "Bị chặn",
+    "cancelled": "Đã hủy"
+  },
+  "result": {
+    "pass": "đạt",
+    "fail": "không đạt",
+    "error": "lỗi"
+  },
+  "create": {
+    "title": "Nhiệm vụ mới",
+    "hint": "Dán hoặc sửa hợp đồng nhiệm vụ (JSON). Đường dẫn tính từ thư mục nguồn nhiệm vụ của gateway.",
+    "contractLabel": "Hợp đồng nhiệm vụ JSON",
+    "invalidJson": "JSON không hợp lệ: {{error}}",
+    "created": "Đã bắt đầu nhiệm vụ",
+    "creating": "Đang bắt đầu…",
+    "submit": "Bắt đầu nhiệm vụ"
+  },
+  "common": {
+    "cancel": "Hủy",
+    "back": "Quay lại"
+  },
+  "detail": {
+    "back": "Tất cả nhiệm vụ",
+    "notFound": "Không tìm thấy nhiệm vụ",
+    "inProgress": "đang thực hiện",
+    "cancel": "Hủy nhiệm vụ",
+    "tokens": "Token (vào / ra)",
+    "cost": "Chi phí",
+    "executor": "Executor kiểm tra",
+    "finished": "Hoàn tất",
+    "criteria": "Tiêu chí nghiệm thu",
+    "criteriaPending": "Kiểm tra sẽ chạy sau khi agent xong việc.",
+    "criteriaNone": "Không có kiểm tra nào được đánh giá.",
+    "changedFiles": "Tệp đã thay đổi",
+    "noChanges": "Không có thay đổi tệp.",
+    "diff": "Diff",
+    "diffTruncated": "Diff bị cắt bớt (giới hạn 256 KiB).",
+    "summary": "Tóm tắt của agent",
+    "summaryHint": "Đây là lời tự thuật của agent, không phải bằng chứng; bằng chứng là các kiểm tra ở trên.",
+    "events": "Dòng thời gian",
+    "confirmCancel": "Hủy nhiệm vụ này?",
+    "confirmCancelHint": "Lượt chạy của agent sẽ dừng và nhiệm vụ được đánh dấu đã hủy.",
+    "cancelled": "Đã hủy nhiệm vụ",
+    "provesChange": "chứng minh thay đổi",
+    "baseline": "baseline: {{status}}"
+  }
+}

@@ -39,6 +39,12 @@ const CronPage = lazyWithRetry(() =>
 const ConfigPage = lazyWithRetry(() =>
   import("@/pages/config/config-page").then((m) => ({ default: m.ConfigPage })),
 );
+const MissionsPage = lazyWithRetry(() =>
+  import("@/pages/missions/missions-page").then((m) => ({ default: m.MissionsPage })),
+);
+const MissionDetailPage = lazyWithRetry(() =>
+  import("@/pages/missions/mission-detail-page").then((m) => ({ default: m.MissionDetailPage })),
+);
 const TracesPage = lazyWithRetry(() =>
   import("@/pages/traces/traces-page").then((m) => ({ default: m.TracesPage })),
 );
@@ -201,6 +207,8 @@ export function AppRoutes() {
           <Route path={ROUTES.TENANT_DETAIL} element={<RequireCrossTenant><TenantDetailPage /></RequireCrossTenant>} />
 
           {/* Operator+ pages */}
+          <Route path={ROUTES.MISSIONS} element={<MissionsPage />} />
+          <Route path={ROUTES.MISSION_DETAIL} element={<MissionDetailPage />} />
           <Route path={ROUTES.TRACES} element={<TracesPage key="list" />} />
           <Route path={ROUTES.TRACE_DETAIL} element={<TracesPage key="detail" />} />
           <Route path={ROUTES.EVENTS} element={<EventsPage />} />

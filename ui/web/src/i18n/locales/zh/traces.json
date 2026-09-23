@@ -120,6 +120,7 @@
     "direct": "私聊",
     "group": "群组",
     "cron": "定时",
+    "mission": "任务",
     "team": "团队",
     "ws": "网页",
     "unknown": "其他"

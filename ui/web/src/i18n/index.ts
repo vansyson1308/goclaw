@@ -17,6 +17,7 @@ import enConfig from "./locales/en/config.json";
 import enChannels from "./locales/en/channels.json";
 import enProviders from "./locales/en/providers.json";
 import enTraces from "./locales/en/traces.json";
+import enMissions from "./locales/en/missions.json";
 import enEvents from "./locales/en/events.json";
 import enUsage from "./locales/en/usage.json";
 import enApprovals from "./locales/en/approvals.json";
@@ -60,6 +61,7 @@ import viConfig from "./locales/vi/config.json";
 import viChannels from "./locales/vi/channels.json";
 import viProviders from "./locales/vi/providers.json";
 import viTraces from "./locales/vi/traces.json";
+import viMissions from "./locales/vi/missions.json";
 import viEvents from "./locales/vi/events.json";
 import viUsage from "./locales/vi/usage.json";
 import viApprovals from "./locales/vi/approvals.json";
@@ -103,6 +105,7 @@ import koConfig from "./locales/ko/config.json";
 import koChannels from "./locales/ko/channels.json";
 import koProviders from "./locales/ko/providers.json";
 import koTraces from "./locales/ko/traces.json";
+import koMissions from "./locales/ko/missions.json";
 import koEvents from "./locales/ko/events.json";
 import koUsage from "./locales/ko/usage.json";
 import koApprovals from "./locales/ko/approvals.json";
@@ -143,6 +146,7 @@ import zhConfig from "./locales/zh/config.json";
 import zhChannels from "./locales/zh/channels.json";
 import zhProviders from "./locales/zh/providers.json";
 import zhTraces from "./locales/zh/traces.json";
+import zhMissions from "./locales/zh/missions.json";
 import zhEvents from "./locales/zh/events.json";
 import zhUsage from "./locales/zh/usage.json";
 import zhApprovals from "./locales/zh/approvals.json";
@@ -186,6 +190,7 @@ import ruConfig from "./locales/ru/config.json";
 import ruChannels from "./locales/ru/channels.json";
 import ruProviders from "./locales/ru/providers.json";
 import ruTraces from "./locales/ru/traces.json";
+import ruMissions from "./locales/ru/missions.json";
 import ruEvents from "./locales/ru/events.json";
 import ruUsage from "./locales/ru/usage.json";
 import ruApprovals from "./locales/ru/approvals.json";
@@ -238,6 +243,7 @@ const ns = [
   "hooks",
   "webhooks",
   "workstations",
+  "missions",
 ] as const;
 
 i18n.use(initReactI18next).init({
@@ -246,7 +252,7 @@ i18n.use(initReactI18next).init({
       common: enCommon, sidebar: enSidebar, topbar: enTopbar, login: enLogin,
       overview: enOverview, chat: enChat, agents: enAgents, teams: enTeams,
       sessions: enSessions, skills: enSkills, cron: enCron, config: enConfig,
-      channels: enChannels, providers: enProviders, traces: enTraces,
+      channels: enChannels, providers: enProviders, traces: enTraces, missions: enMissions,
       events: enEvents, usage: enUsage,
       approvals: enApprovals, nodes: enNodes, logs: enLogs, tools: enTools,
       mcp: enMcp, tts: enTts, setup: enSetup, memory: enMemory, vault: enVault, storage: enStorage,
@@ -267,7 +273,7 @@ i18n.use(initReactI18next).init({
       common: viCommon, sidebar: viSidebar, topbar: viTopbar, login: viLogin,
       overview: viOverview, chat: viChat, agents: viAgents, teams: viTeams,
       sessions: viSessions, skills: viSkills, cron: viCron, config: viConfig,
-      channels: viChannels, providers: viProviders, traces: viTraces,
+      channels: viChannels, providers: viProviders, traces: viTraces, missions: viMissions,
       events: viEvents, usage: viUsage,
       approvals: viApprovals, nodes: viNodes, logs: viLogs, tools: viTools,
       mcp: viMcp, tts: viTts, setup: viSetup, memory: viMemory, vault: viVault, storage: viStorage,
@@ -288,7 +294,7 @@ i18n.use(initReactI18next).init({
       common: zhCommon, sidebar: zhSidebar, topbar: zhTopbar, login: zhLogin,
       overview: zhOverview, chat: zhChat, agents: zhAgents, teams: zhTeams,
       sessions: zhSessions, skills: zhSkills, cron: zhCron, config: zhConfig,
-      channels: zhChannels, providers: zhProviders, traces: zhTraces,
+      channels: zhChannels, providers: zhProviders, traces: zhTraces, missions: zhMissions,
       events: zhEvents, usage: zhUsage,
       approvals: zhApprovals, nodes: zhNodes, logs: zhLogs, tools: zhTools,
       mcp: zhMcp, tts: zhTts, setup: zhSetup, memory: zhMemory, vault: zhVault, storage: zhStorage,
@@ -309,7 +315,7 @@ i18n.use(initReactI18next).init({
       common: koCommon, sidebar: koSidebar, topbar: koTopbar, login: koLogin,
       overview: koOverview, chat: koChat, agents: koAgents, teams: koTeams,
       sessions: koSessions, skills: koSkills, cron: koCron, config: koConfig,
-      channels: koChannels, providers: koProviders, traces: koTraces,
+      channels: koChannels, providers: koProviders, traces: koTraces, missions: koMissions,
       events: koEvents, usage: koUsage,
       approvals: koApprovals, nodes: koNodes, logs: koLogs, tools: koTools,
       mcp: koMcp, tts: koTts, setup: koSetup, memory: koMemory, vault: koVault, storage: koStorage,
@@ -327,7 +333,7 @@ i18n.use(initReactI18next).init({
       common: ruCommon, sidebar: ruSidebar, topbar: ruTopbar, login: ruLogin,
       overview: ruOverview, chat: ruChat, agents: ruAgents, teams: ruTeams,
       sessions: ruSessions, skills: ruSkills, cron: ruCron, config: ruConfig,
-      channels: ruChannels, providers: ruProviders, traces: ruTraces,
+      channels: ruChannels, providers: ruProviders, traces: ruTraces, missions: ruMissions,
       events: ruEvents, usage: ruUsage,
       approvals: ruApprovals, nodes: ruNodes, logs: ruLogs, tools: ruTools,
       mcp: ruMcp, tts: ruTts, setup: ruSetup, memory: ruMemory, vault: ruVault, storage: ruStorage,

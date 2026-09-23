@@ -28,6 +28,7 @@
     "vault": "Vault",
     "knowledgeGraph": "Knowledge Graph",
     "traces": "Traces",
+    "missions": "Missions",
     "realtimeEvents": "Realtime Events",
     "usage": "Usage",
     "logs": "Logs",

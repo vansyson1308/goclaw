@@ -62,6 +62,7 @@
     "direct": "Direct",
     "group": "Group",
     "cron": "Cron",
+    "mission": "Mission",
     "team": "Team",
     "ws": "Web",
     "unknown": "Other"

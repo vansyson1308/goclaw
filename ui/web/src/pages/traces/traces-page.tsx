@@ -1,6 +1,6 @@
 import { useState, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Activity, GitFork, RefreshCw, Square, Bot, User, Users, Clock, Network, Globe, CheckCircle2, XCircle, Loader2, CircleDot, CircleDashed } from "lucide-react";
+import { Activity, Target, GitFork, RefreshCw, Square, Bot, User, Users, Clock, Network, Globe, CheckCircle2, XCircle, Loader2, CircleDot, CircleDashed } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/shared/page-header";
@@ -36,6 +36,7 @@ function cleanPreview(text: string): string {
 function parseSourceType(sessionKey: string): { type: string; topic?: string } {
   if (!sessionKey) return { type: "unknown" };
   if (sessionKey.includes(":cron:")) return { type: "cron" };
+  if (sessionKey.includes(":mission:")) return { type: "mission" };
   if (sessionKey.includes(":team:")) return { type: "team" };
   const topicMatch = sessionKey.match(/:topic:(\d+)/);
   if (topicMatch) return { type: "group", topic: topicMatch[1] };
@@ -47,6 +48,7 @@ function parseSourceType(sessionKey: string): { type: string; topic?: string } {
 
 const SOURCE_ICONS: Record<string, typeof Bot> = {
   cron: Clock,
+  mission: Target,
   team: Network,
   group: Users,
   direct: User,

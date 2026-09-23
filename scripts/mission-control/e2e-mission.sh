@@ -97,4 +97,14 @@ if api -X POST "localhost:$PORT/v1/missions/$M3/cancel" -d '{}' >/dev/null 2>&1;
 step "audit trail"
 api "localhost:$PORT/v1/missions/$M1/events" | jq -e '[.[] | .to_status] | index("succeeded") != null and index("verifying") != null' >/dev/null || fail "events"
 
+if [ "${UI_CHECK:-0}" = 1 ]; then
+  step "UI check (Vite dev server + Playwright)"
+  UI_PORT="${UI_PORT:-5199}"
+  ( cd "$ROOT/ui/web" && VITE_BACKEND_PORT="$PORT" exec setsid pnpm exec vite --port "$UI_PORT" --strictPort > "$WORK/vite.log" 2>&1 ) &
+  VITE=$!
+  trap 'kill $GW 2>/dev/null; kill -- -$VITE 2>/dev/null; fuser -k "$UI_PORT/tcp" >/dev/null 2>&1 || true' EXIT
+  for _ in $(seq 1 60); do curl -fsS "localhost:$UI_PORT" >/dev/null 2>&1 && break; sleep 1; done
+  node "$ROOT/scripts/mission-control/ui-missions.mjs" "http://localhost:$UI_PORT" "$TOKEN" "$WORK" || fail "UI check"
+fi
+
 echo "E2E PASS (work dir: $WORK)"
