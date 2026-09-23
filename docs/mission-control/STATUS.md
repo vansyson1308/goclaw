@@ -11,16 +11,16 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 | C. Mission vertical slice | verified | EVIDENCE.md §C (incl. adversarial review fixes) |
 | D. Durable recovery | verified | EVIDENCE.md §D (incl. adversarial review fixes) |
 | E. Enforced boundaries | verified | EVIDENCE.md §E |
-| F. Evaluation suite | in_progress | 27 cases, harness + CLI |
-| G. Improvement lifecycle | pending | — |
-| H. Product completion | pending | — |
+| F. Evaluation suite | verified | EVIDENCE.md §F |
+| G. Improvement lifecycle | verified (scripted candidates; live improvement NOT DEMONSTRATED) | EVIDENCE.md §G |
+| H. Product completion | in_progress | — |
 
 ## Reporting dimensions (do not set optimistically)
 
 | Dimension | State |
 |---|---|
 | SOURCE READY | no (in progress) |
-| OFFLINE/INTEGRATION VERIFIED | partial: Phases A–E |
+| OFFLINE/INTEGRATION VERIFIED | Phases A–G |
 | LIVE PROVIDER VERIFIED | BLOCKED: no provider credentials or budget |
 | COMMERCIAL LICENSE READY | BLOCKED: CC BY-NC 4.0 upstream |
 | PRODUCTION RELEASE APPROVED | no: not requested |
@@ -41,4 +41,4 @@ go test -race -tags integration ./tests/invariants/... ./tests/integration/
 ## Handoff
 
 - Branch: `claude/blissful-pascal-jo32ao`.
-- Next action: Phase F (run the full offline suite on host and docker, evidence), then Phase G (candidate lifecycle).
+- Next action: Phase H: journeys (coding, read-only research, recovery + learning), onboarding, release manifest, evidence pack, final report.

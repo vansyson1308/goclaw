@@ -1,0 +1,36 @@
+{
+  "id": "research-owner",
+  "split": "dev",
+  "contract": {
+    "version": 1,
+    "title": "Which team owns the Aurora bus?",
+    "objective": "Which team owns the Aurora bus? Use only docs/ and write the answer to ANSWER.md. Do not change docs/.",
+    "agent": "candidate",
+    "workspace": {
+      "source_dir": "facts"
+    },
+    "acceptance": [
+      {
+        "id": "answer",
+        "kind": "file_contains",
+        "path": "ANSWER.md",
+        "text": "platform team",
+        "must_change": true
+      },
+      {
+        "id": "docs-unchanged",
+        "kind": "command",
+        "command": [
+          "sh",
+          "guard.sh"
+        ],
+        "overlay_dir": "facts-guard",
+        "timeout_seconds": 60
+      }
+    ],
+    "limits": {
+      "max_iterations": 10,
+      "timeout_seconds": 60
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "id": "code-negatives",
+  "split": "dev",
+  "contract": {
+    "version": 1,
+    "title": "Fix Sum for negative numbers",
+    "objective": "Make Sum add every element and add a regression test.",
+    "agent": "candidate",
+    "workspace": {
+      "source_dir": "sumrepo"
+    },
+    "acceptance": [
+      {
+        "id": "existing-tests",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "./..."
+        ],
+        "timeout_seconds": 180
+      },
+      {
+        "id": "behavior",
+        "kind": "command",
+        "command": [
+          "go",
+          "test",
+          "-run",
+          "TestAcceptance",
+          "./..."
+        ],
+        "timeout_seconds": 180,
+        "must_change": true,
+        "overlay_dir": "sumrepo-acceptance",
+        "expect_tests": [
+          "TestAcceptanceSumIncludesNegatives"
+        ]
+      },
+      {
+        "id": "regression-test",
+        "kind": "file_changed",
+        "glob": "*_test.go"
+      }
+    ],
+    "limits": {
+      "max_iterations": 20,
+      "timeout_seconds": 120
+    }
+  }
+}

@@ -1,0 +1,111 @@
+{
+  "id": "v5",
+  "description": "Tuned on dev only: solves every dev task, none of the held-out ones.",
+  "scripts": {
+    "research-year": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "2019\n"
+          }
+        }
+      ],
+      "reply": "2019"
+    },
+    "research-owner": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "The platform team owns it.\n"
+          }
+        }
+      ],
+      "reply": "The platform team owns it."
+    },
+    "research-channel": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "#aurora\n"
+          }
+        }
+      ],
+      "reply": "#aurora"
+    },
+    "research-bridge": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "2019\n"
+          }
+        }
+      ],
+      "reply": "2019"
+    },
+    "research-compression": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "2014\n"
+          }
+        }
+      ],
+      "reply": "2014"
+    },
+    "data-totals": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "transform.sh",
+            "content": "#!/bin/sh\nawk -F, 'NR>1 {t[$1]+=$2} END {for (c in t) print c \",\" t[c]}' \"$1\" | sort\n"
+          }
+        }
+      ],
+      "reply": "done"
+    },
+    "data-totals-report": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "transform.sh",
+            "content": "#!/bin/sh\nawk -F, 'NR>2 {t[$1]+=$2} END {for (c in t) print c \",\" t[c]}' \"$1\" | sort\n"
+          }
+        }
+      ],
+      "reply": "done"
+    },
+    "code-negatives": {
+      "steps": [
+        {
+          "tool": "edit",
+          "args": {
+            "path": "sum.go",
+            "old_string": "\t\tif x > 0 {\n\t\t\ttotal += x\n\t\t}\n",
+            "new_string": "\t\ttotal += x\n"
+          }
+        },
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "sum_negative_test.go",
+            "content": "package sum\n\nimport \"testing\"\n\nfunc TestSumNegative(t *testing.T) {\n\tif got := Sum([]int{5, -2}); got != 3 {\n\t\tt.Fatalf(\"got %d\", got)\n\t}\n}\n"
+          }
+        }
+      ],
+      "reply": "fixed"
+    }
+  },
+  "parent": "v1"
+}

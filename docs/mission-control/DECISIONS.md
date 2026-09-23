@@ -68,3 +68,7 @@
   - The host executor remains as an explicit opt-in and is logged as a security warning.
   - The image must be Debian-based (the file tools need GNU coreutils); this is checked at startup.
   - Each check gets its own copy and cache, so checks cannot influence one another.
+- **D22 Evaluation is offline and deterministic; promotion is evidence-gated.**
+  - The suite replays scripted agents through the real guard, verifiers and outcome rules, and judges the *system's verdicts*, not a model.
+  - Promotion requires no violations, no regression, held-out not lower and a strict improvement.
+  - Monitoring rolls back when the champion loses any task its predecessor solved, even if it solves more overall. A known task that used to work and now fails is treated as an incident, not a trade-off. This is conservative on purpose; a later policy could weigh tasks.

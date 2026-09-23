@@ -1,0 +1,90 @@
+{
+  "id": "v1",
+  "description": "Baseline: answers doc questions it finds directly, weak at data and code.",
+  "scripts": {
+    "research-year": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "2019\n"
+          }
+        }
+      ],
+      "reply": "2019"
+    },
+    "research-owner": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "The platform team owns it.\n"
+          }
+        }
+      ],
+      "reply": "The platform team owns it."
+    },
+    "research-channel": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "#platform-aurora\n"
+          }
+        }
+      ],
+      "reply": "#platform-aurora"
+    },
+    "research-bridge": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "2019\n"
+          }
+        }
+      ],
+      "reply": "2019"
+    },
+    "research-compression": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "ANSWER.md",
+            "content": "2014\n"
+          }
+        }
+      ],
+      "reply": "2014"
+    },
+    "data-totals": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "transform.sh",
+            "content": "#!/bin/sh\nawk -F, 'NR>2 {t[$1]+=$2} END {for (c in t) print c \",\" t[c]}' \"$1\" | sort\n"
+          }
+        }
+      ],
+      "reply": "done"
+    },
+    "data-totals-report": {
+      "steps": [
+        {
+          "tool": "write_file",
+          "args": {
+            "path": "transform.sh",
+            "content": "#!/bin/sh\nawk -F, 'NR>2 {t[$1]+=$2} END {for (c in t) print c \",\" t[c]}' \"$1\" | sort\n"
+          }
+        }
+      ],
+      "reply": "done"
+    }
+  }
+}
