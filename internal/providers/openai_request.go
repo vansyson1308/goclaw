@@ -279,6 +279,10 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 		if p.providerType == "kimi_coding" {
 			skipTemp = true
 		}
+		// DeepSeek thinking mode does not support temperature.
+		if p.isDeepSeekAPI() && deepSeekThinkingType(p, req) != "disabled" {
+			skipTemp = true
+		}
 		if !skipTemp {
 			body["temperature"] = v
 		}
@@ -301,6 +305,20 @@ func (p *OpenAIProvider) buildRequestBody(model string, req ChatRequest, stream 
 			if mapped, forward := mapGeminiReasoningEffort(level); forward {
 				body[OptReasoningEffort] = mapped
 			}
+		}
+	}
+
+	// DeepSeek API (V4.x: deepseek-flash, deepseek-v4-pro): thinking is on by
+	// default. Map the agent's thinking level onto DeepSeek's own controls;
+	// with no level, the provider default (thinking on, effort high) applies.
+	if p.isDeepSeekAPI() {
+		switch deepSeekThinkingType(p, req) {
+		case "disabled":
+			body["thinking"] = map[string]any{"type": "disabled"}
+		case "enabled":
+			level, _ := req.Options[OptThinkingLevel].(string)
+			body["thinking"] = map[string]any{"type": "enabled"}
+			body[OptReasoningEffort] = mapDeepSeekReasoningEffort(level)
 		}
 	}
 
@@ -391,6 +409,43 @@ func (p *OpenAIProvider) isGeminiRoute(model string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(model), "gemini")
+}
+
+// isDeepSeekAPI reports requests going to DeepSeek's own API (provider type
+// "deepseek", or any provider pointed at api.deepseek.com). Aggregators that
+// route DeepSeek models use their own parameters and are excluded.
+func (p *OpenAIProvider) isDeepSeekAPI() bool {
+	return p.providerType == "deepseek" || strings.Contains(strings.ToLower(p.apiBase), "api.deepseek.com")
+}
+
+// deepSeekThinkingType returns "disabled", "enabled" or "" (leave the
+// provider default, which is enabled). The provider-level switch
+// (settings.thinking_enabled) wins over the agent's thinking level.
+func deepSeekThinkingType(p *OpenAIProvider, req ChatRequest) string {
+	if p.thinkingEnabled != nil && !*p.thinkingEnabled {
+		return "disabled"
+	}
+	switch level, _ := req.Options[OptThinkingLevel].(string); level {
+	case "":
+		return ""
+	case "off":
+		return "disabled"
+	default:
+		return "enabled"
+	}
+}
+
+// mapDeepSeekReasoningEffort maps GoClaw thinking levels onto DeepSeek's
+// reasoning_effort values (low | high | max).
+func mapDeepSeekReasoningEffort(level string) string {
+	switch level {
+	case "minimal", "low":
+		return "low"
+	case "xhigh", "max":
+		return "max"
+	default:
+		return "high"
+	}
 }
 
 // mapGeminiReasoningEffort returns (value, shouldForward). Gemini 3 Preview

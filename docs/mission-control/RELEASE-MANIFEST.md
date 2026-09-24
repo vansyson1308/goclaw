@@ -97,6 +97,6 @@ Stated in MISSIONS.md "Known limits", "Threat model" and EVALS.md:
 |---|---|
 | SOURCE READY | **Yes** for review: feature-complete for A–H on this branch, documented, tests listed above |
 | OFFLINE/INTEGRATION VERIFIED | **Yes**, with the environment-only exceptions listed |
-| LIVE PROVIDER VERIFIED | **BLOCKED**: no provider credentials or approved budget; all agent runs used the scripted provider |
+| LIVE PROVIDER VERIFIED | **Ready to run, not yet run**: DeepSeek V4.1 Flash integrated; wire contract verified against a local mock only. A live run needs the owner's key (`scripts/mission-control/live-deepseek.sh`, see DEEPSEEK.md) |
 | COMMERCIAL LICENSE READY | **BLOCKED**: upstream is CC BY-NC 4.0 (non-commercial). Not relicensed; commercial use needs independently resolved licensing |
 | PRODUCTION RELEASE APPROVED | **No**: not requested; no tag, publish or deploy was performed |

@@ -166,6 +166,7 @@ func (c *Config) applyEnvOverrides() {
 	envStr("GOCLAW_OPENROUTER_API_KEY", &c.Providers.OpenRouter.APIKey)
 	envStr("GOCLAW_GROQ_API_KEY", &c.Providers.Groq.APIKey)
 	envStr("GOCLAW_DEEPSEEK_API_KEY", &c.Providers.DeepSeek.APIKey)
+	envStr("GOCLAW_DEEPSEEK_BASE_URL", &c.Providers.DeepSeek.APIBase)
 	envStr("GOCLAW_GEMINI_API_KEY", &c.Providers.Gemini.APIKey)
 	envStr("GOCLAW_MISTRAL_API_KEY", &c.Providers.Mistral.APIKey)
 	envStr("GOCLAW_XAI_API_KEY", &c.Providers.XAI.APIKey)

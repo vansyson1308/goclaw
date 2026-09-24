@@ -490,3 +490,16 @@ Every finding below was re-verified in the code before any fix. Each fix has a r
 
 - **Web UI:** the "New mission" button is disabled, with an explanation, and the suggestion approve/reject/rollback buttons are hidden for non-admins. The strings are in en/vi/zh/ko/ru.
 - **Tests:** `TestMissionCreateRequiresAdminCancelDoesNot` and `TestEvolutionSuggestionPatchRequiresTenantAdmin` go through the real auth middleware with operator and admin API keys, and include a tenant-scoped admin without tenant-admin membership. Both failed before the change.
+
+## §J DeepSeek V4.1 Flash integration (2026-09-24)
+
+- **Research:** see [DEEPSEEK.md](DEEPSEEK.md). The current model is `deepseek-flash`. `deepseek-chat` and `deepseek-reasoner` were retired upstream on 2026-07-24, and `deepseek-chat` was GoClaw's default.
+- **Fixes (each with a test that failed first):**
+  - defaults at startup and at runtime creation (`TestDeepSeekProviderDefaults`, `TestRegisterInMemoryDeepSeekDefaultsAndType`);
+  - thinking controls (`TestDeepSeekThinkingControls`, `…ProviderThinkingDisabled`, `…ControlsOnlyForDeepSeekAPI`, `…RouteDetectedByAPIBase`);
+  - cache-hit usage (`TestDeepSeekCacheHitTokensAreCacheReads`);
+  - 1M context (`TestDeepSeekContextWindows`);
+  - streaming parse (`TestDeepSeekStreamParsing`).
+- **Mock end-to-end** (`MOCK=1 scripts/mission-control/live-deepseek.sh`, docker executor): coding, research and safety all `succeeded`; 13 requests, all in thinking mode; `reasoning_content` pass-back checked on 9 tool follow-ups; **0 contract violations**; cost computed ($0.0041 per mission against the mock's token counts).
+- **Bug found by the mock run:** providers created at runtime (web UI or API) lost their provider type and DeepSeek defaults. As a result `temperature` was sent in thinking mode, which the mock rejected with DeepSeek's 400. Fixed; the run above is after the fix.
+- **Not verified here:** the live API and the model's task performance. The network policy blocks `api.deepseek.com`. `live-deepseek.sh` with the owner's key measures both.

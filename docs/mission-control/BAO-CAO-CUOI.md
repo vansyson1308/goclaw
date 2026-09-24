@@ -9,7 +9,7 @@ Mọi con số dưới đây đều lấy từ lần chạy thật, ghi trong [E
 |---|---|---|
 | **SOURCE READY** | **Sẵn sàng để review.** Đã làm xong A–H trên nhánh, có tài liệu và kiểm thử | RELEASE-MANIFEST.md |
 | **OFFLINE/INTEGRATION VERIFIED** | **Đã kiểm chứng.** Ngoại lệ duy nhất là các lỗi do môi trường container này, đã ghi rõ | EVIDENCE §A–§H |
-| **LIVE PROVIDER VERIFIED** | **BỊ CHẶN** (BLOCKED). Không có khóa API và chưa có ngân sách được duyệt. Mọi lần chạy agent đều dùng provider `scripted` (tất định, $0) | SCOPE.md |
+| **LIVE PROVIDER VERIFIED** | **SẴN SÀNG CHẠY, CHƯA CHẠY.** DeepSeek V4.1 Flash đã được tích hợp. Hợp đồng giao tiếp (wire contract) mới chỉ được kiểm chứng với mock cục bộ, vì môi trường này bị chặn truy cập api.deepseek.com. Để chạy thật, anh chạy `scripts/mission-control/live-deepseek.sh` rồi nhập key | DEEPSEEK.md |
 | **COMMERCIAL LICENSE READY** | **BỊ CHẶN** (BLOCKED). Upstream dùng giấy phép CC BY-NC 4.0 (phi thương mại). Em **không** đổi giấy phép; muốn dùng thương mại thì phải giải quyết bản quyền riêng | LICENSE |
 | **PRODUCTION RELEASE APPROVED** | **Không.** Không có yêu cầu này. Chưa tag, chưa publish, chưa deploy | — |
 

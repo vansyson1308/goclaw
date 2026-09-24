@@ -51,6 +51,7 @@ type openAIUsage struct {
 	TotalTokens             int                      `json:"total_tokens"`
 	Cost                    float64                  `json:"cost,omitempty"`
 	PromptTokensDetails     *openAIPromptDetails     `json:"prompt_tokens_details,omitempty"`
+	PromptCacheHitTokens    int                      `json:"prompt_cache_hit_tokens,omitempty"` // DeepSeek
 	CompletionTokensDetails *openAICompletionDetails `json:"completion_tokens_details,omitempty"`
 	ServerToolUse           *openAIServerToolUse     `json:"server_tool_use,omitempty"`
 }
@@ -101,4 +102,18 @@ type toolCallAccumulator struct {
 	ToolCall
 	rawArgs    string
 	thoughtSig string
+}
+
+// fillCacheUsage copies prompt-cache token counts into dst.
+func fillCacheUsage(dst *Usage, u *openAIUsage) {
+	if u.PromptTokensDetails != nil {
+		dst.CacheReadTokens = u.PromptTokensDetails.CachedTokens
+		dst.CacheCreationTokens = u.PromptTokensDetails.CacheWriteTokens + u.PromptTokensDetails.CacheCreationInputTokens
+		dst.PromptTokensIncludeCachedSegments = true
+	}
+	// DeepSeek: prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens.
+	if dst.CacheReadTokens == 0 && u.PromptCacheHitTokens > 0 {
+		dst.CacheReadTokens = u.PromptCacheHitTokens
+		dst.PromptTokensIncludeCachedSegments = true
+	}
 }

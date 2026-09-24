@@ -21,7 +21,7 @@ export const PROVIDER_TYPES: ProviderTypeInfo[] = [
   { value: "vertex", label: "Google Vertex AI", apiBase: "", placeholder: "Auto-computed from project_id + region (settings)" },
   { value: "openrouter", label: "OpenRouter", apiBase: "https://openrouter.ai/api/v1", placeholder: "" },
   { value: "groq", label: "Groq", apiBase: "https://api.groq.com/openai/v1", placeholder: "" },
-  { value: "deepseek", label: "DeepSeek", apiBase: "https://api.deepseek.com/v1", placeholder: "" },
+  { value: "deepseek", label: "DeepSeek", apiBase: "https://api.deepseek.com", placeholder: "" },
   { value: "mistral", label: "Mistral AI", apiBase: "https://api.mistral.ai/v1", placeholder: "" },
   { value: "xai", label: "xAI (Grok)", apiBase: "https://api.x.ai/v1", placeholder: "" },
   { value: "minimax_native", label: "MiniMax (Native)", apiBase: "https://api.minimax.io/v1", placeholder: "" },

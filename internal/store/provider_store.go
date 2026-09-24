@@ -42,6 +42,11 @@ const (
 	ProviderAtlasCloud     = "atlascloud"      // Atlas Cloud (OpenAI-compatible endpoint)
 	ProviderAPIRoute       = "api_route"       // API Route (OpenAI-compatible endpoint)
 
+	// DeepSeek defaults (V4.1 Flash; the legacy deepseek-chat/deepseek-reasoner
+	// names were retired upstream on 2026-07-24).
+	DeepSeekDefaultAPIBase = "https://api.deepseek.com"
+	DeepSeekDefaultModel   = "deepseek-flash"
+
 	// MiniMax defaults.
 	MiniMaxDefaultAPIBase = "https://api.minimax.io/v1"
 	MiniMaxDefaultModel   = "MiniMax-M3"

@@ -251,7 +251,9 @@ Some models emit chain-of-thought reasoning tokens even when `effort="off"` is s
 
 Auto-flagged via `modelLeaksReasoning(model)` in `internal/providers/reasoning_resolution.go`:
 - **Kimi family**: any model name containing `kimi` (case-insensitive, e.g. `kimi-k2`, `moonshot/kimi-k2-thinking`)
-- **DeepSeek-Reasoner**: any model name containing `deepseek-reasoner`
+- **DeepSeek-Reasoner** (legacy, retired upstream 2026-07-24): any model name containing `deepseek-reasoner`
+
+DeepSeek V4.x (`deepseek-flash`, `deepseek-v4-pro`) does not leak: its reasoning comes in `reasoning_content`, and `off` is sent as `thinking: {"type": "disabled"}` on DeepSeek's API (see `internal/providers/openai_request.go`, `isDeepSeekAPI`).
 
 The allowlist is a simple substring check — extendable as new leaky models appear.
 
