@@ -2,6 +2,7 @@
   "title": "Nhiệm vụ",
   "description": "Giao cho agent một mục tiêu kèm các bước kiểm tra nghiệm thu. Kết quả được đánh giá bằng kiểm tra, không dựa vào lời agent tự nhận.",
   "newMission": "Nhiệm vụ mới",
+  "createAdminOnly": "Tạo nhiệm vụ cần quyền admin",
   "disabledTitle": "Tính năng nhiệm vụ đang tắt trên gateway này",
   "disabledHint": "Đặt GOCLAW_MISSIONS=1 (và GOCLAW_MISSIONS_SOURCE_ROOT) rồi khởi động lại gateway. Lệnh kiểm tra chạy trên executor của máy chủ.",
   "emptyTitle": "Chưa có nhiệm vụ nào",

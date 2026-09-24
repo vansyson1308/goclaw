@@ -976,6 +976,8 @@ GET /v1/agents/{agentID}/evolution/suggestions
 PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}
 ```
 
+Requires the **admin** role, and for tenant-scoped callers a tenant owner/admin membership (applying changes agent config or creates tenant skills). Listing and reading suggestions stay available to viewers.
+
 **Request:**
 
 ```json
@@ -1031,7 +1033,7 @@ Missions must be enabled on the gateway with `GOCLAW_MISSIONS=1`. `GOCLAW_MISSIO
 | Method | Path | Role | Description |
 |--------|------|------|-------------|
 | `GET` | `/v1/missions?limit=` | viewer | `{"missions": [...], "enabled": bool}`, newest first. The diff is omitted in the list |
-| `POST` | `/v1/missions` | operator + master scope | Body: the contract JSON (≤ 64 KiB). Returns `202` with the mission, `400` with the validation reason, or `403` for tenant-scoped callers (verifiers run on the gateway host) |
+| `POST` | `/v1/missions` | admin + master scope | Body: the contract JSON (≤ 64 KiB). Returns `202` with the mission, `400` with the validation reason, or `403` for non-admins and tenant-scoped callers (verifiers run on the gateway host) |
 | `GET` | `/v1/missions/{id}` | viewer | Full mission: `verification[]`, `diff`, `changed_files`, usage, `cost_usd` (`null` means unknown), `pins` (input digests). `workspace_path` is only returned to the master scope |
 | `GET` | `/v1/missions/{id}/events` | viewer | Append-only timeline (transitions and notes) |
 | `GET` | `/v1/missions/{id}/receipts` | viewer | Tool calls of every attempt: `attempt`, `seq`, `tool`, `action_class`, `status` (`denied`/`started`/`ok`/`error`; `started` alone = outcome unknown), `args_digest`, `duration_ms` |

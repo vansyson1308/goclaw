@@ -2,6 +2,7 @@
   "title": "미션",
   "description": "에이전트에게 목표와 인수 검사를 부여합니다. 성공 여부는 에이전트의 주장이 아니라 검사 결과로 판단합니다.",
   "newMission": "새 미션",
+  "createAdminOnly": "미션을 만들려면 관리자 역할이 필요합니다",
   "disabledTitle": "이 게이트웨이에서 미션이 비활성화되어 있습니다",
   "disabledHint": "GOCLAW_MISSIONS=1(및 GOCLAW_MISSIONS_SOURCE_ROOT)을 설정하고 게이트웨이를 다시 시작하세요. 검증 명령은 호스트 실행기에서 실행됩니다.",
   "emptyTitle": "아직 미션이 없습니다",

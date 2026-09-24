@@ -2,6 +2,7 @@
   "title": "Missions",
   "description": "Give an agent an objective with acceptance checks. Success is judged by the checks, not by what the agent says.",
   "newMission": "New mission",
+  "createAdminOnly": "Creating a mission requires the admin role",
   "disabledTitle": "Missions are disabled on this gateway",
   "disabledHint": "Set GOCLAW_MISSIONS=1 (and GOCLAW_MISSIONS_SOURCE_ROOT) and restart the gateway. Verifier commands run on the host executor.",
   "emptyTitle": "No missions yet",

@@ -2,6 +2,7 @@
   "title": "任务",
   "description": "为智能体指定目标和验收检查。成功与否由检查结果判定，而不是智能体的自述。",
   "newMission": "新建任务",
+  "createAdminOnly": "创建任务需要管理员角色",
   "disabledTitle": "此网关未启用任务功能",
   "disabledHint": "设置 GOCLAW_MISSIONS=1（以及 GOCLAW_MISSIONS_SOURCE_ROOT）后重启网关。验证命令在主机执行器上运行。",
   "emptyTitle": "暂无任务",

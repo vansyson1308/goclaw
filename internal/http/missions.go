@@ -39,7 +39,9 @@ const maxContractBytes = 64 << 10
 
 func (h *MissionsHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/missions", requireAuth(permissions.RoleViewer, h.handleList))
-	mux.HandleFunc("POST /v1/missions", requireAuth(permissions.RoleOperator, h.handleCreate))
+	// Creating a mission runs code on the gateway's executor: admin, and the
+	// handler also requires the master scope. Cancelling is open to operators.
+	mux.HandleFunc("POST /v1/missions", requireAuth(permissions.RoleAdmin, h.handleCreate))
 	mux.HandleFunc("GET /v1/missions/{id}", requireAuth(permissions.RoleViewer, h.handleGet))
 	mux.HandleFunc("GET /v1/missions/{id}/events", requireAuth(permissions.RoleViewer, h.handleEvents))
 	mux.HandleFunc("GET /v1/missions/{id}/receipts", requireAuth(permissions.RoleViewer, h.handleReceipts))

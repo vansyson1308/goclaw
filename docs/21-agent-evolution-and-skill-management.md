@@ -662,7 +662,7 @@ Analysis runs 1 minute after startup and then at 03:00, 09:00, 15:00 and 21:00 s
 **HTTP Endpoints** (see [18 — HTTP REST API](18-http-api.md#14-evolution-metrics--suggestions)):
 - `GET /v1/agents/{agentID}/evolution/metrics`: query or aggregate metrics
 - `GET /v1/agents/{agentID}/evolution/suggestions`: list suggestions (includes `applied_change`, `applied_by`, `rolled_back_by`, `state_version`)
-- `PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}`: body `{"status": "approved"|"rejected"|"rolled_back", "reason"?: string, "skill_draft"?: string}`. Returns `{status, action, suggestion}`; 409 on state or rollback conflict.
+- `PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}` (admin; tenant owner/admin when tenant-scoped): body `{"status": "approved"|"rejected"|"rolled_back", "reason"?: string, "skill_draft"?: string}`. Returns `{status, action, suggestion}`; 409 on state or rollback conflict.
 - `GET /v1/agents/{agentID}/evolution/suggestions/{suggestionID}/events`: audit trail
 
 There are no WebSocket methods for evolution.

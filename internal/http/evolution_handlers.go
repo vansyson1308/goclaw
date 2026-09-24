@@ -13,6 +13,7 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/permissions"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
@@ -34,6 +35,9 @@ type EvolutionHandler struct {
 
 	// Optional: broadcasts agent cache invalidation after a config change.
 	msgBus *bus.MessageBus
+
+	// Tenant membership lookup for the tenant-admin gate on writes.
+	tenantStore store.TenantStore
 }
 
 // EvolutionHandlerOpt configures optional EvolutionHandler dependencies.
@@ -53,6 +57,12 @@ func WithAgentStore(as store.AgentStore) EvolutionHandlerOpt {
 	return func(h *EvolutionHandler) { h.agentStore = as }
 }
 
+// WithTenantStore enables the tenant owner/admin check on suggestion writes
+// for tenant-scoped callers (without it they are refused).
+func WithTenantStore(ts store.TenantStore) EvolutionHandlerOpt {
+	return func(h *EvolutionHandler) { h.tenantStore = ts }
+}
+
 // WithMessageBus enables agent cache invalidation after applied/rolled-back changes.
 func WithMessageBus(mb *bus.MessageBus) EvolutionHandlerOpt {
 	return func(h *EvolutionHandler) { h.msgBus = mb }
@@ -69,12 +79,24 @@ func NewEvolutionHandler(m store.EvolutionMetricsStore, s store.EvolutionSuggest
 func (h *EvolutionHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/agents/{agentID}/evolution/metrics", h.auth(h.handleGetMetrics))
 	mux.HandleFunc("GET /v1/agents/{agentID}/evolution/suggestions", h.auth(h.handleListSuggestions))
-	mux.HandleFunc("PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}", h.auth(h.handleUpdateSuggestion))
+	mux.HandleFunc("PATCH /v1/agents/{agentID}/evolution/suggestions/{suggestionID}", h.tenantAdmin(h.handleUpdateSuggestion))
 	mux.HandleFunc("GET /v1/agents/{agentID}/evolution/suggestions/{suggestionID}/events", h.auth(h.handleListEvents))
 }
 
 func (h *EvolutionHandler) auth(next http.HandlerFunc) http.HandlerFunc {
 	return requireAuth("", next)
+}
+
+// tenantAdmin gates suggestion writes like the direct agent/skill writes they
+// stand in for (apply changes agent config or creates tenant skills): admin
+// role, and a tenant owner/admin when the caller is tenant-scoped.
+func (h *EvolutionHandler) tenantAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return requireAuth(permissions.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
+		if !store.IsMasterScope(r.Context()) && !requireTenantAdmin(w, r, h.tenantStore) {
+			return
+		}
+		next(w, r)
+	})
 }
 
 // handleGetMetrics returns raw or aggregated evolution metrics for an agent.
