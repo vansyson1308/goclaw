@@ -54,9 +54,11 @@ interface Props {
   suggestions: EvolutionSuggestion[];
   loading: boolean;
   onUpdateStatus: (id: string, status: Action) => Promise<void>;
+  /** Approve/reject/rollback need the admin role (the server enforces it). */
+  canManage: boolean;
 }
 
-export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus }: Props) {
+export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus, canManage }: Props) {
   const { t } = useTranslation("agents");
   const [confirm, setConfirm] = useState<{ s: EvolutionSuggestion; action: Action } | null>(null);
   const [acting, setActing] = useState(false);
@@ -126,7 +128,7 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
                   </td>
                   <td className="px-3 py-2 text-right">
                     <div className="flex items-center justify-end gap-1">
-                      {s.status === "pending" && (
+                      {canManage && s.status === "pending" && (
                         <>
                           <Button
                             size="sm" variant="ghost"
@@ -146,7 +148,7 @@ export function EvolutionSuggestionsTable({ suggestions, loading, onUpdateStatus
                           </Button>
                         </>
                       )}
-                      {canRollback(s) && (
+                      {canManage && canRollback(s) && (
                         <Button
                           size="sm" variant="ghost"
                           className="h-7 w-7 p-0 text-orange-600 hover:text-orange-700"

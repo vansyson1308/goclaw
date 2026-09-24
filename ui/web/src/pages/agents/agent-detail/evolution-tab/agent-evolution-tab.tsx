@@ -4,6 +4,7 @@ import { Sparkles } from "lucide-react";
 import { useV3Flags } from "@/hooks/use-v3-flags";
 import { useEvolutionMetrics } from "@/hooks/use-evolution-metrics";
 import { useEvolutionSuggestions } from "@/hooks/use-evolution-suggestions";
+import { useAuthStore } from "@/stores/use-auth-store";
 import { EvolutionMetricsCharts } from "./evolution-metrics-charts";
 import { EvolutionSuggestionsTable } from "./evolution-suggestions-table";
 import { EvolutionGuardrailsCard } from "./evolution-guardrails-card";
@@ -31,6 +32,8 @@ export function AgentEvolutionTab({ agentId, agentOtherConfig }: AgentEvolutionT
   const { flags, loading: flagsLoading } = useV3Flags(agentId);
   const { toolAggs, retrievalAggs, loading: metricsLoading } = useEvolutionMetrics(agentId, timeRange);
   const { suggestions, loading: suggestionsLoading, updateStatus } = useEvolutionSuggestions(agentId);
+  const role = useAuthStore((s) => s.role);
+  const canManage = role === "admin" || role === "owner";
 
   // Parse guardrails from agent other_config, fallback to defaults.
   const guardrails: AdaptationGuardrails = {
@@ -87,6 +90,7 @@ export function AgentEvolutionTab({ agentId, agentOtherConfig }: AgentEvolutionT
           suggestions={suggestions}
           loading={suggestionsLoading}
           onUpdateStatus={updateStatus}
+          canManage={canManage}
         />
       </div>
 

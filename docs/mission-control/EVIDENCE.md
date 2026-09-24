@@ -466,11 +466,7 @@ Every finding below was re-verified in the code before any fix. Each fix has a r
 | 9 | Low | The CLI printed agent-controlled text with terminal escape sequences | `termSafe` strips control characters except `\n`/`\t` | `TestTermSafeStripsControlSequences` |
 
 **Not changed here (need an owner decision, or deferred with a reason):**
-- **Authorization levels (the skill's "ask first" rule for auth changes):**
-  - evolution suggestion `PATCH` (apply/rollback) is operator-level, while the equivalent direct agent/skill writes need admin;
-  - mission create is operator + master scope;
-  - mission cancel is tenant-wide.
-  Proposal: tenant-admin for the evolution `PATCH`, admin (or owner) for mission create.
+- **Authorization levels:** decided by the owner after this pass and changed in a follow-up (see "Authorization follow-up" below).
 - **Receipt digest:** an unsalted, truncated SHA-256 of the arguments, so low-entropy arguments can be confirmed offline by viewers. The fix (a per-mission HMAC key) changes the stored format.
 - **No cap on queued missions per gateway.** Create is master-scope only.
 - **Incomplete path redaction:** it covers the mission directory, not source-root paths that can appear in rare copy errors.
@@ -483,3 +479,14 @@ Every finding below was re-verified in the code before any fix. Each fix has a r
 - Unit tests of the changed packages: pass. The exception is the two zombie-reaping tests already listed in §A, which fail identically on unchanged `main` in this container.
 - `-race` integration (`Mission|Evolution|Skill`) and invariants on PG 18: pass.
 - Full E2E (docker executor + Playwright): `E2E PASS`, 7 missions + learning + UI.
+
+### Authorization follow-up (owner decision, 2026-09-24)
+
+| Endpoint | Before | After |
+|---|---|---|
+| `PATCH /v1/agents/{id}/evolution/suggestions/{sid}` (approve/apply/reject/rollback) | operator | admin role, plus a tenant owner/admin when tenant-scoped (same gate as the skill evolution writes) |
+| `POST /v1/missions` | operator + master scope | admin + master scope |
+| `POST /v1/missions/{id}/cancel` | operator | unchanged (the owner chose not to restrict it) |
+
+- **Web UI:** the "New mission" button is disabled, with an explanation, and the suggestion approve/reject/rollback buttons are hidden for non-admins. The strings are in en/vi/zh/ko/ru.
+- **Tests:** `TestMissionCreateRequiresAdminCancelDoesNot` and `TestEvolutionSuggestionPatchRequiresTenantAdmin` go through the real auth middleware with operator and admin API keys, and include a tenant-scoped admin without tenant-admin membership. Both failed before the change.

@@ -11,6 +11,7 @@ import { useUiStore } from "@/stores/use-ui-store";
 import { useMissions, useMissionActions } from "./hooks/use-missions";
 import { MissionStatusBadge } from "./mission-status-badge";
 import { CreateMissionDialog } from "./create-mission-dialog";
+import { useAuthStore } from "@/stores/use-auth-store";
 import { formatCost } from "./mission-format";
 
 export function MissionsPage() {
@@ -20,6 +21,9 @@ export function MissionsPage() {
   const { missions, enabled, loading, error } = useMissions();
   const { create } = useMissionActions();
   const [creating, setCreating] = useState(false);
+  // Creating a mission runs code on the gateway: admin only (server enforces).
+  const role = useAuthStore((s) => s.role);
+  const canCreate = role === "admin" || role === "owner";
 
   return (
     <div className="p-4 sm:p-6 space-y-4">
@@ -27,7 +31,13 @@ export function MissionsPage() {
         title={t("title")}
         description={t("description")}
         actions={
-          <Button size="sm" onClick={() => setCreating(true)} disabled={!enabled} data-testid="mission-new">
+          <Button
+            size="sm"
+            onClick={() => setCreating(true)}
+            disabled={!enabled || !canCreate}
+            title={canCreate ? undefined : t("createAdminOnly")}
+            data-testid="mission-new"
+          >
             <Plus className="h-4 w-4 mr-1" /> {t("newMission")}
           </Button>
         }

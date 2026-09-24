@@ -278,6 +278,9 @@ func (d *gatewayDeps) wireHTTPHandlersOnServer(
 		if d.msgBus != nil {
 			evoOpts = append(evoOpts, httpapi.WithMessageBus(d.msgBus))
 		}
+		if d.pgStores.Tenants != nil {
+			evoOpts = append(evoOpts, httpapi.WithTenantStore(d.pgStores.Tenants))
+		}
 		d.server.SetEvolutionHandler(httpapi.NewEvolutionHandler(d.pgStores.EvolutionMetrics, d.pgStores.EvolutionSuggestions, evoOpts...))
 	}
 

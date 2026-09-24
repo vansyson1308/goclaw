@@ -10,7 +10,7 @@ A **mission** gives an agent an objective and has **verifiers outside the agent*
   docker pull golang:1.26-bookworm
   ```
   Any Debian-based image with your project's toolchain works. Set it with `GOCLAW_MISSIONS_IMAGE`.
-- A system-owner (master scope) login. Creating missions runs code, so it is restricted like shell access.
+- An admin login in the master scope (system owner or master tenant admin). Creating missions runs code, so it is restricted like shell access; operators can view and cancel missions.
 
 ## 2. Enable missions
 

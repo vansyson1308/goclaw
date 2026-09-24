@@ -134,7 +134,7 @@ In both modes:
 - The agent's virtual files (`AGENTS.md`, `SOUL.md`, `USER.md`, `MEMORY.md`, `memory/*`, stored in the database and injected into every later run of that agent) are neither read nor written from a mission. The repository's own files with those names are used instead, so a prompt-injected mission cannot persist instructions into the agent.
 - Criterion ids are plain names (`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`): they name per-check directories on the host, and the ids `_integrity`/`_diff` are reserved.
 - Tenant-scoped viewers see host paths redacted in status reasons, check details and events. Internal errors are logged, not returned. The agent's summary and the stored diff are credential-scrubbed like command output; the CLI strips terminal control characters from agent-controlled text.
-- Creating a mission requires the **master scope** (system owner or master tenant).
+- Creating a mission requires the **admin role and the master scope** (system owner or master tenant admin). Cancelling is open to operators.
 - The gateway sets `PR_SET_DUMPABLE=0`, so processes running as the same non-root user cannot read its `/proc/<pid>/environ`. With the docker executor, the containers cannot see host processes at all (separate PID namespace).
 - If the gateway runs in a container with the Docker socket mounted, paths are mapped to host paths (`sandbox.HostPath`).
 
