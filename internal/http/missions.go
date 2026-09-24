@@ -2,10 +2,14 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -46,7 +50,7 @@ func (h *MissionsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	list, err := h.store.ListMissions(r.Context(), limit)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMissionInternalError(w, r, err)
 		return
 	}
 	if list == nil {
@@ -79,7 +83,7 @@ func (h *MissionsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, mission.ErrInvalidContract):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case err != nil:
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMissionInternalError(w, r, err)
 	default:
 		writeJSON(w, http.StatusAccepted, redactMission(r.Context(), m))
 	}
@@ -92,7 +96,7 @@ func (h *MissionsHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	m, err := h.store.GetMission(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMissionInternalError(w, r, err)
 		return
 	}
 	if m == nil {
@@ -107,17 +111,29 @@ func (h *MissionsHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if m, err := h.store.GetMission(r.Context(), id); err != nil || m == nil {
+	m, err := h.store.GetMission(r.Context(), id)
+	if err != nil || m == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "mission not found"})
 		return
 	}
 	events, err := h.store.ListMissionEvents(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMissionInternalError(w, r, err)
 		return
 	}
 	if events == nil {
 		events = []store.MissionEvent{}
+	}
+	if !store.IsMasterScope(r.Context()) {
+		redacted := make([]store.MissionEvent, len(events))
+		for i, ev := range events {
+			ev.Message = redactHostPaths(m, ev.Message)
+			if len(ev.Detail) > 0 {
+				ev.Detail = json.RawMessage(redactHostPaths(m, string(ev.Detail)))
+			}
+			redacted[i] = ev
+		}
+		events = redacted
 	}
 	writeJSON(w, http.StatusOK, events)
 }
@@ -135,7 +151,7 @@ func (h *MissionsHandler) handleReceipts(w http.ResponseWriter, r *http.Request)
 	}
 	recs, err := h.store.ListMissionReceipts(r.Context(), id)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMissionInternalError(w, r, err)
 		return
 	}
 	if recs == nil {
@@ -160,20 +176,51 @@ func (h *MissionsHandler) handleCancel(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrMissionNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 	case err != nil:
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		writeMissionInternalError(w, r, err)
 	default:
 		writeJSON(w, http.StatusOK, redactMission(r.Context(), m))
 	}
 }
 
-// redactMission hides gateway host paths from tenant-scoped callers.
+// redactMission hides gateway host paths and worker identity from
+// tenant-scoped callers, including paths quoted in error texts.
 func redactMission(ctx context.Context, m *store.Mission) *store.Mission {
 	if m == nil || store.IsMasterScope(ctx) {
 		return m
 	}
 	cp := *m
+	cp.StatusReason = redactHostPaths(m, m.StatusReason)
+	if len(m.Verification) > 0 {
+		cp.Verification = json.RawMessage(redactHostPaths(m, string(m.Verification)))
+	}
 	cp.WorkspacePath, cp.LeaseOwner = "", ""
 	return &cp
+}
+
+// redactHostPaths replaces the mission's directory on the gateway host (the
+// parent of its attempt-N directories) in s.
+func redactHostPaths(m *store.Mission, s string) string {
+	if m.WorkspacePath == "" || s == "" {
+		return s
+	}
+	dir := filepath.Dir(m.WorkspacePath)
+	for d := m.WorkspacePath; d != filepath.Dir(d); d = filepath.Dir(d) {
+		if strings.HasPrefix(filepath.Base(d), "attempt-") {
+			dir = filepath.Dir(d)
+			break
+		}
+	}
+	if dir == "/" || dir == "." {
+		return s
+	}
+	return strings.ReplaceAll(s, dir, "<mission-dir>")
+}
+
+// writeMissionInternalError logs a store/service failure and returns a
+// generic message: error texts can carry SQL or host details.
+func writeMissionInternalError(w http.ResponseWriter, r *http.Request, err error) {
+	slog.Error("missions.internal_error", "method", r.Method, "path", r.URL.Path, "error", err)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 }
 
 func missionID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
@@ -193,7 +240,9 @@ func (h *MissionsHandler) HandleGetForTest(w http.ResponseWriter, r *http.Reques
 func (h *MissionsHandler) HandleCancelForTest(w http.ResponseWriter, r *http.Request) {
 	h.handleCancel(w, r)
 }
-func (h *MissionsHandler) HandleListForTest(w http.ResponseWriter, r *http.Request) { h.handleList(w, r) }
+func (h *MissionsHandler) HandleListForTest(w http.ResponseWriter, r *http.Request) {
+	h.handleList(w, r)
+}
 func (h *MissionsHandler) HandleEventsForTest(w http.ResponseWriter, r *http.Request) {
 	h.handleEvents(w, r)
 }

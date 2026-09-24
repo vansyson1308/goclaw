@@ -263,9 +263,10 @@ func (t *ExecTool) Execute(ctx context.Context, args map[string]any) *Result {
 	// Credentialed exec is argv-based, not shell-based. Route it before shell
 	// deny scanning so ordinary argument text cannot be mistaken for executable
 	// shell syntax.
-	// Runs with a required sandbox (missions) never receive stored CLI
-	// credentials: their effects would leave the sandbox.
-	if cred, binary, cmdArgs := t.lookupCredentialedBinary(ctx, command); cred != nil && !SandboxRequiredFromCtx(ctx) {
+	// Mission runs (sandbox required, or confined on the host executor)
+	// never receive stored CLI credentials: their effects would leave the
+	// mission. The lookup is skipped, not just its result.
+	if cred, binary, cmdArgs := t.credentialedBinaryFor(ctx, command); cred != nil {
 		cwd := ToolWorkspaceFromCtx(ctx)
 		if cwd == "" {
 			cwd = t.workspace
@@ -594,6 +595,12 @@ func (t *ExecTool) executeOnHost(ctx context.Context, command, cwd string) *Resu
 		dynKeys = staticCredentialEnvKeys
 	}
 	cmd.Env = scrubCredentialEnv(os.Environ(), dynKeys)
+	if WorkspaceConfinedFromCtx(ctx) {
+		// Missions on the host executor: allowlist, not denylist. A program
+		// the agent compiles can read its whole environment, which holds the
+		// gateway's DSN and encryption key.
+		cmd.Env = confinedExecEnv(os.Environ())
+	}
 
 	// Place the child in its own process group so killProcessGroup(-pgid, sig)
 	// reaches the shell and all of its forked children.

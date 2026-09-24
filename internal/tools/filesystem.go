@@ -120,7 +120,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	// Agent Link artifact runs are a physical exchange boundary. Virtual
 	// context files belong to the delegate's persistent identity and must not
 	// masquerade as staged inputs.
-	if !IsDelegationArtifactRun(ctx) && t.contextFileIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.contextFileIntc != nil {
 		if content, handled, err := t.contextFileIntc.ReadFile(ctx, path); handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to read context file: %v", err))
@@ -134,7 +134,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 
 	// Virtual system files: TEAM.md, DELEGATION.md, AVAILABILITY.md are injected
 	// into the system prompt and don't exist on disk. Return a helpful hint.
-	if !IsDelegationArtifactRun(ctx) {
+	if !usesPhysicalFilesOnly(ctx) {
 		baseName := filepath.Base(path)
 		if hint, ok := virtualSystemFiles[baseName]; ok {
 			return SilentResult(hint)
@@ -143,7 +143,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 
 	// Delegated runs use physical exchange files only. Context and memory
 	// virtual-file routing must not cross the Agent Link boundary.
-	if !IsDelegationArtifactRun(ctx) && t.memIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.memIntc != nil {
 		if content, handled, err := t.memIntc.ReadFile(ctx, path); handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to read memory file: %v", err))

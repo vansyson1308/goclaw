@@ -177,3 +177,25 @@ func extractJSONTopKeys(data []byte) []string {
 	}
 	return keys
 }
+
+// confinedExecEnvKeys are the only variables a workspace-confined (mission)
+// command inherits from the gateway on the host: toolchain and locale
+// settings, nothing that carries credentials (proxy URLs can, so they are
+// left out as well).
+var confinedExecEnvKeys = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "LOGNAME": true, "SHELL": true, "TERM": true,
+	"LANG": true, "LC_ALL": true, "LC_CTYPE": true, "TZ": true, "TMPDIR": true,
+	"GOPATH": true, "GOCACHE": true, "GOMODCACHE": true, "GOPROXY": true, "GOFLAGS": true,
+	"GOTOOLCHAIN": true, "GOROOT": true,
+}
+
+// confinedExecEnv keeps only confinedExecEnvKeys from env.
+func confinedExecEnv(env []string) []string {
+	out := make([]string, 0, len(confinedExecEnvKeys))
+	for _, kv := range env {
+		if k, _, ok := strings.Cut(kv, "="); ok && confinedExecEnvKeys[k] {
+			out = append(out, kv)
+		}
+	}
+	return out
+}

@@ -10,9 +10,15 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
+
+// criterionIDRe: criterion ids name per-check directories on the host and
+// must not collide with the ids the system reserves for its own results
+// ("_integrity", "_diff"), so they are plain names.
+var criterionIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
 // ContractVersion is the only contract schema version this build accepts.
 const ContractVersion = 1
@@ -145,6 +151,9 @@ func (c *Contract) Validate() error {
 		cr.ID = strings.TrimSpace(cr.ID)
 		if cr.ID == "" {
 			return fmt.Errorf("criterion %d: id is required", i)
+		}
+		if !criterionIDRe.MatchString(cr.ID) {
+			return fmt.Errorf("criterion %d: id must be 1-64 letters, digits, '-' or '_', starting with a letter or digit", i)
 		}
 		if seen[cr.ID] {
 			return fmt.Errorf("criterion %q: duplicate id", cr.ID)

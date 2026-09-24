@@ -101,7 +101,7 @@ func missionCmd() *cobra.Command {
 			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 			fmt.Fprintln(tw, "ID\tSTATUS\tAGENT\tTITLE\tCREATED")
 			for _, m := range res.Missions {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.ID, m.Status, m.AgentKey, m.Title, m.CreatedAt.Local().Format(time.DateTime))
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", m.ID, m.Status, m.AgentKey, termSafe(m.Title), m.CreatedAt.Local().Format(time.DateTime))
 			}
 			return tw.Flush()
 		},
@@ -208,9 +208,9 @@ func waitMission(id string, timeout time.Duration) error {
 }
 
 func printMission(m missionView, withDiff bool) {
-	fmt.Printf("Mission   %s\nTitle     %s\nAgent     %s\nStatus    %s\n", m.ID, m.Title, m.AgentKey, strings.ToUpper(m.Status))
+	fmt.Printf("Mission   %s\nTitle     %s\nAgent     %s\nStatus    %s\n", m.ID, termSafe(m.Title), m.AgentKey, strings.ToUpper(m.Status))
 	if m.StatusReason != "" {
-		fmt.Printf("Reason    %s\n", m.StatusReason)
+		fmt.Printf("Reason    %s\n", termSafe(m.StatusReason))
 	}
 	cost := "unknown"
 	if m.CostUSD != nil {
@@ -243,20 +243,35 @@ func printMission(m missionView, withDiff bool) {
 			}
 			fmt.Printf("  %-5s %s (%s)%s\n", mark, c.ID, c.Kind, extra)
 			if c.Detail != "" {
-				fmt.Printf("        %s\n", c.Detail)
+				fmt.Printf("        %s\n", termSafe(c.Detail))
 			}
 		}
 	}
 	if len(m.ChangedFiles) > 0 {
-		fmt.Printf("\nChanged files: %s\n", strings.Join(m.ChangedFiles, ", "))
+		fmt.Printf("\nChanged files: %s\n", termSafe(strings.Join(m.ChangedFiles, ", ")))
 	}
 	if m.Summary != "" {
-		fmt.Printf("\nAgent summary (narrative, not evidence):\n  %s\n", strings.ReplaceAll(strings.TrimSpace(m.Summary), "\n", "\n  "))
+		fmt.Printf("\nAgent summary (narrative, not evidence):\n  %s\n", strings.ReplaceAll(strings.TrimSpace(termSafe(m.Summary)), "\n", "\n  "))
 	}
 	if withDiff && m.Diff != "" {
-		fmt.Printf("\n%s\n", m.Diff)
+		fmt.Printf("\n%s\n", termSafe(m.Diff))
 		if m.DiffTruncated {
 			fmt.Println("[diff truncated]")
 		}
 	}
+}
+
+// termSafe removes control characters (ESC, CR, BEL, C1 controls such as
+// CSI) from agent-controlled text before it is printed, keeping newlines and
+// tabs, so the text cannot drive the operator's terminal.
+func termSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\t':
+			return r
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+			return -1
+		}
+		return r
+	}, s)
 }

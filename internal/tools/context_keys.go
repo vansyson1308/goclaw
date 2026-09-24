@@ -966,6 +966,15 @@ func IsDelegationArtifactRun(ctx context.Context) bool {
 	return DelegationIDFromCtx(ctx) != "" && DelegationArtifactInputsFromCtx(ctx) != ""
 }
 
+// usesPhysicalFilesOnly reports runs that must not see or change the agent's
+// virtual (database-backed) context and memory files: Agent Link artifact
+// runs, and workspace-confined (mission) runs, whose agent works on a
+// repository whose own AGENTS.md/MEMORY.md must not be shadowed and must not
+// be able to persist instructions into the agent.
+func usesPhysicalFilesOnly(ctx context.Context) bool {
+	return IsDelegationArtifactRun(ctx) || WorkspaceConfinedFromCtx(ctx)
+}
+
 func validateDelegationChildRunMode(ctx context.Context, operation, mode string) error {
 	if IsDelegationArtifactRun(ctx) && mode != "sync" {
 		return fmt.Errorf("%s mode %q is not allowed inside an Agent Link artifact run; use mode=\"sync\"", operation, mode)

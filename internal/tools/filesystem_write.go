@@ -129,7 +129,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	}
 
 	// Virtual FS: route context files to DB
-	if !IsDelegationArtifactRun(ctx) && t.contextFileIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.contextFileIntc != nil {
 		if handled, err := t.contextFileIntc.WriteFile(ctx, path, content); handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to write context file: %v", err))
@@ -139,7 +139,7 @@ func (t *WriteFileTool) Execute(ctx context.Context, args map[string]any) *Resul
 	}
 
 	// Virtual FS: route memory files to DB
-	if !IsDelegationArtifactRun(ctx) && t.memIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.memIntc != nil {
 		if mwr, err := t.memIntc.WriteFile(ctx, path, content, appendMode); mwr.Handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to write memory file: %v", err))

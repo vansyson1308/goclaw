@@ -840,6 +840,15 @@ func formatCredentialedResult(binary string, args []string,
 
 // lookupCredentialedBinary checks if a command's binary has credential config.
 // Returns the credential config and parsed args, or nil if not credentialed.
+// credentialedBinaryFor is lookupCredentialedBinary for runs allowed to use
+// stored credentials; mission runs get nil without a lookup.
+func (t *ExecTool) credentialedBinaryFor(ctx context.Context, command string) (*store.SecureCLIBinary, string, []string) {
+	if SandboxRequiredFromCtx(ctx) || WorkspaceConfinedFromCtx(ctx) {
+		return nil, "", nil
+	}
+	return t.lookupCredentialedBinary(ctx, command)
+}
+
 func (t *ExecTool) lookupCredentialedBinary(ctx context.Context, command string) (*store.SecureCLIBinary, string, []string) {
 	if t.secureCLIStore == nil {
 		slog.Warn("secure_cli.lookup: store is nil, skipping credentialed exec", "command", command)

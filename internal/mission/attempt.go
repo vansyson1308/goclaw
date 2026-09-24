@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // attempt is one claimed execution of a mission by this worker. Every
@@ -91,7 +92,9 @@ func (s *Service) execute(ctx context.Context, id uuid.UUID, c *Contract) {
 		now := time.Now().UTC()
 		upd.StartedAt = &now
 	}
-	msg := fmt.Sprintf("attempt %d/%d claimed by %s; preparing workspace", m.Attempt+1, m.MaxAttempts, s.cfg.WorkerID)
+	// The worker (host:pid) is kept in lease_owner, which tenant views redact;
+	// events are shown as is.
+	msg := fmt.Sprintf("attempt %d/%d claimed; preparing workspace", m.Attempt+1, m.MaxAttempts)
 	claimed, err := s.store.TransitionMission(bctx, id, []string{StatusPlanned}, StatusPreparing, ActorSystem, msg, upd)
 	switch {
 	case errors.Is(err, store.ErrMissionNoAttempts):
@@ -285,7 +288,8 @@ func (a *attempt) run(ctx, bctx context.Context, m *store.Mission, c *Contract) 
 	upd := store.MissionUpdate{}
 	if diffErr == nil {
 		env.Changed = diff.Present
-		upd.Diff, upd.DiffTruncated, upd.ChangedFiles = &diff.Patch, &diff.Truncated, orEmpty(diff.ChangedFiles)
+		patch := scrubPatch(diff.Patch)
+		upd.Diff, upd.DiffTruncated, upd.ChangedFiles = &patch, &diff.Truncated, orEmpty(diff.ChangedFiles)
 	}
 	results := Verify(ctx, c, env, baseline)
 	if cause := stopped(ctx); cause != nil {
@@ -345,7 +349,7 @@ func aggregateUsage(m *store.Mission, out *RunOutput) (store.MissionUpdate, bool
 		u.UsageIncomplete = &incomplete
 		return u, false
 	}
-	summary := cleanText(out.Content)
+	summary, _ := truncateText(tools.ScrubCredentials(out.Content), maxSummaryBytes)
 	in, outTok, iters := m.InputTokens+out.InputTokens, m.OutputTokens+out.OutputTokens, m.Iterations+out.Iterations
 	u.Summary, u.InputTokens, u.OutputTokens, u.Iterations = &summary, &in, &outTok, &iters
 	priorUsage := m.InputTokens+m.OutputTokens > 0 || m.Iterations > 0

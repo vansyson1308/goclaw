@@ -72,7 +72,7 @@ func (t *ListFilesTool) Execute(ctx context.Context, args map[string]any) *Resul
 	}
 
 	// Virtual FS: route memory directory listing to DB
-	if !IsDelegationArtifactRun(ctx) && t.memIntc != nil {
+	if !usesPhysicalFilesOnly(ctx) && t.memIntc != nil {
 		if listing, handled, err := t.memIntc.ListFiles(ctx, path); handled {
 			if err != nil {
 				return ErrorResult(fmt.Sprintf("failed to list memory files: %v", err))
