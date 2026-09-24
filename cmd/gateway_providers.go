@@ -78,7 +78,12 @@ func registerProviders(registry *providers.Registry, cfg *config.Config, modelRe
 	}
 
 	if cfg.Providers.DeepSeek.APIKey != "" {
-		registry.Register(providers.NewOpenAIProvider("deepseek", cfg.Providers.DeepSeek.APIKey, "https://api.deepseek.com/v1", "deepseek-chat"))
+		base := cfg.Providers.DeepSeek.APIBase
+		if base == "" {
+			base = store.DeepSeekDefaultAPIBase
+		}
+		registry.Register(providers.NewOpenAIProvider("deepseek", cfg.Providers.DeepSeek.APIKey, base, store.DeepSeekDefaultModel).
+			WithProviderType(store.ProviderDeepSeek))
 		slog.Info("registered provider", "name", "deepseek")
 	}
 
@@ -504,6 +509,11 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 
 func openAIProviderDefaults(providerType, apiBase string) (string, string) {
 	switch providerType {
+	case store.ProviderDeepSeek:
+		if apiBase == "" {
+			apiBase = store.DeepSeekDefaultAPIBase
+		}
+		return apiBase, store.DeepSeekDefaultModel
 	case store.ProviderMiniMax:
 		if apiBase == "" {
 			apiBase = store.MiniMaxDefaultAPIBase

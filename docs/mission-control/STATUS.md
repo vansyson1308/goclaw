@@ -21,7 +21,7 @@ Update this file at every checkpoint. Statuses: `pending` / `in_progress` / `ver
 |---|---|
 | SOURCE READY | yes, for review (A–H complete on the branch; not merged) |
 | OFFLINE/INTEGRATION VERIFIED | Phases A–H (local + GitHub Actions on PR #1) |
-| LIVE PROVIDER VERIFIED | BLOCKED: no provider credentials or budget |
+| LIVE PROVIDER VERIFIED | READY TO RUN, not yet run: DeepSeek V4.1 Flash is integrated and its wire contract verified against a local mock (DEEPSEEK.md). The owner's key is needed for `scripts/mission-control/live-deepseek.sh`; this environment cannot reach api.deepseek.com |
 | COMMERCIAL LICENSE READY | BLOCKED: CC BY-NC 4.0 upstream |
 | PRODUCTION RELEASE APPROVED | no: not requested |
 

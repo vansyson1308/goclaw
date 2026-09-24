@@ -14,7 +14,7 @@ export const PROVIDER_TYPES: ProviderTypeInfo[] = [
   { value: 'vertex', label: 'Google Vertex AI', apiBase: '', needsKey: false },
   { value: 'openrouter', label: 'OpenRouter', apiBase: 'https://openrouter.ai/api/v1', needsKey: true },
   { value: 'groq', label: 'Groq', apiBase: 'https://api.groq.com/openai/v1', needsKey: true },
-  { value: 'deepseek', label: 'DeepSeek', apiBase: 'https://api.deepseek.com/v1', needsKey: true },
+  { value: 'deepseek', label: 'DeepSeek', apiBase: 'https://api.deepseek.com', needsKey: true },
   { value: 'mistral', label: 'Mistral AI', apiBase: 'https://api.mistral.ai/v1', needsKey: true },
   { value: 'xai', label: 'xAI (Grok)', apiBase: 'https://api.x.ai/v1', needsKey: true },
   { value: 'minimax_native', label: 'MiniMax (Native)', apiBase: 'https://api.minimax.io/v1', needsKey: true },

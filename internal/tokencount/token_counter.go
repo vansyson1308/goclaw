@@ -51,6 +51,9 @@ var DefaultRegistry = map[string]ModelInfo{
 	"gpt-5":     {TokenizerO200K, 1_000_000},
 	"qwen-":     {TokenizerCL100K, 128_000},
 	"deepseek-": {TokenizerCL100K, 128_000},
+	// DeepSeek V4.x: deepseek-flash (V4.1 Flash), deepseek-v4-pro/-flash.
+	"deepseek-flash": {TokenizerCL100K, 1_000_000},
+	"deepseek-v4":    {TokenizerCL100K, 1_000_000},
 }
 
 // PerMessageOverhead is the token overhead per message

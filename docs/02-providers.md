@@ -100,7 +100,7 @@ Supported price units: input, output, cache read, cache write, reasoning, reques
 | api_route | `https://global.api-route.com/v1` | `gpt-5.4-mini` | API Route branded OpenAI-compatible endpoint |
 | openrouter | `https://openrouter.ai/api/v1` | `anthropic/claude-sonnet-4-5-20250929` | Model must contain `/` |
 | groq | `https://api.groq.com/openai/v1` | `llama-3.3-70b-versatile` | |
-| deepseek | `https://api.deepseek.com/v1` | `deepseek-chat` | |
+| deepseek | `https://api.deepseek.com` | `deepseek-flash` | DeepSeek V4.1 Flash (1M context); also `deepseek-v4-pro`. `deepseek-chat`/`deepseek-reasoner` were retired upstream on 2026-07-24. Thinking is on by default: the agent's thinking level maps to `thinking.type` + `reasoning_effort` (low/high/max), `off` disables it, and `temperature` is not sent while thinking. `reasoning_content` is passed back on tool-call turns. Env: `GOCLAW_DEEPSEEK_API_KEY`, `GOCLAW_DEEPSEEK_BASE_URL`. One-step setup: `scripts/deepseek-setup.sh` |
 | gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-2.0-flash` | Skips empty content fields |
 | mistral | `https://api.mistral.ai/v1` | `mistral-large-latest` | |
 | xai | `https://api.x.ai/v1` | `grok-3-mini` | |

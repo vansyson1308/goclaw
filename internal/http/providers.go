@@ -390,6 +390,9 @@ func (h *ProvidersHandler) registerInMemory(p *store.LLMProviderData) providerRu
 	default:
 		base, model := openAIProviderDefaults(p.ProviderType, apiBase)
 		prov := providers.NewOpenAIProvider(p.Name, p.APIKey, base, model)
+		// Same as the startup path (cmd/gateway_providers.go): provider-specific
+		// request shaping (e.g. DeepSeek thinking controls) keys off the type.
+		prov.WithProviderType(p.ProviderType)
 		prov.WithThinkingEnabled(store.ParseThinkingEnabled(p.Settings))
 		h.providerReg.RegisterForTenant(p.TenantID, prov)
 	}
@@ -416,6 +419,11 @@ func (h *ProvidersHandler) resolveOllamaNumCtx(p *store.LLMProviderData, apiBase
 
 func openAIProviderDefaults(providerType, apiBase string) (string, string) {
 	switch providerType {
+	case store.ProviderDeepSeek:
+		if apiBase == "" {
+			apiBase = store.DeepSeekDefaultAPIBase
+		}
+		return apiBase, store.DeepSeekDefaultModel
 	case store.ProviderMiniMax:
 		if apiBase == "" {
 			apiBase = store.MiniMaxDefaultAPIBase

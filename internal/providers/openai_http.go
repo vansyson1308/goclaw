@@ -150,11 +150,7 @@ func (p *OpenAIProvider) parseResponse(resp *openAIResponse, tools ...[]ToolDefi
 			TotalTokens:      resp.Usage.TotalTokens,
 			RequestCount:     1,
 		}
-		if resp.Usage.PromptTokensDetails != nil {
-			result.Usage.CacheReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
-			result.Usage.CacheCreationTokens = resp.Usage.PromptTokensDetails.CacheWriteTokens + resp.Usage.PromptTokensDetails.CacheCreationInputTokens
-			result.Usage.PromptTokensIncludeCachedSegments = true
-		}
+		fillCacheUsage(result.Usage, resp.Usage)
 		if resp.Usage.CompletionTokensDetails != nil && resp.Usage.CompletionTokensDetails.ReasoningTokens > 0 {
 			result.Usage.ThinkingTokens = resp.Usage.CompletionTokensDetails.ReasoningTokens
 		}
